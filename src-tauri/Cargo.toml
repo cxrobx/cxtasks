@@ -1,0 +1,63 @@
+[package]
+name = "cxtasks"
+version = "0.1.0"
+description = "Agentic todo app for macOS"
+authors = ["cx"]
+edition = "2021"
+rust-version = "1.77.2"
+default-run = "cxtasks"
+
+[lib]
+name = "cxtasks_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cxtasks-core = { path = "../crates/cxtasks-core" }
+
+tauri = { version = "2.11", features = ["protocol-asset", "macos-private-api"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-log = "2"
+tauri-plugin-clipboard-manager = "2"
+
+tokio = { version = "1", features = ["full"] }
+
+rusqlite = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+chrono = { workspace = true }
+
+log = { workspace = true }
+env_logger = "0.11"
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+libc = { workspace = true }
+
+# The vault look (`commands::vault_look`): one loopback GET to Onyx. The same
+# blocking client cxtasks-core already builds, so nothing new is compiled.
+ureq = { version = "2", default-features = false }
+url = "2"
+
+# Repo app icons for the sidebar (`commands::icons`): decode a favicon, an .ico
+# or an app-icon PNG, trim it, scale it to 64px. Already in the lockfile.
+image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
+base64 = "0.22"
+
+# MCP server
+rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Native macOS notifications
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+window-vibrancy = "0.8"

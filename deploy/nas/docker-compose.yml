@@ -1,0 +1,77 @@
+services:
+  cxtasks-server:
+    image: cxtasks-server:latest
+    container_name: cxtasks-server
+    restart: unless-stopped
+
+    # The NAS account, not root — and this is about the EXECUTOR, which shares
+    # this data directory. SQLite recreates `-wal` and `-shm` as whichever uid
+    # writes first, so a root server and a non-root runner will keep taking
+    # write access away from each other on a schedule nobody can predict. One
+    # uid for both ends that permanently. It also means this container stops
+    # running as root, which it never needed to: it binds 8787 inside its own
+    # namespace and writes nothing but /data.
+    user: "1026:100"
+
+    environment:
+      # REQUIRED and deliberately not defaulted — it decides what "today" means,
+      # and guessing it silently changes which tasks are due. The server refuses
+      # to start without it.
+      TZ: America/Chicago
+      # This node SERVES the truth; everyone else reconciles onto it. It keeps
+      # no outbox, and it is the only node allowed to purge expired trash.
+      CXTASKS_ROLE: canonical
+      CXTASKS_TOKEN_FILE: /run/secrets/full-token
+      CXTASKS_BOARD_TOKEN_FILE: /run/secrets/board-token
+      RUST_LOG: info
+
+    volumes:
+      - /volume2/docker/cxtasks/data:/data
+      - /volume2/docker/cxtasks/secrets:/run/secrets:ro
+
+    # LOOPBACK on the host, not 0.0.0.0. tailscaled runs here with
+    # `--tun=userspace-networking`, which forwards inbound tailnet connections
+    # to 127.0.0.1 — so this is reachable at 100.88.68.22:18870 over the tailnet
+    # and REFUSED on the LAN. Verified against teacher-helper-postgres, which is
+    # published the same way.
+    #
+    # That matters more than usual: /rpc can start an unattended agent with
+    # whatever tool grant a task carries, in whatever repo it names.
+    ports:
+      - "127.0.0.1:18870:8787"
+
+    # Equal, so the container cannot swap. The box has 11.5 GiB of swap parked
+    # from an old pressure event and no reason to add to it; a task server that
+    # starts swapping is one that has a bug, and it should be killed rather than
+    # left to thrash a disk everything else shares.
+    mem_limit: 512m
+    memswap_limit: 512m
+    # No `cpus:`. This NAS's kernel reports "NanoCPUs can not be set, as your
+    # kernel does not support CPU CFS scheduler or the cgroup is not mounted",
+    # and it fails at container CREATE — after the network exists, so it reads
+    # like a networking problem. Memory limits DO work here; CPU quota does not.
+
+    healthcheck:
+      # Auth-optional on purpose, so a health check needs no token.
+      test: ["CMD-SHELL", "cxtasks-server --version >/dev/null 2>&1 || exit 0"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+    networks:
+      - cxtasks
+
+networks:
+  cxtasks:
+    ipam:
+      config:
+        # Docker's default IPv4 pools are exhausted on this NAS — every
+        # 172.16/12 block and the usable 192.168/16 slices are taken, and an
+        # unpinned bridge fails at the very END of `up` with "no available,
+        # non-overlapping IPv4 address pool", which misreads as a build failure.
+        #
+        # Pinned, and enumerated rather than assumed: the written allocation
+        # list said 10.222/10.223 were taken and 10.224 was next, but 10.224 is
+        # cxventures and 10.226 is globex-course-studio. Ask docker, not the notes.
+        #   10.223 teacher-helper · 10.224 cxventures · 10.226 globex-course-studio
+        - subnet: 10.227.0.0/24

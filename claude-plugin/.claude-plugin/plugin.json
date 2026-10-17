@@ -1,0 +1,6 @@
+{
+  "name": "cxtasks",
+  "version": "0.15.0",
+  "description": "Slash commands for the CXTasks agentic todo app",
+  "author": { "name": "Chris Robinson" }
+}

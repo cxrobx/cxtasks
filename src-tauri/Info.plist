@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Merged into the generated Info.plist by the Tauri CLI (see
+	  distribute/macos-application-bundle). Only additive keys belong here —
+	  overriding a generated one (version, bundle id) fights the bundler.
+
+	  Foreground dispatch asks the running Ghostty for a new window over
+	  AppleScript, so the app sends an Apple Event to another process. TCC
+	  refuses that outright unless this purpose string exists, and the refusal
+	  is indistinguishable from Ghostty simply not answering — the dispatch
+	  would silently fall back to spawning a second Ghostty instance forever.
+	  The string is the text of the one-time consent dialog, so it says which
+	  app and why rather than "CXTasks wants to control your computer".
+	-->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>CXTasks opens a task's Claude session in a new window of your existing Ghostty, instead of launching a second copy of Ghostty.</string>
+
+	<!--
+	  `cxtasks://task/T42` (or a task id) opens that task — the Alfred `t`
+	  workflow's Enter. Handled as `RunEvent::Opened` in lib.rs; see links.rs.
+	  Like every key here it exists only in a real build, so `tauri dev` never
+	  answers the scheme.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.cxtasks.app</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>cxtasks</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

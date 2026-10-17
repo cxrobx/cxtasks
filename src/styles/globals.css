@@ -1,0 +1,821 @@
+@import "tailwindcss";
+
+/* ─── Fonts ───────────────────────────────────────────────────
+   UI text is the SYSTEM stack — San Francisco — declared byte-identically to
+   cxmail's `--font-sans` so the two apps sit beside each other as one family.
+   Nothing is vendored for it and nothing is downloaded: `-apple-system` is
+   resolved by the engine, so there is no `@font-face`, no FOUT and no
+   `font-display` to reason about.
+
+   Both SF faces are named on purpose. macOS switches between SF Pro Display
+   and SF Pro Text at ~20pt on its own when it resolves `-apple-system`, but
+   naming them explicitly keeps the fallback honest on the WebKit builds that
+   don't, and it is what cxmail does.
+
+   Geist Mono is KEPT — cxmail declares no mono token at all, so there is
+   nothing to bring over for it, and the numerics this app is full of (token
+   counts, diffs, T-numbers) are the one place a vendored face earns its
+   ~90 KB. Its `font-weight` RANGE is load-bearing: it's a variable font, and
+   declaring a single weight instead makes every weight silently render at 400
+   — which looks like the font has no bold rather than like a broken
+   declaration. Same reason `format("woff2")` and not
+   `format("woff2-variations")`, a Safari-11-era spelling a modern engine may
+   reject outright — and a rejected `src` is not an error but a silent fall
+   through to the next family in the stack, so the app looks completely fine,
+   in SF Mono, and only someone who knows what Geist Mono looks like notices.
+
+   `Geist-Variable.woff2` is deliberately left in `src/assets/fonts/` beside
+   its licence, unreferenced. It is one file, Vite never bundles what no rule
+   points at, and it is the whole cost of putting Geist back. */
+@font-face {
+  font-family: "Geist Mono";
+  src: url("../assets/fonts/GeistMono-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+
+/* ─── Tailwind v4 theme tokens ────────────────────────────────
+   The palette is OpenAI's, read off Codex's own live design system rather than
+   eyeballed — see the `[data-theme]` blocks for the source token each value
+   came from.
+
+   Three of these are ALPHA-AWARE and two are deliberately not. `base`,
+   `sidebar` and `surface` are *panes*: they carry the window transparency, so
+   they resolve through `--alpha-*`, which `uiStore::applyWindow` sets. `elevated` and
+   `input` stay fully opaque, because they are the things you have to be able
+   to READ — popovers and menus portal to the document root, so their backdrop
+   is the transparent window itself, and a translucent menu at Glass would be
+   text over raw wallpaper with nothing behind it.
+
+   The alpha lives here rather than being baked into the triplets on purpose:
+   the triplets are consumed as `rgb(var(--x) / 0.3)` in a dozen places, and
+   pre-multiplying them would break every one of those slots. */
+@theme {
+  --color-base: rgb(var(--bg-primary) / var(--alpha-pane));
+  --color-sidebar: rgb(var(--bg-sidebar) / var(--alpha-sidebar));
+  --color-surface: rgb(var(--bg-surface) / var(--alpha-surface));
+  --color-elevated: rgb(var(--bg-elevated));
+  --color-input: rgb(var(--bg-input));
+
+  --color-border: var(--border-default);
+  --color-border-subtle: var(--border-subtle);
+
+  --color-content: rgb(var(--text-primary));
+  --color-content-secondary: rgb(var(--text-secondary));
+  --color-content-muted: rgb(var(--text-muted));
+  --color-content-faint: rgb(var(--text-faint));
+
+  --color-accent: rgb(var(--accent));
+  --color-accent-hover: rgb(var(--accent-hover));
+
+  /* Where you ARE, as opposed to what you can DO. The sidebar's selected row
+     used to be a filled accent slab, which is the loudest mark in the window
+     spent on the least surprising fact — the thing you just clicked. Blue now
+     means an action or a live state (queue, primary buttons, an active filter
+     chip, a running row); a selection is a neutral ink lift, the way the
+     surrounding chrome already lifts.
+
+     Full colors rather than triplets, and for the same reason the borders are:
+     these tint whatever pane is behind them, so they must be alpha-on-ink, not
+     a solid grey that would read as a painted tile over the glass. */
+  --color-selected: var(--selected);
+
+  --color-success: rgb(var(--success));
+  --color-error: rgb(var(--error));
+  --color-warning: rgb(var(--warning));
+
+  --shadow-macos: 0 2px 8px rgb(var(--shadow-color) / 0.3), 0 1px 3px rgb(var(--shadow-color) / 0.2);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+/* Codex's dark palette, sampled from the Codex **desktop app** rather than
+   the web build — they are not the same, and the desktop one is the reference.
+   The web app puts a near-black sidebar against a lighter pane; the desktop app
+   inverts that, and the inversion is the whole character of the window:
+
+     content #181818  ·  card #1c1c1c  ·  BAR #2a2b2b  ·  input #2d2d2d
+
+   THE BAR IS LIGHTER THAN THE CONTENT. It reads as chrome laid over the work
+   rather than a gutter cut out of it, and it survives transparency far better
+   than a dark sidebar, which at any real alpha stops looking like a surface and
+   starts looking like a hole punched through to the wallpaper.
+
+   That ordering holds against any backdrop, which is why the lighter base and
+   the lower sidebar alpha can coexist. Over black: bar 42×0.55 = 23 vs content
+   24×0.72 = 17. Over a white wallpaper: bar 113 vs content 73. The base
+   difference dominates the alpha difference in both directions, so the bar
+   never inverts and starts reading as a trench. */
+[data-theme="dark"] {
+  --bg-primary: 24 24 24; /* main content   #181818 */
+  --bg-sidebar: 42 43 43; /* the bar        #2a2b2b — LIGHTER than content */
+  --bg-surface: 28 28 28; /* card on content #1c1c1c */
+  --bg-elevated: 45 45 45; /* composer/menu  #2d2d2d */
+  --bg-input: 45 45 45; /* composer         #2d2d2d */
+
+  /* Codex's borders are alpha-on-white, not solid greys — which is why these
+     are full colors rather than triplets. Over a translucent pane a solid grey
+     hairline reads as a drawn line sitting on top of the glass; an alpha one
+     tints whatever is behind it, which is the effect Codex actually has. */
+  --border-default: rgb(255 255 255 / 0.15); /* --border-default #ffffff26 */
+  --border-subtle: rgb(255 255 255 / 0.05); /* --border-light    #ffffff0d */
+
+  --text-primary: 255 255 255; /* --text-primary   #fff     */
+  --text-secondary: 205 205 205; /* --text-secondary #cdcdcd */
+  --text-muted: 175 175 175; /* --text-tertiary    #afafaf  */
+  --text-faint: 143 143 143; /* no Codex equal — CXTasks has a fourth step */
+
+  --accent: 58 131 247; /* --blue-400 #3a83f7 */
+  --accent-hover: 44 103 197; /* --blue-500 #2c67c5 */
+
+  /* Selection, as ink lifted off the bar rather than a colour laid on it.
+     0.10 over the #2a2b2b bar lands at ~#3f4040 — the same step the elevated
+     surfaces take, so a selected row reads as part of the chrome family
+     instead of an inserted swatch. */
+  --selected: rgb(255 255 255 / 0.10);
+
+  --success: 83 181 89; /* --green-400  #53b559 */
+  --error: 255 133 131; /* --text-status-error #ff8583 */
+  --warning: 241 162 117; /* --text-status-warning #f1a275 */
+
+  /* Icon hues (`src/lib/hues.ts`, icons only — never text or a fill): Apple's
+     dark-appearance system colours, the set cxmail's group icons use, as they
+     are. ≥3.8:1 on the bar (glass.test.ts). */
+  --hue-blue: 10 132 255; /* #0A84FF */
+  --hue-red: 255 69 58; /* #FF453A */
+  --hue-green: 48 209 88; /* #30D158 */
+  --hue-orange: 255 159 10; /* #FF9F0A */
+  --hue-amber: 255 214 10; /* #FFD60A */
+  --hue-purple: 191 90 242; /* #BF5AF2 */
+  --hue-teal: 64 200 224; /* #40C8E0 */
+  --hue-pink: 255 55 95; /* #FF375F */
+  --hue-sand: 172 142 104; /* #AC8E68 */
+  --hue-grey: 152 152 157; /* #98989D */
+
+  --shadow-color: 0 0 0;
+
+  /* Task card (frosted). Values from cxventures' `.glass-card`, one step
+     softer: past ~0.1 a rim stops being an edge and becomes a drawn outline. */
+  --card-fill: 255 255 255;
+  --card-fill-a: 0.02;
+  --card-fill-a-hover: 0.04;
+  --card-rim: 255 255 255 / 0.025;
+  --card-rim-hover: 255 255 255 / 0.07;
+  --card-glow-color: 255 255 255 / 0.03;
+  --card-sheen: 255 255 255 / 0.055;
+}
+
+/* cxmail's light palette, copied value for value (2026-09-27) so the two apps
+   sit beside each other as one family. Codex's neutral light — grey text on a
+   white bar — was the first cut and read as washed out: `--text-faint` held
+   ~2:1 against the pane, and the 0.55 glass floor let a dark desktop pull the
+   panes to the same grey as the muted text.
+
+   Warm paper, near-black ink, and borders that are SOLID warm greys rather than
+   alpha-on-black — a 5% black hairline all but vanishes on cream. The bar is
+   DARKER than the content here (243 vs 248), which is cxmail's ordering, not
+   dark's; that is why light gets cxmail's sidebar curve (`SIDEBAR_LEAD` in
+   uiStore) rather than dark's boost. The tokens cxmail has no equivalent for
+   (`--selected`, the card) are warm ink at an alpha, the same relationship dark
+   expresses in white. */
+[data-theme="light"] {
+  --bg-primary: 248 247 245; /* cxmail --bg-primary  #f8f7f5 */
+  --bg-sidebar: 243 242 240; /* cxmail --bg-sidebar  #f3f2f0 — darker than content */
+  --bg-surface: 255 255 254; /* cxmail --bg-surface  #fffffe */
+  --bg-elevated: 251 250 248; /* cxmail --bg-elevated #fbfaf8 */
+  --bg-input: 255 255 254; /* cxmail --bg-input    #fffffe */
+
+  --border-default: rgb(225 222 218); /* cxmail #e1deda */
+  --border-subtle: rgb(238 236 232); /* cxmail #eeece8 */
+
+  --text-primary: 30 25 15; /* cxmail — warm near-black ink */
+  --text-secondary: 75 70 60;
+  /* Pinned by the light legibility test in `glass.test.ts`: muted holds 3:1
+     and faint 2.5:1 (to the default) over a BLACK desktop at every slider
+     position. Lighten either and that test is what says so. */
+  --text-muted: 100 96 88;
+  --text-faint: 140 135 126;
+
+  --accent: 10 132 255; /* cxmail / macOS system blue #0a84ff */
+  --accent-hover: 8 106 204;
+
+  /* Ink lifted off the bar, in the warm ink rather than black, so a selected
+     row reads as a deeper patch of the same paper. */
+  --selected: rgb(30 25 15 / 0.07);
+
+  --success: 125 155 118;
+  --error: 196 92 74;
+  --warning: 196 146 58;
+
+  --shadow-color: 44 31 14;
+
+  /* Icon hues (`src/lib/hues.ts`, icons only — never text or a fill): Apple's
+     light-appearance system colours, full saturation. Blue, red, purple, pink
+     and brown are Apple's own values; green, orange, yellow and teal are
+     Apple's hue at the same saturation with the brightness taken down a step,
+     because Apple's own sit at 1.4–2:1 on this cream and the Today sun all but
+     vanished. SATURATED on purpose (a first, dusty pass read as dull): the
+     floor is ~2:1 on the bar rather than 3:1, which an icon's shape carries
+     and a label never could (glass.test.ts). */
+  --hue-blue: 0 122 255; /* #007AFF */
+  --hue-red: 255 59 48; /* #FF3B30 */
+  --hue-green: 30 180 60; /* #1EB43C */
+  --hue-orange: 245 135 0; /* #F58700 */
+  --hue-amber: 230 162 0; /* #E6A200 */
+  --hue-purple: 175 82 222; /* #AF52DE */
+  --hue-teal: 18 166 192; /* #12A6C0 */
+  --hue-pink: 255 45 85; /* #FF2D55 */
+  --hue-sand: 162 132 94; /* #A2845E */
+  --hue-grey: 134 134 139; /* #86868B */
+
+  /* Light is not dark inverted: a near-transparent fill on cream is no card at
+     all, so the card is a sheet of the white surface laid on the paper, with a
+     warm rim. Dark's 0.02 fill works only because white-on-black is loud. */
+  --card-fill: 255 255 254;
+  --card-fill-a: 0.55;
+  --card-fill-a-hover: 0.85;
+  --card-rim: 44 31 14 / 0.08;
+  --card-rim-hover: 44 31 14 / 0.14;
+  --card-glow-color: 44 31 14 / 0.05;
+  --card-sheen: 255 255 255 / 0.5;
+}
+
+/* ─── Window transparency ─────────────────────────────────────
+   The three pane alphas are written as INLINE styles on <html> by
+   `uiStore::applyWindow`, derived from one continuous slider value. They are
+   not defined per-level in CSS: the useful amount depends entirely on the
+   wallpaper behind the window, so this is a dial the user turns rather than
+   points someone else picked.
+
+   These declarations are only the pre-hydrate fallback. `applyWindow` runs
+   from `main.tsx` before React mounts, but the very first paint can still
+   precede it, and without a value here every alpha is invalid at
+   computed-value time — the panes paint fully TRANSPARENT and the app flashes
+   as a bare vibrancy panel with floating text. Opaque is the safe answer.
+
+   An inline style beats any selector, so unlike the previous `[data-window]`
+   approach there is no specificity to get wrong here. */
+:root {
+  --alpha-pane: 1;
+  --alpha-sidebar: 1;
+  --alpha-surface: 1;
+}
+
+/* ─── Transparency slider ─────────────────────────────────────
+   A native range input rather than a Radix slider: it is one control, it is
+   keyboard- and VoiceOver-accessible for free, and it avoids a dependency for
+   a single use. WebKit needs the vendor pseudo-elements spelled out — without
+   `-webkit-appearance: none` on the input AND on the thumb, macOS draws its own
+   aqua slider and every rule below is ignored. */
+.cx-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  background: transparent;
+  cursor: grab;
+}
+.cx-slider:active {
+  cursor: grabbing;
+}
+.cx-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  /* Filled portion drawn with a hard-stop gradient driven by `--fill`, which
+     the component sets from the value. Cheaper and smoother during a drag than
+     a second absolutely-positioned element. */
+  background: linear-gradient(
+    to right,
+    rgb(var(--accent)) 0%,
+    rgb(var(--accent)) var(--fill, 0%),
+    rgb(var(--text-faint) / 0.35) var(--fill, 0%),
+    rgb(var(--text-faint) / 0.35) 100%
+  );
+}
+.cx-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px; /* centres the 14px thumb on the 4px track */
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+}
+.cx-slider:focus-visible {
+  outline: none;
+}
+.cx-slider:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid rgb(var(--accent) / 0.6);
+  outline-offset: 2px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* `transparent`, NOT the base color. The window is a transparent Tauri window
+   with an NSVisualEffectView behind the webview (see `vibrancy_macos.rs`), and
+   an opaque body paints straight over it — the blur would be there, correctly
+   configured, and completely invisible. The visible background comes from
+   `AppLayout`'s `bg-base`, which is alpha-aware, so Solid still covers the
+   vibrancy completely and nothing is lost by not painting it twice. */
+body {
+  font-family: var(--font-sans);
+  background: transparent;
+  color: rgb(var(--text-primary));
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* The launch console lives in a resizable split pane, so its breakpoints must
+   follow the pane rather than the full window. At the minimum app width the
+   detail column is 340px (308px after padding): turn the densest three-up row
+   into readable full-width choices and give the primary action its own line. */
+.execution-console {
+  container-type: inline-size;
+}
+
+/* The rail carries FOUR nodes (workspace · runner · capability · brief), which
+   leaves ~78px per column at the narrow end. Below 300px, go 2x2 instead of
+   squeezing every label into an ellipsis — the rail is the console's only
+   summary now, so an unreadable one costs more than a second row. */
+@container (max-width: 300px) {
+  .execution-console__rail {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 10px;
+  }
+
+  /* The connector's 12.5%/62.5% offsets are the centres of FOUR columns. Once
+     the rail wraps they point at nothing, and the line draws straight through
+     the middle of the grid — so it goes with the single row it describes. */
+  .execution-console__route-line {
+    display: none;
+  }
+}
+
+@container (max-width: 360px) {
+  .execution-console__runner-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@container (max-width: 320px) {
+  .execution-console__access-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .execution-console__access-option {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 10px;
+  }
+
+  .execution-console__access-option > span {
+    margin-top: 0;
+  }
+
+  .execution-console__access-option > span:last-of-type {
+    grid-column: 2;
+  }
+
+  .execution-console__access-option > svg:last-child {
+    position: static;
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+
+  .execution-console__actions {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .execution-console__queue {
+    grid-column: 1 / -1;
+  }
+
+  .execution-console__open {
+    justify-content: center;
+  }
+}
+
+/* The window uses titleBarStyle "Overlay" + hiddenTitle, so the traffic
+   lights float over our content. Any pane that reaches the top of the window
+   must reserve this much headroom or its first row sits under the buttons. */
+:root {
+  --titlebar-height: 38px;
+}
+
+/* macOS-style overlay scrollbars: invisible until the pane is hovered.
+ *
+ * EXCEPT on anything the user can drag-resize, and the exclusion is the whole
+ * point of the selector — do not simplify it back to a bare
+ * `::-webkit-scrollbar`. Styling a scrollbar at all switches that element to
+ * WebKit's CUSTOM scrollbar machinery, which draws its own resize grip: an
+ * outlined square with one diagonal through it, instead of the two bare
+ * diagonal strokes macOS draws. The two grips sit inches apart in the task
+ * detail pane and read as different controls.
+ *
+ * What made it hard to see is that the grip only changes once the element
+ * actually scrolls — an under-filled Notes field looks native, and grows the
+ * custom grip the moment its text overruns five rows. So the difference
+ * presents as "the new box is wrong" when both were always going to diverge.
+ *
+ * `textarea` covers every resizable field (Notes, the brief, both comment
+ * composers); `[data-resizable]` is for the one resizable div, RunResult.
+ * Opting out costs nothing visible — native overlay scrollbars are what these
+ * rules are imitating in the first place. */
+:not(textarea):not([data-resizable])::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+:not(textarea):not([data-resizable])::-webkit-scrollbar-track {
+  background: transparent;
+}
+:not(textarea):not([data-resizable])::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+}
+:not(textarea):not([data-resizable]):hover::-webkit-scrollbar-thumb {
+  background: rgb(var(--text-faint) / 0.35);
+}
+:not(textarea):not([data-resizable])::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--text-muted) / 0.6);
+}
+/* The corner where two scrollbars (or a scrollbar and a grip) meet. Left
+   unstyled it paints the UA default — an opaque LIGHT square in a dark pane.
+   The opt-out above spares everything resizable, but a box that scrolls on
+   BOTH axes still reaches it with no resizer involved: RunCheckpoint's diff
+   is `overflow-auto` over unwrapped lines. Keep it. */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Form controls inherit the app's type. Tailwind's Preflight already does
+   this in `@layer base`; the two lines that stay are here because they are
+   the ones this app has been burned by (a `<select>` falling back to the UA
+   font is how the theme stops applying to half a form).
+
+   `color: inherit` USED to be the third line and had to go. This rule is
+   UNLAYERED, and an unlayered rule outranks every rule in a cascade layer
+   whatever its specificity — so it beat `@layer utilities`, and every
+   Tailwind `text-*` colour on a <button> was silently ignored: the class on
+   the element, the rule in the stylesheet, and the colour still inherited.
+   Seventeen buttons in this app were painting `text-content-secondary` as
+   full-strength content. Preflight's own `color: inherit` (in the base
+   layer, where utilities can beat it) is what a button with no colour class
+   gets now, so the default is unchanged and the classes work. */
+input,
+textarea,
+select,
+button {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: 2px solid rgb(var(--accent) / 0.6);
+  outline-offset: 1px;
+}
+
+/* The filter bar is ONE control that happens to contain an input: chips and
+   text share a bordered box, so the generic input ring above would draw a
+   second box inside it. The ring moves to the container — same look the plain
+   search field had — and the inner input goes bare. A rule here rather than a
+   utility class because the generic rule is unlayered and beats Tailwind's
+   layered utilities whatever their specificity. */
+.cx-filterbar input:focus-visible {
+  outline: none;
+}
+.cx-filterbar:focus-within {
+  outline: 2px solid rgb(var(--accent) / 0.6);
+  outline-offset: 1px;
+}
+
+/* Notes is the same shape as the filter bar: ONE bordered box that sometimes
+   contains a textarea (it renders markdown until you click into it), so the
+   generic ring above would draw a second box inside the one you can see. Ring
+   on the container, inner field bare — and for the same reason spelled out
+   above, `outline-none` as a Tailwind utility does NOT do it: the generic rule
+   is unlayered and beats every layered utility regardless of specificity, so
+   the textarea keeps its own ring and the class silently reads as a no-op. */
+.cx-notes textarea:focus-visible {
+  outline: none;
+}
+.cx-notes:focus-within {
+  outline: 2px solid rgb(var(--accent) / 0.6);
+  outline-offset: 1px;
+}
+
+/* The markdown surface (`components/shared/Markdown.tsx`). Notes, comments and
+   run results may carry inline HTML and SVG since 2026-09-22 — sanitized, see
+   `lib/markdownSchema.ts` — and the diagrams Chris pastes come from the HTML
+   artifact kit (`~/.claude/docs/html-design/style.css`), whose markup paints
+   with that kit's colour tokens. Mapping those names onto the app theme here
+   means a diagram authored for an ivory page paints in the pane's own palette
+   in both themes, and its author never has to know it moved. The names are the
+   kit's, deliberately — this is a compatibility shim, not a second palette. */
+.cx-prose {
+  --ivory: rgb(var(--bg-input));
+  --white: rgb(var(--bg-surface));
+  --slate: rgb(var(--text-primary));
+  --gray-700: rgb(var(--text-secondary));
+  --gray-500: rgb(var(--text-muted));
+  --gray-300: var(--border-default);
+  --gray-100: rgb(var(--text-primary) / 0.05);
+  --hr: var(--border-default);
+  --oat: rgb(var(--text-primary) / 0.08);
+  --code-bg: rgb(var(--text-primary) / 0.06);
+  --clay: rgb(var(--accent));
+  --clay-700: rgb(var(--accent-hover));
+  --olive: rgb(var(--success));
+  --rust: rgb(var(--error));
+  --warn: rgb(var(--warning));
+  --sans: var(--font-sans);
+  --serif: var(--font-sans);
+  --mono: var(--font-mono);
+  --border: 1px solid var(--border-default);
+  --radius-panel: 8px;
+  --radius-row: 6px;
+  --shadow: none;
+  overflow-wrap: anywhere;
+}
+
+/* Transient highlight for a row changed out-of-band by the live bridge — the
+   visual answer to "did my /task actually land?". Mirrors cxmail's
+   .cx-row-flash. */
+@keyframes cxRowFlash {
+  0% {
+    background-color: rgb(var(--accent) / 0.3);
+  }
+  100% {
+    background-color: rgb(var(--accent) / 0);
+  }
+}
+.cx-row-flash {
+  animation: cxRowFlash 1.5s ease-out;
+}
+
+/* Drag-reorder affordances. */
+.cx-dragging {
+  opacity: 0.4;
+}
+.cx-drop-above:not(.cx-task-card) {
+  box-shadow: inset 0 2px 0 0 rgb(var(--accent));
+}
+.cx-drop-below:not(.cx-task-card) {
+  box-shadow: inset 0 -2px 0 0 rgb(var(--accent));
+}
+/* On a card the indicator takes its own slot in the composed shadow, or its
+   `box-shadow` would replace the rim wholesale and the row would lose its edge
+   for as long as the drag lasts. */
+.cx-task-card.cx-drop-above {
+  --card-drop: inset 0 2px 0 0 rgb(var(--accent));
+}
+.cx-task-card.cx-drop-below {
+  --card-drop: inset 0 -2px 0 0 rgb(var(--accent));
+}
+/* ─── Task card ───────────────────────────────────────────────
+   A task row as frosted glass: a translucent fill and a 1px rim, no bevel and
+   no cast shadow. Ported from `src/mocks/RedesignMock.tsx`, which is where the
+   material was argued out; the numbers come from cxventures' `.glass-card`.
+
+   EVERY PART OF THIS IS A CUSTOM PROPERTY, and that is the load-bearing
+   decision rather than a style. The states here stack — a row can be selected
+   AND hovered AND a drop target at once — and the first two attempts at this
+   composed them by overwriting whole declarations, so hovering a selected row
+   silently stripped the accent rim that says which row you are on, and the drop
+   indicator erased the rim entirely. Cascading VARIABLES instead of
+   declarations makes that structurally impossible: each state owns one slot in
+   a single `box-shadow`, and nothing can claim another's.
+
+   `background-color` is deliberately left alone — `.cx-row-flash` animates it,
+   and animations outrank normal declarations, so the live-bridge flash still
+   reads over the card without either rule knowing about the other. */
+/* ─── Density ──────────────────────────────────────────────────────────────
+   How much room a task row gets. One attribute on <html> (`applyDensity`),
+   variables here, and every consumer reads a variable — the cxmail pattern.
+
+   What each mode DROPS is the point, not the padding. `compact` takes the row
+   to ONE line by hiding the tag strip; `ultra` also drops the T-number chip and
+   tightens the type. What NEVER goes at any density is a badge saying the row
+   cannot be worked — blocked, deferred, tripwire — because a list that hides
+   those is a list lying about what is actionable, which is the one thing this
+   board exists to answer.
+
+   The virtualizer's `estimateSize` is paired with these numbers in
+   `DENSITY_ROW_ESTIMATE`; move one and the scrollbar jumps on the first scroll
+   (gotcha #33). */
+:root,
+[data-density="comfortable"] {
+  --row-py: 10px;
+  --row-pl: 16px;
+  --row-pr: 12px;
+  --row-gap: 6px;
+  --row-title: 13px;
+  --row-radius: 10px;
+}
+[data-density="compact"] {
+  --row-py: 5px;
+  --row-pl: 12px;
+  --row-pr: 10px;
+  --row-gap: 3px;
+  --row-title: 13px;
+  --row-radius: 8px;
+}
+[data-density="ultra"] {
+  --row-py: 2px;
+  --row-pl: 10px;
+  --row-pr: 8px;
+  --row-gap: 2px;
+  --row-title: 12px;
+  --row-radius: 6px;
+}
+
+/* The row's own box. `!important` because these fight Tailwind utilities on
+   the element itself, which is also why the utilities were left in place: they
+   are the comfortable values, so a stylesheet that fails to load still renders
+   a sane row. */
+.cx-task-card {
+  padding: var(--row-py) var(--row-pr) var(--row-py) var(--row-pl) !important;
+  font-size: var(--row-title);
+}
+
+/* ONE line at compact and below. The body stops stacking and lays the title
+   and the badge strip side by side — the badges are not dropped, they move.
+   That distinction is the whole rule: `blocked`, `deferred` and `tripwire` say
+   the row cannot be worked, and a denser list that hid them would be a list
+   lying about what is actionable. */
+[data-density="compact"] .cx-row-body,
+[data-density="ultra"] .cx-row-body {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+}
+[data-density="compact"] .cx-row-titleline,
+[data-density="ultra"] .cx-row-titleline {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+[data-density="compact"] .cx-row-meta,
+[data-density="ultra"] .cx-row-meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+/* The Decide line keeps its OWN line at every density. It is an input you
+   type a sentence into, not metadata — squeezed onto the title's row it came
+   out about 200px wide, which makes the cheapest close on the board the
+   fiddliest. `wrap` on the body is what lets it take a full row of its own. */
+[data-density="compact"] .cx-row-body,
+[data-density="ultra"] .cx-row-body {
+  flex-wrap: wrap;
+}
+.cx-row-decide {
+  flex: 1 0 100%;
+}
+
+/* What DOES go: the labels. Tags and the project are what you scan for only
+   when you are hunting one, and they are what makes the strip too wide to sit
+   on the title's line. */
+[data-density="compact"] .cx-row-tags,
+[data-density="ultra"] .cx-row-tags,
+/* Waiting's evidence line is a second line by definition, so it cannot
+   survive a one-line row. The badge beside it still says a date is pending. */
+[data-density="compact"] .cx-row-evidence,
+[data-density="ultra"] .cx-row-evidence {
+  display: none;
+}
+/* An address you rarely read aloud is the next thing to go. */
+[data-density="ultra"] .cx-row-ref {
+  display: none;
+}
+/* The gap between the title line and whatever survives under it. */
+.cx-row-body {
+  gap: var(--row-gap) !important;
+}
+
+.cx-task-card {
+  border-radius: var(--row-radius);
+  overflow: hidden; /* clips the priority bar to the radius; see TaskRow */
+  background: rgb(var(--card-fill) / var(--card-fill-a));
+  box-shadow:
+    var(--card-drop, 0 0 rgb(0 0 0 / 0)),
+    inset 0 0 0 1px rgb(var(--card-rim)),
+    var(--card-glow, 0 0 rgb(0 0 0 / 0));
+  transform: var(--card-tilt, none);
+  /* Transform stays fast so the tilt tracks the pointer; fill and glow ride the
+     0.3s that makes a hover read as a light coming up rather than a state
+     flipping. */
+  transition:
+    background 300ms ease,
+    box-shadow 300ms ease,
+    transform 140ms ease-out;
+}
+
+/* Hover ADDS the glow to every row, whatever else it is. The fill and rim bump
+   is scoped to rows carrying no state of their own, or it would overwrite the
+   accent rim on the row you are pointing at — which is the one row that must
+   not lose its mark. */
+.cx-task-card:hover {
+  --card-glow: 0 0 30px rgb(var(--card-glow-color));
+}
+.cx-task-card:not([data-card-state]):hover {
+  --card-fill-a: var(--card-fill-a-hover);
+  --card-rim: var(--card-rim-hover);
+}
+
+/* The row you are on, and the rows in the multi-select set: both are the
+   ORIGINAL blue fill, at the original strengths (0.12 / 0.22). Selection went
+   through an accent-rim phase while the card material was being worked out —
+   the reasoning was that a fill and a rim are two channels, so the two states
+   could not collide. They can't, but a rim reads as a drawn box, and a
+   highlight is the one thing in a list that should read as light rather than as
+   an outline. So selection is a fill again and the rim stays out of it.
+
+   The pair is 0.12 against 0.22 for the same reason it always was: with both
+   states tinted, "one row is selected" and "one row of this set is the one
+   you're reading" are told apart by strength alone, and closing the gap makes
+   the bulk bar the only thing left saying which you are in.
+
+   These two are the ONLY states the card paints. A live background run briefly
+   had an accent rim as well, which was redundant twice over: the status pill
+   already says "In progress" in accent, and a second accent mark on the same
+   row is a louder way of saying something already said. `--card-rim` now
+   carries one meaning — the card's edge — and no state claims it. */
+.cx-task-card[data-card-state="selected"] {
+  --card-fill: var(--accent);
+  --card-fill-a: 0.12;
+}
+.cx-task-card[data-card-state="checked"] {
+  --card-fill: var(--accent);
+  --card-fill-a: 0.22;
+}
+/* A pointer-tracked specular sweep, positioned by vars the row writes on
+   mousemove. Kept off the React render path entirely: setState at pointer rate
+   re-renders a row 60 times a second for a decoration. */
+.cx-task-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 140ms ease-out;
+  background: radial-gradient(
+    220px circle at var(--card-sheen-x, 50%) var(--card-sheen-y, 50%),
+    rgb(var(--card-sheen)),
+    transparent 65%
+  );
+}
+.cx-task-card:hover::after {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-task-card {
+    transform: none;
+    transition: none;
+  }
+  .cx-task-card::after {
+    display: none;
+  }
+}
+
+/* Dropping INTO a container (a section, the Ungrouped bucket) rather than
+   between two rows — so it outlines the whole block instead of drawing an
+   insertion line, which is the honest shape of "this task lands in here,
+   position unchanged". */
+.cx-drop-into {
+  box-shadow: inset 0 0 0 1px rgb(var(--accent));
+  background: rgb(var(--accent) / 0.08);
+}
+
+/* Window dragging is driven by the `data-tauri-drag-region` ATTRIBUTE, not by
+   CSS. `-webkit-app-region: drag` is an Electron property and a silent no-op in
+   WKWebView — it used to be here and never worked. Tauri's injected `drag.js`
+   walks the composed path on mousedown looking for the attribute, so markup is
+   the only thing that matters; see gotcha #15 for the `deep` vs bare values.
+
+   All this rule does is stop a drag from *looking* like a text selection.
+   Tauri already calls `preventDefault()` when it accepts the drag, so this is
+   belt-and-braces for the frame before that, plus it kills the I-beam cursor
+   over a strip that isn't text. Form fields opt back in — selecting text there
+   is the point, and `user-select` inherits. */
+[data-tauri-drag-region] {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+[data-tauri-drag-region] :is(input, textarea, [contenteditable="true"]) {
+  -webkit-user-select: auto;
+  user-select: auto;
+  cursor: auto;
+}

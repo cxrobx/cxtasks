@@ -1,0 +1,18 @@
+node_modules
+dist
+
+# Build output. `target` (root) is where the WORKSPACE puts it; the
+# `src-tauri/target` line stays because a pre-workspace tree still has one
+# sitting there, and an un-ignored stale build dir is 20k files of noise in
+# `git status`.
+target
+src-tauri/target
+src-tauri/gen
+.DS_Store
+*.log
+
+# Playwright MCP scratch output (screenshots, snapshots, console logs)
+.playwright-mcp/
+
+# Staged sidecars for Tauri externalBin — rebuilt by scripts/build-helpers.sh
+src-tauri/binaries/

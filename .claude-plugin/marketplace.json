@@ -1,0 +1,17 @@
+{
+  "name": "cxtasks",
+  "metadata": {
+    "description": "CXTasks' own Claude Code plugin — slash commands for the agentic todo app"
+  },
+  "owner": {
+    "name": "Chris Robinson"
+  },
+  "plugins": [
+    {
+      "name": "cxtasks",
+      "description": "Slash commands for CXTasks: task, tasks, next",
+      "source": "./claude-plugin",
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+services:
+  cxtasks-runner:
+    image: cxtasks-runner:latest
+    container_name: cxtasks-runner
+    # `no`, not `unless-stopped`, and this is the one deliberate difference from
+    # the canonical node's compose file.
+    #
+    # A crash-looping SERVER is unavailable; a crash-looping RUNNER spends
+    # money. Until this host has a few real runs behind it, a restart should be
+    # a decision somebody makes rather than something that happens overnight.
+    # Change it to `unless-stopped` once it has earned that.
+    restart: "no"
+
+    # The NAS account, not the image's `node` (uid 1000). Every mounted
+    # directory here is owned by 1026:100 and this box's `cx` account is not
+    # root, so it cannot chown them — a container running as 1000 would depend
+    # on the 777 modes those directories happen to carry, which is not a thing
+    # to rest a credential store on.
+    user: "1026:100"
+
+    environment:
+      # REQUIRED and deliberately not defaulted. It decides what "today" means,
+      # and this is where getting it wrong actually bites: the daily token cap
+      # is one pool shared with the Mac, so a UTC container would reset its half
+      # of the accounting at 6pm Central. `bg_budget_tz` in the database is the
+      # real fix and this agrees with it — belt and braces, since the two are
+      # set by different people at different times.
+      TZ: America/Chicago
+      RUST_LOG: info
+
+    volumes:
+      # THE SAME data directory the canonical node uses.
+      #
+      # This is the one place the "SQLite over a network filesystem is not an
+      # option" rule does NOT apply, and the distinction is worth stating: that
+      # rule is about SMB/NFS, where WAL needs shared memory the protocol cannot
+      # provide and the documented failure is corruption rather than an error.
+      # Two containers on ONE host sharing ONE local volume is the ordinary
+      # multi-process case SQLite's locking was built for — the same case as the
+      # app, the MCP and the runner on the Mac, which have shared a file since
+      # the first version.
+      #
+      # It also means this host needs no sync client at all: it IS on the
+      # canonical node's disk.
+      - /volume2/docker/cxtasks/data:/data
+
+      # Read-only, and that is the filesystem guard. `git clone --shared` is
+      # what makes it workable — a materialized run borrows the object store
+      # rather than copying it, so a 300 MB repo costs a checkout.
+      #
+      # Under /volume2/docker, not /volume2, because that is the only place on
+      # this NAS the `cx` account can write — `mkdir /volume2/cxtasks` fails
+      # with a bare "Permission denied" partway through a deploy, after the
+      # image has already shipped.
+      - /volume2/docker/cxtasks/mirrors:/mirrors:ro
+
+      # A dedicated home, never a shared one — three containers sharing one
+      # `.claude/projects` tree is a documented session-lock hazard on this box.
+      # It is a MOUNT rather than the image's own directory because `claude
+      # login` writes here, and credentials that vanish on every redeploy make
+      # a redeploy an interactive event.
+      #
+      # **That mount shadows the empty settings.json the image ships**, so the
+      # security property it carries has to be re-established on the host side —
+      # `deploy.sh` seeds one here if it is absent. Worth stating plainly,
+      # because a file baked into an image and then mounted over is exactly the
+      # kind of guard that reads as present and is not.
+      #
+      # `--health` is the thing that actually enforces it, and it runs against
+      # whatever is really at $HOME.
+      - /volume2/docker/cxtasks/runner-home:/home/cxrunner
+
+    # ── the tool surface, and why it is empty here ──────────────────────────
+    #
+    # `CXTASKS_MCP_VAULT` is deliberately NOT set, and it is worth writing down
+    # why rather than leaving it as an absence somebody tries to "fix".
+    #
+    # This is the only host that can run a DETACHED task (the Mac does not
+    # declare that workspace — an unattended run there would get unsupervised
+    # Read/Glob/Grep over every client repo, ~/.ssh and the vault). So the tool
+    # surface is the whole bound, and the vault would be the obvious first
+    # grant. It is not available here because it needs two things this box does
+    # not have:
+    #
+    #   * the notes themselves — ~/Documents/CX lives on the Mac
+    #   * an embedding service — vault-mcp calls Ollama, which runs on the Mac
+    #     at :11434 and nowhere on this NAS
+    #
+    # Pointing VAULT_MCP_OLLAMA back at the Mac over the tailnet would work and
+    # would also defeat the point: a run that needs the laptop awake is a run
+    # that could have happened on the laptop. Making it real means an embedding
+    # service here and the vault reachable from here, which is its own decision
+    # rather than a line in this file.
+    #
+    # Until then a detached run gets the write-back router and nothing else —
+    # which is the documented safe default, not a broken state. `--dry-run`
+    # prints exactly what a task would be handed.
+
+    # No ports. This container talks to a file and to Anthropic's API; nothing
+    # talks to it. An executor that can start agents in 25 repos should not be
+    # reachable, and the cheapest way to guarantee that is to publish nothing.
+
+    # Equal, so it cannot swap. An agent that starts swapping on a box whose
+    # disk everything else shares should be killed rather than left to thrash.
+    mem_limit: 2g
+    memswap_limit: 2g
+    # No `cpus:`. This NAS's kernel reports "NanoCPUs can not be set, as your
+    # kernel does not support CPU CFS scheduler or the cgroup is not mounted",
+    # and it fails at container CREATE — after the network exists, so it reads
+    # like a networking problem. Memory limits DO work here; CPU quota does not.
+
+    healthcheck:
+      # Asserts the thing a deployment actually drifts on: that this $HOME
+      # grants no permission rules. Somebody mounting the real home to fix
+      # something would silently hand every unattended agent a shell, and
+      # nothing else would notice.
+      test: ["CMD", "/usr/local/bin/cxtasks-runner", "--health"]
+      interval: 120s
+      timeout: 20s
+      retries: 2
+      start_period: 30s
+
+    networks:
+      - cxtasks-runner
+
+networks:
+  cxtasks-runner:
+    ipam:
+      config:
+        # Docker's default IPv4 pools are exhausted on this NAS — every
+        # 172.16/12 block and the usable 192.168/16 slices are taken — and an
+        # unpinned bridge fails at the very END of `up` with "no available,
+        # non-overlapping IPv4 address pool", which misreads as a build failure.
+        #
+        # Enumerated on 2026-08-21, not taken from a list: 10.222, 10.223,
+        # 10.224, 10.226 and 10.227 are in use. 10.225 reads as free, which
+        # means something released it — so this takes the next number above the
+        # highest rather than filling a gap whose history is unknown.
+        - subnet: 10.228.0.0/24

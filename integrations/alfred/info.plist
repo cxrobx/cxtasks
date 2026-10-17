@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>bundleid</key>
+	<string>com.cxtasks.alfred</string>
+	<key>connections</key>
+	<dict>
+		<key>3C1E7A52-6B0D-4F2A-9E47-1D2C3B4A5F60</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>8E9F0A1B-2C3D-4E5F-A6B7-C8D9E0F1A2B3</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>8E9F0A1B-2C3D-4E5F-A6B7-C8D9E0F1A2B3</string>
+				<key>modifiers</key>
+				<integer>1048576</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+			<dict>
+				<key>destinationuid</key>
+				<string>8E9F0A1B-2C3D-4E5F-A6B7-C8D9E0F1A2B3</string>
+				<key>modifiers</key>
+				<integer>524288</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+	</dict>
+	<key>createdby</key>
+	<string>CXTasks</string>
+	<key>description</key>
+	<string>Find a CXTasks task by T-number or words, and open it in CXTasks</string>
+	<key>disabled</key>
+	<false/>
+	<key>name</key>
+	<string>CXTasks</string>
+	<key>objects</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>alfredfiltersresults</key>
+				<false/>
+				<key>alfredfiltersresultsmatchmode</key>
+				<integer>0</integer>
+				<key>argumenttreatemptyqueryasnil</key>
+				<true/>
+				<key>argumenttrimmode</key>
+				<integer>0</integer>
+				<key>argumenttype</key>
+				<integer>1</integer>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>keyword</key>
+				<string>t</string>
+				<key>queuedelaycustom</key>
+				<integer>3</integer>
+				<key>queuedelayimmediatelyinitially</key>
+				<true/>
+				<key>queuedelaymode</key>
+				<integer>0</integer>
+				<key>queuemode</key>
+				<integer>1</integer>
+				<key>runningsubtext</key>
+				<string>Searching tasks…</string>
+				<key>script</key>
+				<string>/usr/bin/python3 cxtasks_search.py "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>subtext</key>
+				<string>A T-number, or words describing the task</string>
+				<key>title</key>
+				<string>CXTasks — find a task</string>
+				<key>type</key>
+				<integer>0</integer>
+				<key>withspace</key>
+				<true/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.input.scriptfilter</string>
+			<key>uid</key>
+			<string>3C1E7A52-6B0D-4F2A-9E47-1D2C3B4A5F60</string>
+			<key>version</key>
+			<integer>3</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>script</key>
+				<string>/usr/bin/open "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>5</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>8E9F0A1B-2C3D-4E5F-A6B7-C8D9E0F1A2B3</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+	</array>
+	<key>readme</key>
+	<string>t &lt;T-number or words&gt; — find a CXTasks task.
+
+  t 69 / t T69     that task; a prefix like t T11 lists T11, T110…T119
+  t &lt;words&gt;        keyword + semantic search (local Ollama nomic-embed-text), fused
+  t                what is in motion, most recently touched first
+
+↩ opens the task in CXTasks (cxtasks://task/&lt;id&gt;)
+⌘ shows the notes · ⌥ shows tags, repo, tripwire
+⇧ or ⌘Y previews the whole task · ⌘L large type · ⌘C copies the T-number
+
+Source: ~/Projects/cxtasks/integrations/alfred — Alfred runs an installed copy,
+so re-run install.sh after editing. The semantic lane is optional: without
+Ollama the list is built from the number and keyword lanes.</string>
+	<key>uidata</key>
+	<dict>
+		<key>3C1E7A52-6B0D-4F2A-9E47-1D2C3B4A5F60</key>
+		<dict>
+			<key>xpos</key>
+			<integer>40</integer>
+			<key>ypos</key>
+			<integer>40</integer>
+		</dict>
+		<key>8E9F0A1B-2C3D-4E5F-A6B7-C8D9E0F1A2B3</key>
+		<dict>
+			<key>xpos</key>
+			<integer>260</integer>
+			<key>ypos</key>
+			<integer>40</integer>
+		</dict>
+	</dict>
+	<key>userconfigurationconfig</key>
+	<array/>
+	<key>variablesdontexport</key>
+	<array/>
+	<key>version</key>
+	<string>1.0.0</string>
+</dict>
+</plist>

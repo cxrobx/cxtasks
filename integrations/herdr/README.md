@@ -1,0 +1,39 @@
+# Desktop handoffs to Herdr
+
+`install.sh` installs `cx-open-in-herdr` into `~/.local/bin`. CXTasks, CXMail
+(including Continue in terminal), and Onyx's Claude Open session call it when
+installed. Without it they retain their standalone terminal handoff.
+
+The router always targets the **local default Herdr session**, independent of
+the app's inherited terminal or remote environment. It starts/attaches Herdr
+in Ghostty when needed and focuses the existing attached client when possible.
+It uses Herdr's documented newline-delimited socket API (0.9.3 or later).
+
+- Code work shares a space by canonical checkout path. Nested directories and
+  symlinks resolve to that checkout; linked worktrees remain separate. Display
+  names alone never select a space, and mixed-repository spaces are not reused.
+- Each click opens a fresh tab with the original app-generated launch script
+  passed as argv. Existing agents never receive shell input or a new prompt.
+  The script and prompt are frozen locally so a later click cannot change a
+  queued tab's instructions.
+- Repo-less CXTasks work uses a per-task scratch directory, grouped by project
+  (or Inbox). Unmapped CXMail work remains in its message scratch directory,
+  grouped by account. Claude's existing flags and MCP setup are preserved.
+- Local routing state lives in `~/Library/Application Support/cx-herdr`. A file
+  lock serializes simultaneous launches. Saved space IDs are checked against
+  live paths or explicit scope metadata, including after Herdr restarts.
+- A failed or unconfirmed handoff is surfaced to the app. It never retries the
+  launch in a different terminal. After a confirmed launch, a display/focus
+  failure is a warning, so the same click cannot launch two sessions.
+
+Verify without touching a live Herdr session:
+
+```sh
+python3 -m unittest discover -s integrations/herdr -v
+```
+
+The socket test needs permission to create a disposable local Unix socket.
+The tests cover matching/creation, same-named repos, worktrees, symlinks, stale
+IDs, explicit project/account identity, argv transport, and no launch retries.
+
+Protocol reference: <https://herdr.dev/docs/socket-api/>.

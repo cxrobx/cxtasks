@@ -1,0 +1,32 @@
+# The canonical-role HTTP surface.
+#
+# Deliberately thin: it owns transport, auth and framing, and nothing else.
+# Every verb it executes comes from `cxtasks_core::api::dispatch`, which is the
+# whole reason Phase 1a collapsed the commands onto one table — a server with
+# its own implementation of "complete a task" is a second answer waiting to
+# drift.
+[package]
+name = "cxtasks-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+
+[[bin]]
+name = "cxtasks-server"
+path = "src/main.rs"
+
+[dependencies]
+cxtasks-core = { path = "../cxtasks-core" }
+
+axum = "0.8"
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip"] }
+
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+subtle = "2"

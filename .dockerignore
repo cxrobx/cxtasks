@@ -1,0 +1,10 @@
+target
+node_modules
+dist
+.git
+src
+src-tauri/gen
+src-tauri/icons
+docs
+deploy
+*.md

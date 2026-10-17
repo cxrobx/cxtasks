@@ -1,0 +1,67 @@
+# The platform-neutral half of CXTasks.
+#
+# What is NOT in this dependency list is the entire point: no tauri, no objc2,
+# no objc2-foundation, no block2, no window-vibrancy. That absence is the
+# boundary. A macOS-only call added to this crate does not fail on some flag
+# nobody passes — it fails to resolve, during `cargo test`, on the machine that
+# typed it.
+#
+# Anything needing an AppHandle, an NSApplication, launchd, or Ghostty belongs
+# in the `cxtasks` crate instead.
+[package]
+name = "cxtasks-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+
+[[bin]]
+name = "cxtasks-mcp"
+path = "src/bin/mcp.rs"
+
+[[bin]]
+name = "cxtasks-runner"
+path = "src/bin/runner.rs"
+
+[dependencies]
+# Blocking HTTP for sync and the optional TypeSafe/Jev integration. Sync itself
+# still lives on a tailnet, but Jev's API is HTTPS, so TLS is now part of the
+# shared client dependency. `json` is used by both; `gzip` keeps snapshots small.
+base64 = "0.22"
+ureq = { version = "2", default-features = false, features = ["json", "gzip", "tls"] }
+
+# The content address for attachment bytes. Pure Rust, no C, so the Linux
+# container check stays a `cargo check` rather than a toolchain hunt.
+sha2 = "0.10"
+hex = "0.4"
+
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# The budget window's timezone, resolved in Rust rather than by SQLite's
+# `localtime`. Pure Rust with a bundled tz database, so a container needs no
+# tzdata package and the answer cannot depend on what the image happens to ship.
+chrono-tz = "0.10"
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+libc = { workspace = true }
+
+tokio = { workspace = true }
+
+# The MCP server. Note this crate builds it for Linux too — the container needs
+# `cxtasks-mcp` beside the runner for a delegated run's write-back (invariant 18).
+rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+env_logger = "0.11"
+
+[dev-dependencies]
+# `trace` is a zero-dependency feature flag that exposes `Connection::trace`,
+# used by `db::tasks`'s update-SQL shape test to capture the statement actually
+# executed. A dev-dependency so it never reaches a production build; under
+# resolver 2 dev-only features do not leak into the normal graph.
+rusqlite = { workspace = true, features = ["trace"] }

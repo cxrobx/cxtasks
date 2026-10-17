@@ -1,0 +1,63 @@
+# Workspace root.
+#
+# The point of this file is a BOUNDARY, not tidiness. `cxtasks-core` (landing
+# next) must not be able to reach `tauri`, `objc2` or `window-vibrancy`,
+# because the runner and the MCP need to build for Linux and today they can't:
+# `lib.rs` declares three `*_macos` modules unconditionally and
+# `runner/mod.rs` calls `notify_macos::show_notification` with no cfg gate.
+#
+# A `#[cfg(feature = "macos")]` split would express the same intent and not
+# enforce it — the next unconditional macOS call compiles fine on the machine
+# that types it, and only fails under `cargo build --no-default-features`,
+# which nobody runs by reflex. A separate crate has those dependencies out of
+# its graph entirely, so the same mistake is a compile error during an ordinary
+# `cargo test`. That matters here specifically: with ~490 tests across 27
+# modules, `cargo test` is this repo's primary verification instrument, and a
+# boundary it exercises by default is worth far more than one that needs a
+# second command.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/*"]
+
+# Shared dependency versions live here so the two crates cannot drift apart.
+#
+# This is not tidiness. `cxtasks-core` and `cxtasks` pass `rusqlite::Connection`
+# and `AppError` across the boundary, so if one crate's rusqlite is bumped and
+# the other's isn't, cargo builds BOTH and the types stop being the same type.
+# The error that produces names one `rusqlite::Connection` and the other
+# `rusqlite::Connection` and says they don't match, which reads as a compiler
+# bug until you notice the two versions. A single source for the version makes
+# the situation unreachable.
+[workspace.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+dirs = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+
+# ── Profiles live HERE, and only here ────────────────────────────────────────
+# `[profile]` in a workspace MEMBER is ignored with a warning. These were in
+# `src-tauri/Cargo.toml`; left there they would have silently stopped applying
+# the moment this file appeared, and the first symptom would be `target/debug`
+# growing without bound — cxmail's hit 15 GB without the dev-package rule.
+[profile.dev.package."*"]
+debug = false
+
+# Our own crates keep line tables only — enough for a backtrace to name a file
+# and line, which is how this project debugs (logs, `tauri dev`). Full DWARF is
+# what gave a debugger variable inspection, and there is no debugger workflow
+# here. Same setting as cxmail; target/debug was 10 GB with full debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = "s"
