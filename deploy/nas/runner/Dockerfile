@@ -40,7 +40,7 @@ COPY src-tauri ./src-tauri
 # than the one the tests passed against.
 RUN cargo build --release --locked -p cxtasks-core --bin cxtasks-runner --bin cxtasks-mcp
 
-FROM --platform=linux/amd64 node:22-bookworm-slim
+FROM --platform=linux/amd64 node:24-bookworm-slim
 
 # git: mirrors are materialized with `git clone --shared`.
 # openssh-client: unused today (the Mac pushes TO here), kept because the

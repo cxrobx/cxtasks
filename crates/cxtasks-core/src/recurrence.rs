@@ -625,7 +625,18 @@ mod tests {
         // Due in an hour, yesterday's date as the anchor's day-of-week is
         // irrelevant for `daily` — what matters is that `next_after` lands
         // inside today.
-        let anchor = Utc::now() - Duration::days(1) + Duration::hours(1);
+        // Halfway to local midnight rather than a flat hour: run after 23:00
+        // and "an hour from now" is tomorrow, which failed the date assert
+        // below every night for an hour.
+        let now = Utc::now();
+        let midnight = (now.with_timezone(&Local).date_naive() + Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
+        let anchor = now - Duration::days(1) + (midnight - now) / 2;
         let t = tasks::create(
             &conn,
             &NewTask {
