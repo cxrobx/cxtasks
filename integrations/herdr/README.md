@@ -22,6 +22,14 @@ It uses Herdr's documented newline-delimited socket API (0.9.3 or later).
 - Local routing state lives in `~/Library/Application Support/cx-herdr`. A file
   lock serializes simultaneous launches. Saved space IDs are checked against
   live paths or explicit scope metadata, including after Herdr restarts.
+- Before a Claude Code launch starts, the router saves Claude Code's folder
+  trust for the git repository it opens in, when a folder above that repository
+  is already trusted. Claude Code stops looking for a trusted parent at a repo
+  root, so a trusted `~/Projects` never covered a repo inside it, and each
+  never-opened repo asked "Do you trust this folder?". A repository with nothing
+  trusted above it still asks. The write takes Claude Code's own
+  `~/.claude.json.lock`; if that is busy or the file is unreadable, nothing is
+  written, the prompt shows, and the launch goes ahead.
 - A failed or unconfirmed handoff is surfaced to the app. It never retries the
   launch in a different terminal. After a confirmed launch, a display/focus
   failure is a warning, so the same click cannot launch two sessions.

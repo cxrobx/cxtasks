@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 import herdr_open as router
 
@@ -178,6 +179,93 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(router.request(socket_path, "test", {"command": argv}), {"ok": True})
         worker.join(2)
         self.assertEqual(seen[0]["params"]["command"], argv)
+
+
+class ClaudeTrustTests(unittest.TestCase):
+    """A trusted ~/Projects doesn't reach a git repo inside it; the router carries that trust across."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="cx-herdr-trust-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.trusted = self.root / "projects"
+        self.repo = self.trusted / "new-repo"
+        self.stray = self.root / "downloads" / "stray-repo"
+        for folder in [self.repo / ".git", self.repo / "src", self.stray / ".git", self.trusted / "plain"]:
+            folder.mkdir(parents=True)
+        self.config = self.root / "claude.json"
+        self.config.write_text(json.dumps({
+            "numStartups": 7, "oauthAccount": {"emailAddress": "dana@example.com"},
+            "projects": {str(self.trusted): {"hasTrustDialogAccepted": True, "allowedTools": ["Bash"]}},
+        }), encoding="utf-8")
+        self.config.chmod(0o600)
+
+    def saved(self):
+        return json.loads(self.config.read_text(encoding="utf-8"))
+
+    def launch_script(self, agent, folder):
+        script = self.root / "launch.command"
+        script.write_text(f"#!/bin/zsh -l\nset -e\ncd '{folder}'\nexec '{agent}' \"$(cat '/tmp/prompt.txt')\"\n", encoding="utf-8")
+        return script
+
+    def test_repo_under_a_trusted_folder_is_trusted_like_accepting_the_prompt(self):
+        self.assertEqual(router.extend_claude_trust(self.repo / "src", self.config), self.repo)
+        saved = self.saved()
+        entry = saved["projects"][str(self.repo)]
+        self.assertIs(entry["hasTrustDialogAccepted"], True)
+        self.assertEqual(entry["allowedTools"], [])
+        self.assertEqual(saved["numStartups"], 7)
+        self.assertEqual(saved["oauthAccount"], {"emailAddress": "dana@example.com"})
+        self.assertEqual(saved["projects"][str(self.trusted)]["allowedTools"], ["Bash"])
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(Path(str(self.config) + ".lock").exists())
+        before = self.config.read_bytes()
+        self.assertIsNone(router.extend_claude_trust(self.repo, self.config))
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_nothing_is_written_where_claude_code_should_still_ask_or_already_trusts(self):
+        before = self.config.read_bytes()
+        self.assertIsNone(router.extend_claude_trust(self.stray, self.config))
+        self.assertIsNone(router.extend_claude_trust(self.trusted / "plain", self.config))
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_waits_out_claude_codes_lock_and_never_takes_it(self):
+        lock = Path(str(self.config) + ".lock")
+        lock.mkdir()
+        self.addCleanup(lambda: lock.exists() and lock.rmdir())
+        with unittest.mock.patch.object(router.time, "sleep"):
+            self.assertIsNone(router.extend_claude_trust(self.repo, self.config))
+        self.assertTrue(lock.is_dir())
+        self.assertNotIn(str(self.repo), self.saved()["projects"])
+
+    def test_only_a_claude_launch_names_a_folder(self):
+        claude = self.launch_script(Path.home() / ".local/bin/claude", self.repo / "src")
+        self.assertEqual(router.claude_folder(claude, self.root), self.repo / "src")
+        versioned = self.launch_script(Path.home() / ".local/share/claude/versions/2.1.312", self.repo)
+        self.assertEqual(router.claude_folder(versioned, self.root), self.repo)
+        codex = self.launch_script("/opt/homebrew/bin/codex", self.repo)
+        self.assertIsNone(router.claude_folder(codex, self.root))
+
+    def test_main_trusts_the_repo_before_the_session_starts(self):
+        script = self.launch_script(Path.home() / ".local/bin/claude", self.repo)
+        seen = {}
+
+        def route(rpc, cwd, launch, label, scope, cache, tab=None):
+            seen["entry"] = self.saved()["projects"].get(str(self.repo))
+            return {"workspace_id": "w", "tab_id": "t"}
+
+        home = self.root / "home"
+        (home / ".local/bin").mkdir(parents=True)
+        (home / ".local/bin/herdr").write_text("#!/bin/sh\n", encoding="utf-8")
+        (home / ".local/bin/herdr").chmod(0o700)
+        with unittest.mock.patch.object(router.Path, "home", return_value=home), \
+                unittest.mock.patch.object(router, "CLAUDE_CONFIG", self.config), \
+                unittest.mock.patch.object(router, "request", return_value={}), \
+                unittest.mock.patch.object(router, "route", side_effect=route), \
+                unittest.mock.patch.object(router, "show_terminal"), \
+                unittest.mock.patch("builtins.print"):
+            self.assertEqual(router.main(["--cwd", str(self.repo), "--launch", str(script)]), 0)
+        self.assertIs(seen["entry"]["hasTrustDialogAccepted"], True)
 
 
 if __name__ == "__main__":

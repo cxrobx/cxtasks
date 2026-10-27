@@ -20,6 +20,13 @@ import uuid
 
 TITLE = "Herdr · CX Apps"
 MAX_RESPONSE = 8 * 1024 * 1024
+CLAUDE_CONFIG = Path.home() / ".claude.json"
+# What Claude Code writes for a project it has no entry for when its trust prompt is accepted.
+NEW_CLAUDE_PROJECT = {
+    "allowedTools": [], "mcpContextUris": [], "mcpServers": {}, "enabledMcpjsonServers": [],
+    "disabledMcpjsonServers": [], "hasTrustDialogAccepted": False,
+    "hasClaudeMdExternalIncludesApproved": False, "hasClaudeMdExternalIncludesWarningShown": False,
+}
 
 
 class RoutingError(Exception):
@@ -146,6 +153,90 @@ def route(rpc, cwd, launch, label, scope, cache, tab=None):
             "working_dir": str(cwd), "scope": scope}
 
 
+def claude_folder(launch, cwd):
+    """Where a launch script starts Claude Code (its `cd`, else the pane's cwd); None for any other agent."""
+    folder, agent = None, None
+    for line in launch.read_text(encoding="utf-8").splitlines():
+        try:
+            words = shlex.split(line)
+        except ValueError:
+            continue
+        if len(words) > 1 and words[0] == "cd":  # Also `cd <folder> || exit 1`.
+            folder = words[1]
+        elif len(words) > 1 and words[0] == "exec":
+            agent = words[1]
+    if not agent or "claude" not in Path(agent).parts:
+        return None
+    return Path(folder) if folder else cwd
+
+
+def extend_claude_trust(folder, config=None):
+    """Save Claude Code trust for the repository `folder` is in, as accepting its prompt there would.
+
+    Claude Code (2.1.312) trusts a folder when it or a folder above it holds
+    hasTrustDialogAccepted in ~/.claude.json, but inside a git repository the
+    search stops at the repository root. So a trusted ~/Projects never covered a
+    repo inside it, and a handoff to one never opened before opened behind "Do
+    you trust this folder?". Only the trust you already gave a folder above the
+    repository is carried across; a repository with nothing trusted above it
+    still asks. Written under Claude Code's own lock (`.claude.json.lock`, the
+    proper-lockfile directory both of its save paths take); busy or unreadable,
+    nothing is written and the prompt shows. Returns the repository it trusted.
+    """
+    config = Path(config or CLAUDE_CONFIG)
+    path = Path(folder).resolve()
+    root = next((p for p in [path, *path.parents] if (p / ".git").exists()), None)
+    if root is None or root == Path.home().resolve():
+        return None
+    lock = Path(str(config) + ".lock")
+    for _ in range(40):
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+    else:
+        return None
+    try:
+        target = config.resolve()
+        try:
+            settings = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        projects = settings.get("projects", {}) if isinstance(settings, dict) else None
+        if not isinstance(projects, dict):
+            return None
+
+        def trusted(start, limit):
+            for candidate in [start, *start.parents]:
+                entry = projects.get(str(candidate))
+                if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+                    return True
+                if candidate == limit:
+                    return False
+            return False
+
+        if trusted(path, root) or not trusted(root.parent, None):
+            return None
+        entry = projects.get(str(root))
+        entry = dict(entry) if isinstance(entry, dict) else dict(NEW_CLAUDE_PROJECT)
+        entry["hasTrustDialogAccepted"] = True
+        projects[str(root)] = entry
+        settings["projects"] = projects
+        staging = target.with_name(f"{target.name}.cx-herdr-{os.getpid()}.tmp")
+        try:
+            descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, target.stat().st_mode & 0o777)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(settings, handle, indent=2, ensure_ascii=False)
+            os.replace(staging, target)
+        except OSError:
+            staging.unlink(missing_ok=True)
+            return None
+        return root
+    finally:
+        lock.rmdir()
+
+
 def terminal_script(state_dir, herdr):
     script = state_dir / "attach.command"
     script.write_text(
@@ -262,6 +353,13 @@ def main(argv=None):
             cache = {}
         tab = args.tab or tab_label(launch)
         frozen = freeze_launch(launch, state_dir)
+        # Before layout.apply starts it, so a Claude session in a repo never opened before skips the trust prompt.
+        try:
+            folder = claude_folder(frozen, cwd)
+            if folder:
+                extend_claude_trust(folder)
+        except (OSError, ValueError):
+            pass  # Never a reason not to launch; the prompt shows as it always did.
         result = route(rpc, cwd, frozen, args.space or repo_root(cwd).name, args.scope, cache, tab)
         # Past layout.apply, errors are presentation errors, never a reason to
         # return failure and cause a second launch on the next click.
