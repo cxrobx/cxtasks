@@ -10,10 +10,16 @@ in Ghostty when needed and focuses the existing attached client when possible.
 It uses Herdr's documented newline-delimited socket API (0.9.3 or later).
 
 - Code work shares a space by canonical checkout path. Nested directories and
-  symlinks resolve to that checkout; linked worktrees remain separate. Display
-  names alone never select a space, and mixed-repository spaces are not reused.
+  symlinks resolve to that checkout; linked worktrees remain separate. Existing
+  checkout/scope matches win. Otherwise a matching space name is reused, ignoring
+  capitalization, spaces, and punctuation (for example, Quick Ask and QuickAsk).
+  A different checkout or explicit project/account identity blocks that name
+  match. Among matching names, a space already running an agent is preferred.
+  A fresh space is created only when no compatible existing space is found.
 - Each click opens a fresh tab with the original app-generated launch script
   passed as argv. Existing agents never receive shell input or a new prompt.
+  On a new space, `layout.apply` targets only its initial `tab_id`; on a reused
+  space it targets only `workspace_id`. Herdr rejects requests containing both.
   The script and prompt are frozen locally so a later click cannot change a
   queued tab's instructions.
 - Repo-less CXTasks work uses a per-task scratch directory, grouped by project
@@ -41,7 +47,9 @@ python3 -m unittest discover -s integrations/herdr -v
 ```
 
 The socket test needs permission to create a disposable local Unix socket.
-The tests cover matching/creation, same-named repos, worktrees, symlinks, stale
-IDs, explicit project/account identity, argv transport, and no launch retries.
+The tests cover matching/creation, name variations, existing-space preference,
+same-named repos, worktrees, symlinks, stale IDs, explicit project/account identity,
+exclusive layout targets, launching the original Claude script, argv transport,
+and no launch retries.
 
 Protocol reference: <https://herdr.dev/docs/socket-api/>.

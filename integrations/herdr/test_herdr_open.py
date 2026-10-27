@@ -26,7 +26,9 @@ class FakeHerdr:
         if method == "workspace.create":
             return {"workspace": {"workspace_id": "created"}, "tab": {"tab_id": "initial"}}
         if method == "layout.apply":
-            return {"layout": {"workspace_id": params["workspace_id"], "tab_id": "new-tab",
+            if ("workspace_id" in params) == ("tab_id" in params):
+                raise router.RoutingError("layout.apply requires exactly one target")
+            return {"layout": {"workspace_id": params.get("workspace_id", "created"), "tab_id": "new-tab",
                                "focused_pane_id": "new-pane"}}
         return {}
 
@@ -52,6 +54,7 @@ class RoutingTests(unittest.TestCase):
         self.assertNotIn("workspace.create", methods)
         params = next(p for m, p in rpc.calls if m == "layout.apply")
         self.assertNotIn("tab_id", params)  # Never replaces an existing tab.
+        self.assertEqual(params["workspace_id"], "right")
         self.assertEqual(params["root"]["command"], ["/bin/zsh", "-l", str(self.launch)])
 
     def test_creates_space_when_another_repo_has_the_same_name(self):
@@ -62,6 +65,92 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(result["created_space"])
         params = next(p for m, p in rpc.calls if m == "layout.apply")
         self.assertEqual(params["tab_id"], "initial")  # Only the newly created shell is replaced.
+        self.assertNotIn("workspace_id", params)
+
+    def test_reuses_named_space_with_spacing_and_case_differences(self):
+        rpc = FakeHerdr([{"workspace_id": "existing", "label": "QUICK ASK"}],
+                        [self.pane("existing", self.root)])
+        result = router.route(rpc, self.repo, self.launch, "QuickAsk", None, {})
+        self.assertEqual(result["workspace_id"], "existing")
+        self.assertFalse(result["created_space"])
+        self.assertNotIn("workspace.create", [method for method, _ in rpc.calls])
+        params = next(p for method, p in rpc.calls if method == "layout.apply")
+        self.assertEqual(params["workspace_id"], "existing")
+        self.assertNotIn("tab_id", params)  # Add a tab; preserve every existing tab/process.
+        self.assertEqual(params["root"]["cwd"], str(self.repo))
+
+    def test_reuses_matching_named_space_without_pane_directory_metadata(self):
+        rpc = FakeHerdr([{"workspace_id": "existing", "label": "Quick-Ask"}],
+                        [{"workspace_id": "existing"}])
+        result = router.route(rpc, self.repo, self.launch, "Quick Ask", None, {})
+        self.assertEqual(result["workspace_id"], "existing")
+        self.assertFalse(result["created_space"])
+
+    def test_general_handoff_reuses_existing_project_space(self):
+        rpc = FakeHerdr([{"workspace_id": "code", "label": "QuickAsk"}],
+                        [self.pane("code", self.repo, tokens={"cx_scope": "path:" + str(self.repo)})])
+        result = router.route(rpc, self.root, self.launch, "Quick Ask", "quickask:general", {})
+        self.assertEqual(result["workspace_id"], "code")
+        self.assertFalse(result["created_space"])
+
+    def test_named_space_never_overrides_a_different_checkout(self):
+        other = self.root / "different-project"
+        other.mkdir()
+        subprocess.run(["/usr/bin/git", "init", "-q", str(other)], check=True)
+        rpc = FakeHerdr([{"workspace_id": "wrong", "label": "Quick Ask"}],
+                        [self.pane("wrong", other)])
+        result = router.route(rpc, self.repo, self.launch, "QuickAsk", None, {})
+        self.assertTrue(result["created_space"])
+
+    def test_named_space_never_overrides_a_different_explicit_account(self):
+        rpc = FakeHerdr([{"workspace_id": "wrong", "label": "Inbox"}],
+                        [self.pane("wrong", self.root, tokens={"cx_scope": "cxmail:other"})])
+        result = router.route(rpc, self.repo, self.launch, "Inbox", "cxmail:requested", {})
+        self.assertTrue(result["created_space"])
+
+    def test_known_checkout_wins_over_a_named_space(self):
+        rpc = FakeHerdr([{"workspace_id": "named", "label": "Quick Ask"},
+                         {"workspace_id": "exact", "label": "Development"}],
+                        [self.pane("named", self.root, agent="claude"), self.pane("exact", self.repo)])
+        result = router.route(rpc, self.repo, self.launch, "QuickAsk", None, {})
+        self.assertEqual(result["workspace_id"], "exact")
+        self.assertFalse(result["created_space"])
+
+    def test_duplicate_names_prefer_the_space_already_running_an_agent(self):
+        rpc = FakeHerdr([{"workspace_id": "empty", "label": "Quick Ask"},
+                         {"workspace_id": "active", "label": "QuickAsk"}],
+                        [self.pane("empty", self.root), self.pane("active", self.root, agent="claude")])
+        result = router.route(rpc, self.repo, self.launch, "Quick Ask", None, {})
+        self.assertEqual(result["workspace_id"], "active")
+        self.assertFalse(result["created_space"])
+
+    def test_new_space_executes_the_original_claude_launch_script(self):
+        prompt = self.root / "prompt.txt"
+        prompt.write_text("Fix the requested QuickAsk issue.\nPreserve café and quotes: ' \".")
+        captured = self.root / "claude-started.json"
+        fake_claude = self.root / "fake claude"
+        fake_claude.write_text(
+            "#!/usr/bin/python3\nimport json,sys\n"
+            + "open(" + repr(str(captured)) + ", 'w').write(json.dumps(sys.argv[1:]))\n"
+        )
+        fake_claude.chmod(0o700)
+        quote = router.shlex.quote
+        self.launch.write_text(
+            "#!/bin/zsh -f\nset -eu\nexec " + quote(str(fake_claude))
+            + ' -- "$(cat ' + quote(str(prompt)) + ')"\n'
+        )
+        rpc = FakeHerdr()
+
+        def execute_layout(method, params=None):
+            result = rpc(method, params)  # Validate the real target exclusivity rule first.
+            if method == "layout.apply":
+                subprocess.run(params["root"]["command"], cwd=params["root"]["cwd"],
+                               check=True, capture_output=True, text=True)
+            return result
+
+        result = router.route(execute_layout, self.repo, self.launch, "Quick Ask", "quickask:general", {})
+        self.assertTrue(result["created_space"])
+        self.assertEqual(json.loads(captured.read_text()), ["--", prompt.read_text()])
 
     def test_stale_cached_id_cannot_route_into_a_different_repo(self):
         other = self.root / "other"
@@ -97,7 +186,7 @@ class RoutingTests(unittest.TestCase):
         subprocess.run(["/usr/bin/git", "-C", str(self.repo), "worktree", "add", "--detach", str(child)],
                        check=True, capture_output=True)
         self.assertEqual(router.repo_root(child), child)
-        rpc = FakeHerdr([{"workspace_id": "main"}], [self.pane("main", self.repo)])
+        rpc = FakeHerdr([{"workspace_id": "main", "label": "Repo"}], [self.pane("main", self.repo)])
         self.assertTrue(router.route(rpc, child, self.launch, "Repo", None, {})["created_space"])
 
     def test_project_space_reuses_explicit_identity_across_task_scratch_dirs(self):

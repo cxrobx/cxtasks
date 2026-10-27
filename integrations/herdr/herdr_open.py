@@ -67,8 +67,13 @@ def repo_root(folder):
     return Path(result.stdout.strip()).resolve() if result.returncode == 0 else folder
 
 
-def select_workspace(workspaces, panes, scope, cached, path_scope):
-    """Validate cached IDs against live state; never match just a display name."""
+def space_name(value):
+    """Treat spacing, punctuation, and capitalization as display differences."""
+    return "".join(char for char in (value or "").casefold() if char.isalnum())
+
+
+def select_workspace(workspaces, panes, scope, cached, path_scope, label=None):
+    """Prefer proven checkout/scope identity, then a compatible named space."""
     ids = {w["workspace_id"] for w in workspaces}
     candidates = {}
     for pane in panes:
@@ -95,7 +100,42 @@ def select_workspace(workspaces, panes, scope, cached, path_scope):
         )
     if cached_id and belongs(cached_id):
         return cached_id
-    return next((w["workspace_id"] for w in workspaces if belongs(w["workspace_id"])), None)
+    aligned = next((w["workspace_id"] for w in workspaces if belongs(w["workspace_id"])), None)
+    if aligned:
+        return aligned
+
+    wanted = space_name(label)
+    if not wanted:
+        return None
+
+    def compatible(workspace):
+        wid = workspace["workspace_id"]
+        if space_name(workspace.get("label")) != wanted:
+            return False
+        for pane in panes:
+            if pane.get("workspace_id") != wid:
+                continue
+            tagged = pane.get("tokens", {}).get("cx_scope", "")
+            if tagged and tagged != scope and tagged.split(":", 1)[0] == scope.split(":", 1)[0]:
+                return False  # Distinct projects/accounts retain their explicit identity.
+        if path_scope:
+            for folder in candidates.get(wid, set()):
+                if folder == "unknown" or folder == path_scope:
+                    continue
+                root = Path(folder)
+                if (root / ".git").exists() or space_name(root.name) == wanted:
+                    return False  # A name never overrides a different checkout/worktree.
+        return True
+
+    matches = [w for w in workspaces if compatible(w)]
+    if not matches:
+        return None
+    # Prefer an established working space over an empty shell left by a failed launch.
+    def activity(workspace):
+        wid = workspace["workspace_id"]
+        has_agent = any(p.get("workspace_id") == wid and p.get("agent") for p in panes)
+        return (bool(has_agent), workspace.get("tab_count", 0))
+    return max(matches, key=activity)["workspace_id"]
 
 
 def tab_label(launch):
@@ -116,7 +156,7 @@ def route(rpc, cwd, launch, label, scope, cache, tab=None):
     scope = scope or "path:" + path_scope
     workspaces = rpc("workspace.list")["workspaces"]
     panes = rpc("pane.list")["panes"]
-    wid = select_workspace(workspaces, panes, scope, cache.get(scope), path_scope)
+    wid = select_workspace(workspaces, panes, scope, cache.get(scope), path_scope, label)
     created = wid is None
     initial_tab = None
     if created:
@@ -126,13 +166,16 @@ def route(rpc, cwd, launch, label, scope, cache, tab=None):
     # Replacing only the tab just created avoids an unused shell in a new space.
     # Existing workspaces get a new tab; no existing process is replaced.
     params = {
-        "workspace_id": wid, "tab_label": tab or tab_label(launch),
+        "tab_label": tab or tab_label(launch),
         "focus": True,
         "root": {"type": "pane", "cwd": str(cwd),
                  "command": ["/bin/zsh", "-l", str(launch)]},
     }
+    # Herdr requires exactly one target: tab_id already identifies its workspace.
     if initial_tab:
         params["tab_id"] = initial_tab
+    else:
+        params["workspace_id"] = wid
     layout = rpc("layout.apply", params)["layout"]
     # Tag the pane so project/inbox spaces with distinct scratch directories
     # have explicit identity. Metadata is display-only, so a local cache is
