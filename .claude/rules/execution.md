@@ -1128,6 +1128,15 @@ elsewhere and quiet for `max(3 × cadence, 3 days)`, another host reports it thr
 the orphan path, naming the machine. An unassigned script still runs wherever it
 is held, and an unassigned agent check belongs to the default.
 
+## A run's PATH
+
+launchd starts the runner on a bare PATH, and Claude Code keeps the PATH it was
+started with, even with `SHELL` set. `providers::agent_path` gives every Claude
+run the login shell's PATH, or a shell-tier run can't find `cargo`, `node` or
+`uv`, and reaches the real `xcodebuild` past the mini's guard in `~/.local/bin`.
+It's set where the CLI is spawned because the app rewrites the plist. Tripwire
+scripts don't get it: they're written for the bare PATH and use absolute paths.
+
 ## Scripts-only hosts
 
 A host declaring **no workspaces** (`CXTASKS_HOST_WORKSPACES=none`) evaluates the

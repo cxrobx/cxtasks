@@ -23,6 +23,48 @@ use crate::runner::ToolTier;
 pub mod claude;
 pub mod codex;
 
+/// The PATH a background agent's shell commands run with.
+///
+/// launchd starts the runner on `/usr/bin:/bin:/usr/sbin:/sbin`, and Claude Code
+/// keeps the PATH it was started with: setting `SHELL` doesn't help, because the
+/// session's zsh is handed the inherited value back. So without this a run can't
+/// find `cargo`, `node` or `uv`, and it reaches the real `/usr/bin/xcodebuild`
+/// past the Mac mini's guard in `~/.local/bin`, whose job is to stop builds
+/// freezing that machine. The fix lives here rather than in the plist because the
+/// app rewrites the plist when it installs the runner.
+///
+/// A host with no zsh (the NAS container) keeps what it inherited.
+pub fn agent_path() -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    merge_path(login_shell_path().as_deref(), &inherited)
+}
+
+fn login_shell_path() -> Option<String> {
+    let out = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg(r#"printf '%s\n' "$PATH""#)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // The last line, because a login file may print something of its own.
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().last().map(str::to_string)
+}
+
+/// The login shell's directories first, then anything only the runner had.
+fn merge_path(login: Option<&str>, inherited: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    login
+        .unwrap_or_default()
+        .split(':')
+        .chain(inherited.split(':'))
+        .filter(|dir| dir.starts_with('/') && seen.insert(*dir))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// The reduced write-back MCP binary, when this install can actually launch it.
 ///
 /// Both providers derive their command line and their prompt tail from this
@@ -668,5 +710,29 @@ impl Provider {
             Self::Claude => {}
             Self::Codex => codex::finalize(summary, req),
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::merge_path;
+
+    #[test]
+    fn a_run_gets_the_login_paths_first_and_keeps_the_runners_own() {
+        assert_eq!(
+            merge_path(Some("/h/.cargo/bin:/h/.local/bin:/usr/bin"), "/usr/bin:/bin"),
+            "/h/.cargo/bin:/h/.local/bin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_login_shell_keeps_what_it_inherited() {
+        assert_eq!(merge_path(None, "/usr/bin:/bin"), "/usr/bin:/bin");
+    }
+
+    #[test]
+    fn a_login_line_that_is_not_a_path_adds_nothing() {
+        assert_eq!(merge_path(Some("welcome back"), "/usr/bin"), "/usr/bin");
+        assert_eq!(merge_path(Some(""), "/usr/bin"), "/usr/bin");
     }
 }

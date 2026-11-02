@@ -97,6 +97,7 @@ pub fn command(cli: &Path, req: &RunRequest) -> Command {
     };
     let mut cmd = Command::new(cli);
     cmd.current_dir(&req.repo)
+        .env("PATH", super::agent_path())
         .arg("-p")
         .arg(&req.prompt)
         .arg("--output-format")
