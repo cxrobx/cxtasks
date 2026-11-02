@@ -495,6 +495,16 @@ class RemoteHostTests(unittest.TestCase):
         self.open()
         self.assertIn(router.shlex.quote(router.window_title("cx@mini")), self.calls()[-1][-1])
 
+    def test_a_linked_home_folder_still_freezes_the_prompt(self):
+        link = self.root / "linked"
+        link.symlink_to(self.session)
+        written = link / "prompt.txt"
+        self.launch.write_text(f"exec claude -- \"$(cat '{written}')\"\n", encoding="utf-8")
+        state = self.root / "frozen-state"
+        frozen = router.freeze_launch(self.launch.resolve(), state, link / "launch.command")
+        self.assertNotIn(str(written), frozen.read_text(encoding="utf-8"))
+        self.assertIn(str(frozen.parent / "prompt.txt"), frozen.read_text(encoding="utf-8"))
+
     def test_the_host_moves_the_attached_client_to_the_new_tab(self):
         def opened(*args, **kwargs):
             return {"workspace_id": "w", "tab_id": "t"}

@@ -305,8 +305,12 @@ def terminal_script(state_dir, herdr, host=None):
     return script
 
 
-def freeze_launch(launch, state_dir):
-    """Keep a queued tab's prompt stable when the app reuses its scratch dir."""
+def freeze_launch(launch, state_dir, spelled=None):
+    """Keep a queued tab's prompt stable when the app reuses its scratch dir.
+
+    `spelled` is the path as the client wrote it. A linked home folder resolves
+    to another spelling than the one inside the script, and only that one matches.
+    """
     destination = state_dir / "launches" / uuid.uuid4().hex
     destination.mkdir(mode=0o700, parents=True)
     text = launch.read_text(encoding="utf-8")
@@ -318,7 +322,8 @@ def freeze_launch(launch, state_dir):
         # All three apps shell-quote this explicit absolute filename. Preserve
         # the invocation and flags; only the cat input becomes immutable.
         quote = lambda path: "'" + str(path).replace("'", "'\\''") + "'"
-        text = text.replace(quote(prompt), quote(frozen_prompt))
+        for original in (prompt, Path(spelled or launch).parent / "prompt.txt"):
+            text = text.replace(quote(original), quote(frozen_prompt))
     frozen = destination / "launch.command"
     frozen.write_text(text, encoding="utf-8")
     frozen.chmod(0o700)
@@ -486,7 +491,7 @@ def main(argv=None):
         except (OSError, ValueError):
             cache = {}
         tab = args.tab or tab_label(launch)
-        frozen = freeze_launch(launch, state_dir)
+        frozen = freeze_launch(launch, state_dir, args.launch)
         # Before layout.apply starts it, so a Claude session in a repo never opened before skips the trust prompt.
         try:
             folder = claude_folder(frozen, cwd)
