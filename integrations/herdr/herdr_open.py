@@ -34,6 +34,11 @@ NEW_CLAUDE_PROJECT = {
 }
 
 
+def window_title(host=None):
+    """A window attached to another Mac has its own title, so a local client can't be mistaken for it."""
+    return f"{TITLE} · {host}" if host else TITLE
+
+
 class RoutingError(Exception):
     pass
 
@@ -340,7 +345,7 @@ end tell
 end run'''
     try:
         result = subprocess.run(
-            ["/usr/bin/osascript", "-e", apple, TITLE, str(cwd), shlex.quote(str(script))],
+            ["/usr/bin/osascript", "-e", apple, window_title(host), str(cwd), shlex.quote(str(script))],
             capture_output=True, text=True, timeout=8,
         )
         if result.returncode == 0 and result.stdout.strip() in {"opened", "focused"}:
@@ -393,7 +398,7 @@ def open_on_host(host, args, launch):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._@%-]*", host):
         raise HostError(f"{HOST_VARIABLE} isn't an SSH target: use a name or user@host.")
     send_session(host, launch.parent)
-    words = ["--headless", "--cwd", str(args.cwd), "--launch", str(launch)]
+    words = ["--headless", "--window-title", window_title(host), "--cwd", str(args.cwd), "--launch", str(launch)]
     for flag, value in (("--space", args.space), ("--scope", args.scope), ("--tab", args.tab)):
         if value:
             words += [flag, value]
@@ -424,6 +429,7 @@ def main(argv=None):
     parser.add_argument("--tab", help="Label for the fresh conversation tab")
     parser.add_argument("--headless", action="store_true",
                         help="Run for another Mac: open the session here and show no terminal")
+    parser.add_argument("--window-title", help="Title for the attached client's window")
     args = parser.parse_args(argv)
     launch = args.launch.resolve(strict=True)
     herdr = Path.home() / ".local/bin/herdr"
@@ -493,7 +499,7 @@ def main(argv=None):
         # return failure and cause a second launch on the next click.
         try:
             cache_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-            rpc("client.window_title.set", {"title": TITLE})
+            rpc("client.window_title.set", {"title": args.window_title or TITLE})
             if not args.headless:
                 time.sleep(0.1)  # Let the attached client emit the title to Ghostty.
                 show_terminal(herdr, state_dir, cwd)

@@ -489,6 +489,12 @@ class RemoteHostTests(unittest.TestCase):
         script = router.terminal_script(state, Path("/bin/herdr")).read_text(encoding="utf-8")
         self.assertIn("/bin/herdr --session default", script)
 
+    def test_a_window_on_another_mac_can_never_match_the_local_one(self):
+        # 2026-11-01: the local client's window held the shared title, so the handoff focused it and no attach started.
+        self.assertNotEqual(router.window_title("cx@mini"), router.window_title())
+        self.open()
+        self.assertIn(router.shlex.quote(router.window_title("cx@mini")), self.calls()[-1][-1])
+
     def test_a_bare_claude_command_still_earns_trust_on_the_host(self):
         self.launch.write_text("cd /repo\nexec 'claude' --model opus -- \"$(cat p)\"\n", encoding="utf-8")
         self.assertEqual(router.claude_folder(self.launch, self.root), Path("/repo"))
