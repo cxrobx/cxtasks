@@ -91,6 +91,10 @@ editing `claude-plugin/commands/*.md` here does nothing until
    and cannot see the calling session's cwd; `current_dir()` there is the *client's*
    launch dir, not the user's repo. `claude-plugin/commands/task.md` instructs Claude
    to pass `pwd`.
+   The folder must exist on the filing machine only when that machine would run the
+   task. If `run_on` names another host, or nothing does and another host takes
+   unassigned work, `repo_path` need only be absolute: the mini holds repos the
+   laptop doesn't, and the host that runs the task refuses a folder it lacks.
 
 28. **A self-initiated filing declares WHY it isn't being done now.** `file_task`
     takes a required `why` (validated in the handler, not by the deserializer, so

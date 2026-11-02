@@ -1068,6 +1068,14 @@ fn clear_or_set(v: Option<i64>) -> Option<Option<i64>> {
 /// Reject a repo_path that isn't a usable absolute directory rather than
 /// storing a value that will fail at dispatch time, hours later.
 fn validate_repo_path(raw: &str) -> Result<String, McpError> {
+    validate_repo_path_for(raw, false)
+}
+
+/// `runs_elsewhere` means another machine will do the work, so a folder missing
+/// HERE proves nothing: the mini holds repos the laptop doesn't, and the task is
+/// filed from wherever Chris happens to be. The path must still be absolute, and
+/// the machine that runs it refuses a folder it doesn't have.
+fn validate_repo_path_for(raw: &str, runs_elsewhere: bool) -> Result<String, McpError> {
     let trimmed = raw.trim();
     let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
         dirs::home_dir()
@@ -1082,13 +1090,30 @@ fn validate_repo_path(raw: &str) -> Result<String, McpError> {
             None,
         ));
     }
-    if !expanded.is_dir() {
+    if !expanded.is_dir() && !runs_elsewhere {
         return Err(McpError::invalid_params(
             format!("repo_path '{}' is not an existing directory", expanded.display()),
             None,
         ));
     }
     Ok(expanded.to_string_lossy().to_string())
+}
+
+/// Whether a task runs on another machine: the one it names, or failing that the
+/// host that takes unassigned work. Anything unknown answers no, which keeps the
+/// stricter check.
+fn runs_elsewhere(
+    conn: &rusqlite::Connection,
+    named: Option<&str>,
+    this_host: &str,
+) -> bool {
+    match named {
+        Some(id) => id != this_host,
+        None => matches!(
+            db::hosts::default_host(conn),
+            Ok(Some(host)) if host.id != this_host
+        ),
+    }
 }
 
 fn parse_view(raw: Option<&str>) -> Result<db::tasks::View, McpError> {
@@ -1908,8 +1933,22 @@ impl CxTasksMcp {
         };
         let self_initiated = why != WHY_CHRIS_ASKED;
 
+        let run_on = match params.run_on.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => {
+                let conn = self.open_db()?;
+                let host = db::hosts::resolve(&conn, name)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                Some(host.id)
+            }
+            None => None,
+        };
+
         let repo_path = match params.repo_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(raw) => Some(validate_repo_path(raw)?),
+            Some(raw) => {
+                let elsewhere =
+                    runs_elsewhere(&self.open_db()?, run_on.as_deref(), &crate::host::host_id());
+                Some(validate_repo_path_for(raw, elsewhere)?)
+            }
             None => None,
         };
 
@@ -1987,16 +2026,6 @@ impl CxTasksMcp {
             None => None,
         };
         let project = given.map(str::to_string).or_else(|| owner.clone());
-
-        let run_on = match params.run_on.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(name) => {
-                let conn = self.open_db()?;
-                let host = db::hosts::resolve(&conn, name)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Some(host.id)
-            }
-            None => None,
-        };
 
         let new = db::tasks::NewTask {
             // Server-side creation: let the DB mint the id.
@@ -2359,8 +2388,30 @@ impl CxTasksMcp {
         &self,
         Parameters(params): Parameters<UpdateTaskParams>,
     ) -> Result<CallToolResult, McpError> {
+        let run_on = match params.run_on.as_deref().map(str::trim) {
+            Some("") => Some(None),
+            Some(name) => {
+                let conn = self.open_db()?;
+                let host = db::hosts::resolve(&conn, name)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                Some(Some(host.id))
+            }
+            None => None,
+        };
         let repo_path = match params.repo_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(raw) => Some(Some(validate_repo_path(raw)?)),
+            Some(raw) => {
+                let conn = self.open_db()?;
+                // A machine set in this call wins; otherwise the task keeps its own.
+                let named = match &run_on {
+                    Some(id) => id.clone(),
+                    None => db::tasks::resolve_ref(&conn, &params.task_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.run_on),
+                };
+                let elsewhere = runs_elsewhere(&conn, named.as_deref(), &crate::host::host_id());
+                Some(Some(validate_repo_path_for(raw, elsewhere)?))
+            }
             None => None,
         };
         if let Some(rule) = params.recurrence.as_deref().filter(|r| !r.trim().is_empty()) {
@@ -2399,16 +2450,6 @@ impl CxTasksMcp {
             .as_deref()
             .map(|b| crate::prose::render_note(b, crate::prose::Channel::Notes))
             .unwrap_or_default();
-        let run_on = match params.run_on.as_deref().map(str::trim) {
-            Some("") => Some(None),
-            Some(name) => {
-                let conn = self.open_db()?;
-                let host = db::hosts::resolve(&conn, name)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Some(Some(host.id))
-            }
-            None => None,
-        };
         let patch = db::tasks::TaskPatch {
             title: params.title,
             body: params.body.map(Some),
@@ -4062,6 +4103,26 @@ mod tests {
         let tmp = std::env::temp_dir();
         let ok = validate_repo_path(&tmp.to_string_lossy()).unwrap();
         assert!(Path::new(&ok).is_dir());
+    }
+
+    #[test]
+    fn a_folder_missing_here_is_fine_when_another_machine_runs_the_task() {
+        let gone = "/definitely/not/here/12345";
+        assert!(validate_repo_path_for(gone, false).is_err());
+        assert_eq!(validate_repo_path_for(gone, true).unwrap(), gone);
+        // Still has to be a path a machine could use.
+        assert!(validate_repo_path_for("Projects/cxventures", true).is_err());
+    }
+
+    #[test]
+    fn who_runs_a_task_decides_whether_its_folder_must_be_here() {
+        let (dir, db) = test_db("mcp-runs-elsewhere");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // No default host known: the stricter check stays.
+        assert!(!runs_elsewhere(&conn, None, "laptop"));
+        assert!(runs_elsewhere(&conn, Some("mini"), "laptop"));
+        assert!(!runs_elsewhere(&conn, Some("laptop"), "laptop"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── queueing through update_task ──────────────────────────────────────
