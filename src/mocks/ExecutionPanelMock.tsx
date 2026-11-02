@@ -30,6 +30,7 @@ const TASK: Task = {
   bg_writes_allowed: false,
   bg_shell_allowed: true,
   bg_remote_allowed: false,
+  run_on: null,
   bg_mcp_servers: null,
   reminded_at: null,
   model: null,

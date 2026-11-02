@@ -131,20 +131,41 @@ pub fn claim_due(conn: &Connection, dir: &Path, limit: usize) -> Result<Vec<Clai
             break;
         }
         let Some(spec) = task.tripwire.clone() else { continue };
+        let since = runtime
+            .checked_at
+            .as_deref()
+            .or(runtime.requested_at.as_deref())
+            .or(Some(task.created_at.as_str()))
+            .and_then(tripwire::parse_stamp);
+        let orphaned = tripwire::is_orphaned(
+            task.tripwire_every_minutes,
+            since,
+            runtime.last_note.as_deref(),
+            now,
+        );
+        let assigned_elsewhere = task.run_on.as_deref().is_some_and(|id| id != host);
         let check = match Tripwire::parse(&spec) {
-            Ok(Tripwire::Script { name, .. }) if !tripwire::script_is_held_in(dir, &name) => {
-                let since = runtime
-                    .checked_at
-                    .as_deref()
-                    .or(runtime.requested_at.as_deref())
-                    .or(Some(task.created_at.as_str()))
-                    .and_then(tripwire::parse_stamp);
-                if !tripwire::is_orphaned(
-                    task.tripwire_every_minutes,
-                    since,
-                    runtime.last_note.as_deref(),
-                    now,
-                ) {
+            // Assigned to another machine: this host never evaluates it, of any
+            // kind, but it does say so if that machine has gone quiet.
+            Ok(_) if assigned_elsewhere => {
+                if !orphaned {
+                    continue;
+                }
+                let id = task.run_on.as_deref().unwrap_or_default();
+                let label = db::hosts::get(conn, id)?.map(|h| h.label).unwrap_or_else(|| id.into());
+                Check::Unsupported(format!(
+                    "{} since {}. This task is assigned to {label}. Check that machine is on, or \
+                     pick another one in Run on.",
+                    tripwire::ORPHAN_NOTE,
+                    since.map(|s| s.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "it began".into()),
+                ))
+            }
+            // Assigned here: a missing script is this host's own error, so it
+            // falls through and fails where it can be fixed.
+            Ok(Tripwire::Script { name, .. })
+                if task.run_on.is_none() && !tripwire::script_is_held_in(dir, &name) =>
+            {
+                if !orphaned {
                     continue;
                 }
                 Check::Unsupported(format!(
@@ -276,9 +297,13 @@ pub fn check_model_for(task: &Task, settings: &BudgetSettings) -> Option<String>
 /// prints beside "due now", so a due count that isn't this host's work doesn't
 /// read as a stuck runner.
 pub fn due_elsewhere(conn: &Connection, dir: &Path) -> Result<usize, AppError> {
+    let host = crate::host::host_id();
     Ok(db::tripwires::list_due(conn, usize::MAX)?
         .iter()
         .filter(|(task, _)| {
+            if let Some(id) = task.run_on.as_deref() {
+                return id != host;
+            }
             matches!(
                 task.tripwire.as_deref().map(Tripwire::parse),
                 Some(Ok(Tripwire::Script { ref name, .. })) if !tripwire::script_is_held_in(dir, name)
@@ -288,8 +313,14 @@ pub fn due_elsewhere(conn: &Connection, dir: &Path) -> Result<usize, AppError> {
 }
 
 /// The ONE due agent tripwire the lane would run next, if any.
-fn next_due_agent(conn: &Connection) -> Result<Option<(Task, String, String)>, AppError> {
+fn next_due_agent(
+    conn: &Connection,
+    cap: &crate::routing::HostCapability,
+) -> Result<Option<(Task, String, String)>, AppError> {
     for (task, _rt) in db::tripwires::list_due(conn, DUE_SCAN)? {
+        if !cap.is_mine(task.run_on.as_deref()) {
+            continue;
+        }
         let Some(spec) = task.tripwire.clone() else { continue };
         if let Ok(Tripwire::Agent { condition }) = Tripwire::parse(&spec) {
             return Ok(Some((task, spec, condition)));
@@ -335,7 +366,7 @@ pub fn agent_pass(
     if slots < 1 {
         return Ok(0);
     }
-    let Some((task, spec, _condition)) = next_due_agent(conn)? else {
+    let Some((task, spec, _condition)) = next_due_agent(conn, cap)? else {
         return Ok(0);
     };
     let label = task.short_id.map(|n| format!("T{n}")).unwrap_or_else(|| task.id.clone());
@@ -1523,10 +1554,94 @@ mod tests {
         assert!(rt.checked_at.is_none(), "not recorded");
         assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed());
         // And it is exactly what the agent lane picks next.
-        let next = next_due_agent(&conn).unwrap().unwrap();
+        let cap = crate::routing::HostCapability::local_default("mac".into(), "Mac".into());
+        let next = next_due_agent(&conn, &cap).unwrap().unwrap();
         assert_eq!(next.0.id, t.id);
         assert_eq!(next.2, "the moon is full");
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    fn assign(conn: &Connection, id: &str, host: &str) {
+        crate::db::tasks::update(
+            conn,
+            id,
+            &crate::db::tasks::TaskPatch {
+                run_on: Some(Some(host.into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Holding the file isn't enough once a task names a machine, which is how
+    /// two hosts holding one script stop doubling up.
+    #[test]
+    fn a_script_assigned_elsewhere_is_left_alone_even_by_a_host_that_holds_it() {
+        let conn = test_conn();
+        let r = root("assigned-elsewhere");
+        script(&r, "held-here", "#!/bin/sh\nexit 1\n");
+        let t = armed(&conn, "script:held-here", Some(60), None);
+        assign(&conn, &t.id, "some-other-host");
+        assert!(pass(&conn, &r).is_empty());
+        let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert!(rt.checked_at.is_none(), "a host it isn't assigned to records nothing");
+        assert_eq!(due_elsewhere(&conn, &r.join("tripwires")).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// The other half: assigned HERE with no file is this host's own error, not
+    /// a shrug. Skipping it would hide a task from the one machine told to run it.
+    #[test]
+    fn a_script_assigned_here_but_missing_is_this_hosts_error() {
+        let conn = test_conn();
+        let r = root("assigned-here");
+        let t = armed(&conn, "script:not-on-this-machine", Some(60), None);
+        assign(&conn, &t.id, &crate::host::host_id());
+        let _ = pass(&conn, &r);
+        let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert!(rt.checked_at.is_some(), "evaluated, not skipped");
+        assert_eq!(rt.last_outcome.as_deref(), Some("error"));
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// Invariant 26 with a machine named: if that machine goes quiet, another
+    /// host says so rather than evaluating it or leaving it hidden.
+    #[test]
+    fn a_quiet_assigned_machine_is_reported_never_replaced() {
+        let conn = test_conn();
+        let r = root("assigned-quiet");
+        script(&r, "held-here", "#!/bin/sh\nexit 0\n");
+        let t = armed(&conn, "script:held-here", Some(60), None);
+        assign(&conn, &t.id, "some-other-host");
+        crate::db::tripwires::ensure_runtime(&conn, &t.id).unwrap();
+        conn.execute(
+            "UPDATE tripwire_runtime SET checked_at = datetime('now', '-5 days') WHERE task_id = ?1",
+            rusqlite::params![t.id],
+        )
+        .unwrap();
+        let _ = pass(&conn, &r);
+        let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        let note = rt.last_note.unwrap();
+        assert!(note.starts_with(crate::tripwire::ORPHAN_NOTE), "{note}");
+        assert!(note.contains("assigned to some-other-host"), "{note}");
+        assert!(
+            get(&conn, &t.id).unwrap().unwrap().tripwire_armed(),
+            "the script here would have tripped it; it must not have run"
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn the_agent_lane_takes_only_what_is_this_hosts() {
+        let conn = test_conn();
+        let t = armed(&conn, "agent:the moon is full", Some(60), None);
+        let mut other = crate::routing::HostCapability::local_default("mac".into(), "Mac".into());
+        other.takes_unassigned = false;
+        assert!(next_due_agent(&conn, &other).unwrap().is_none(), "unassigned is the default's");
+        assign(&conn, &t.id, "mac");
+        assert_eq!(next_due_agent(&conn, &other).unwrap().unwrap().0.id, t.id);
+        other.id = "laptop".into();
+        assert!(next_due_agent(&conn, &other).unwrap().is_none());
     }
 
     /// The sub-cap reservation: a check counts in full before it runs.

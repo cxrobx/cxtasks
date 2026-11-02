@@ -1161,10 +1161,33 @@ pub fn admit(conn: &rusqlite::Connection, task: &Task) -> Result<Vec<HostReadine
     // tasks", and the only process entitled to write one is the runner, which
     // does so on every tick.
     let registered = crate::db::hosts::list(conn)?;
+    let registered_any = !registered.is_empty();
     let hosts = if registered.is_empty() {
         vec![crate::routing::HostCapability::declared_for_this_host()]
     } else {
         registered
+    };
+
+    // Only the machine that would run it gets asked. "Some host could" is no
+    // comfort when the others will never claim it.
+    let hosts = if registered_any {
+        let target: Vec<_> = hosts
+            .into_iter()
+            .filter(|h| h.is_mine(task.run_on.as_deref()))
+            .collect();
+        if target.is_empty() {
+            return Err(AppError::Dispatch(match task.run_on.as_deref() {
+                Some(_) => "This task is assigned to a machine that no longer exists. Pick \
+                            another one in Run on."
+                    .to_string(),
+                None => "No machine takes unassigned work. Choose one in Settings, or pick \
+                         one in this task's Run on."
+                    .to_string(),
+            }));
+        }
+        target
+    } else {
+        hosts
     };
 
     let mut out = Vec::new();
@@ -1324,8 +1347,21 @@ where
     // the agent's CLI installed and logged in": a missing Codex install
     // becomes an error the caller sees now, not a task that silently sits at
     // `queued`.
+    //
+    // Only when THIS machine is the one that will run it. Another machine's
+    // login and repos aren't visible from here, and its own preflight is the
+    // one that counts.
     task.bg_allowed = true;
-    crate::runner::preflight(&task).map_err(AppError::Dispatch)?;
+    let here = crate::host::host_id();
+    if hosts.is_empty() || hosts.iter().any(|h| h.host_id == here) {
+        crate::runner::preflight(&task).map_err(AppError::Dispatch)?;
+    }
+    // A host without a live workspace drains on `bg_remote_allowed`. Naming it
+    // is the opt-in, so nobody has to say so twice.
+    let remote = hosts.iter().any(|h| {
+        matches!(h.workspace, Some(crate::routing::WorkspaceKind::Mirror)
+            | Some(crate::routing::WorkspaceKind::Detached))
+    });
 
     let task = with_conn(&mut |conn| {
         crate::db::tasks::update(
@@ -1334,6 +1370,7 @@ where
             &crate::db::tasks::TaskPatch {
                 status: Some("queued".into()),
                 bg_allowed: Some(true),
+                bg_remote_allowed: remote.then_some(true),
                 ..Default::default()
             },
         )
@@ -1372,6 +1409,100 @@ pub fn git_tree_is_clean(repo: &Path) -> Result<bool, AppError> {
 mod tests {
     use super::*;
     use crate::db::tasks::{create, NewTask};
+
+    // ── Run on ────────────────────────────────────────────────────────────
+
+    fn fleet(conn: &rusqlite::Connection) -> (String, String) {
+        use crate::db::hosts::{register_self, set_default};
+        use crate::routing::{HostCapability, WorkspaceKind};
+        let mini = HostCapability::local_default("mini".into(), "Mac mini".into());
+        let laptop = HostCapability::local_default("laptop".into(), "MacBook Pro".into());
+        let mut nas = HostCapability::local_default("nas".into(), "the NAS".into());
+        nas.workspaces = vec![WorkspaceKind::Mirror];
+        nas.max_tier = crate::runner::ToolTier::ReadOnly;
+        nas.can_checkpoint = false;
+        nas.takes_unassigned = false;
+        for h in [&laptop, &mini, &nas] {
+            register_self(conn, h).unwrap();
+        }
+        set_default(conn, "mini").unwrap();
+        ("mini".into(), "laptop".into())
+    }
+
+    fn writing_task(conn: &rusqlite::Connection, run_on: Option<&str>) -> Task {
+        create(
+            conn,
+            &NewTask {
+                title: "edit".into(),
+                repo_path: Some("/tmp/cx-repo".into()),
+                bg_writes_allowed: Some(true),
+                run_on: run_on.map(str::to_string),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// Asking the machine that would run it, not "some host": a task for the
+    /// default is answered by the default alone.
+    #[test]
+    fn admission_asks_only_the_machine_that_would_run_it() {
+        let conn = crate::db::schema::test_conn();
+        fleet(&conn);
+        let hosts = admit(&conn, &writing_task(&conn, None)).unwrap();
+        assert_eq!(hosts.iter().map(|h| h.host_id.as_str()).collect::<Vec<_>>(), ["mini"]);
+        let hosts = admit(&conn, &writing_task(&conn, Some("laptop"))).unwrap();
+        assert_eq!(hosts.iter().map(|h| h.host_id.as_str()).collect::<Vec<_>>(), ["laptop"]);
+    }
+
+    /// Refused now, with the reason, rather than parked where it would never run.
+    #[test]
+    fn a_task_the_chosen_machine_cannot_run_is_refused_at_queue_time() {
+        let conn = crate::db::schema::test_conn();
+        fleet(&conn);
+        let err = admit(&conn, &writing_task(&conn, Some("nas"))).unwrap_err().to_string();
+        assert!(err.contains("the NAS"), "{err}");
+    }
+
+    #[test]
+    fn a_task_assigned_to_a_removed_machine_says_so() {
+        let conn = crate::db::schema::test_conn();
+        fleet(&conn);
+        let err = admit(&conn, &writing_task(&conn, Some("gone"))).unwrap_err().to_string();
+        assert!(err.contains("no longer exists"), "{err}");
+    }
+
+    /// The whole point: from two replicas' point of view, one queued task has
+    /// exactly one claimant, and the laptop no longer sees unassigned work.
+    #[test]
+    fn one_queued_task_has_exactly_one_claimant() {
+        let conn = crate::db::schema::test_conn();
+        fleet(&conn);
+        let drain = |host: &str, t: &Task| {
+            let cap = crate::db::hosts::get(&conn, host).unwrap().unwrap();
+            crate::db::tasks::update(
+                &conn,
+                &t.id,
+                &crate::db::tasks::TaskPatch {
+                    status: Some("queued".into()),
+                    bg_allowed: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            crate::db::tasks::list_queued_for_background(&conn, &cap, 50)
+                .unwrap()
+                .iter()
+                .any(|q| q.id == t.id)
+        };
+        let unassigned = writing_task(&conn, None);
+        assert!(drain("mini", &unassigned));
+        assert!(!drain("laptop", &unassigned));
+        assert!(!drain("nas", &unassigned));
+        let pinned = writing_task(&conn, Some("laptop"));
+        assert!(!drain("mini", &pinned));
+        assert!(drain("laptop", &pinned));
+    }
 
     // ── the CLI override ──────────────────────────────────────────────────
 
@@ -2502,6 +2633,18 @@ mod tests {
             .unwrap()
         }
 
+        fn assign(conn: &rusqlite::Connection, t: &Task, host: &str) -> Task {
+            crate::db::tasks::update(
+                conn,
+                &t.id,
+                &crate::db::tasks::TaskPatch {
+                    run_on: Some(Some(host.into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        }
+
         fn register(conn: &rusqlite::Connection, id: &str, f: impl FnOnce(&mut HostCapability)) {
             let mut c = HostCapability::local_default(id.into(), id.into());
             f(&mut c);
@@ -2597,6 +2740,7 @@ mod tests {
                 c.can_checkpoint = false;
             });
             let t = task_needing(&conn, false, true); // wants a shell
+            let t = assign(&conn, &t, "nas");
 
             let err = admit(&conn, &t).unwrap_err().to_string();
             assert!(err.contains("the NAS"), "{err}");
@@ -2627,6 +2771,7 @@ mod tests {
             .unwrap();
 
             let t = task_needing(&conn, false, false);
+            let t = assign(&conn, &t, "mac");
             let hosts = admit(&conn, &t).expect("a sleeping host must not refuse the queue");
             let mac = hosts.iter().find(|h| h.host_id == "mac").unwrap();
             assert!(mac.capable(), "it can run it");
@@ -2634,14 +2779,12 @@ mod tests {
             assert!(!mac.ready(), "so nothing will happen yet, and the UI must say so");
         }
 
-        /// The queue outcome names every host, not only the one that will run
-        /// it — a queue whose only capable host is asleep is otherwise
-        /// indistinguishable from a healthy one.
+        /// The queue outcome names the machine that will run it, and only that
+        /// one: no other host is ever going to claim this row.
         #[test]
-        fn every_registered_host_appears_in_the_verdict() {
+        fn the_verdict_names_the_machine_that_would_run_it() {
             let conn = test_conn();
             this_machine_is_registered(&conn);
-            register(&conn, "mac", |c| c.label = "the Mac".into());
             register(&conn, "nas", |c| {
                 c.label = "the NAS".into();
                 c.max_tier = ToolTier::ReadOnly;
@@ -2651,26 +2794,21 @@ mod tests {
 
             let t = task_needing(&conn, false, false);
             let hosts = admit(&conn, &t).unwrap();
-            // Three, not two: `admit` also registers the machine running the
-            // tests, which is the behaviour that makes a fresh install work.
-            assert_eq!(hosts.len(), 3);
-            assert!(hosts.iter().any(|h| h.host_id == crate::host::host_id()));
+            assert_eq!(hosts.len(), 1);
+            assert_eq!(hosts[0].host_id, crate::host::host_id());
+            assert_eq!(hosts[0].workspace, Some(WorkspaceKind::Live));
 
-            let nas = hosts.iter().find(|h| h.host_id == "nas").unwrap();
-            assert!(!nas.capable(), "the NAS has no mirror of /repo yet");
-            assert!(nas.unmet.as_deref().unwrap().contains("mirror"), "{nas:?}");
-
-            let mac = hosts.iter().find(|h| h.host_id == "mac").unwrap();
-            assert_eq!(mac.workspace, Some(WorkspaceKind::Live));
+            // Named, a host's near-miss is the refusal rather than a footnote.
+            let t = assign(&conn, &t, "nas");
+            let err = admit(&conn, &t).unwrap_err().to_string();
+            assert!(err.contains("mirror"), "{err}");
         }
 
-        /// Once the NAS holds a mirror it becomes an option — but the Mac still
-        /// says `Live`, because freshness dominates.
+        /// Once the NAS holds a mirror, a task naming it can run there.
         #[test]
-        fn a_mirrored_repo_makes_a_remote_host_an_option_without_demoting_the_local_one() {
+        fn a_mirrored_repo_lets_a_task_name_a_remote_host() {
             let conn = test_conn();
             this_machine_is_registered(&conn);
-            register(&conn, "mac", |c| c.label = "the Mac".into());
             register(&conn, "nas", |c| {
                 c.label = "the NAS".into();
                 c.max_tier = ToolTier::ReadOnly;
@@ -2688,15 +2826,9 @@ mod tests {
             crate::db::hosts::record_mirror(&conn, "nas", "/repo").unwrap();
 
             let t = task_needing(&conn, false, false);
+            let t = assign(&conn, &t, "nas");
             let hosts = admit(&conn, &t).unwrap();
-            assert_eq!(
-                hosts.iter().find(|h| h.host_id == "nas").unwrap().workspace,
-                Some(WorkspaceKind::Mirror)
-            );
-            assert_eq!(
-                hosts.iter().find(|h| h.host_id == "mac").unwrap().workspace,
-                Some(WorkspaceKind::Live)
-            );
+            assert_eq!(hosts[0].workspace, Some(WorkspaceKind::Mirror));
         }
 
         /// A disabled host is not a reason to refuse if another host can do it.
@@ -2712,14 +2844,11 @@ mod tests {
             let t = task_needing(&conn, false, false);
             let hosts = admit(&conn, &t).unwrap();
             assert!(hosts.iter().any(HostReadiness::ready));
-            assert!(hosts
-                .iter()
-                .find(|h| h.host_id == "old")
-                .unwrap()
-                .unmet
-                .as_deref()
-                .unwrap()
-                .contains("switched off"));
+
+            // Named, it does: the task would otherwise sit forever.
+            let t = assign(&conn, &t, "old");
+            let err = admit(&conn, &t).unwrap_err().to_string();
+            assert!(err.contains("switched off"), "{err}");
         }
     }
 }

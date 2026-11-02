@@ -69,6 +69,7 @@ pub fn run() {
             commands::hosts::set_host_policy,
             commands::hosts::set_host_mirror_remote,
             commands::hosts::remove_host,
+            commands::hosts::set_default_host,
             commands::hosts::runs_finished_elsewhere,
             commands::tasks::list_tasks,
             commands::tasks::get_task,

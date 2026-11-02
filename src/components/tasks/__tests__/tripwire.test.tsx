@@ -28,6 +28,7 @@ const scripts = vi.fn(async () => ["pocketbuddy-first-user"]);
 vi.mock("@/lib/tauri", () => ({
   api: {
     tripwires: { scripts: () => scripts() },
+    hosts: { list: () => Promise.resolve([]) },
     tasks: { complete: vi.fn(), update: vi.fn(), trash: vi.fn() },
     menu: { showForTask: vi.fn() },
   },
@@ -60,6 +61,7 @@ function task(overrides: Partial<Task> = {}): Task {
     bg_writes_allowed: false,
     bg_shell_allowed: false,
     bg_remote_allowed: false,
+    run_on: null,
     bg_mcp_servers: null,
     reminded_at: null,
     model: null,

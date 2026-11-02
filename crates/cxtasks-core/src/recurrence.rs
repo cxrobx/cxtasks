@@ -382,6 +382,7 @@ pub fn complete_with_recurrence_as(
             // needs is a property of the recurring task, and dropping it would
             // leave every future instance able to read nothing — which fails
             // as a confident report about an empty directory.
+            run_on: completed.run_on.clone(),
             bg_mcp_servers: completed.bg_mcp_servers.clone(),
             model: completed.model.clone(),
             section_id: completed.section_id.clone(),

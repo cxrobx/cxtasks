@@ -998,7 +998,8 @@ opening with `ORPHAN_NOTE`. That note is how the next pass knows the fresh
 `checked_at` is its own report and not a check. A holder's next answer resets the
 count, so a laptop shut for a week leaves nothing behind; a script nobody holds
 climbs to five and surfaces. Two holders of one script both run it, and a trip can
-land one comment from each: the DB has no cross-host lease, only a per-replica one.
+land one comment from each, because the DB has no cross-host lease, only a
+per-replica one. Assign the task to one machine (`run_on`) to stop that.
 
 **A script gets a task, not a shell.** cwd is the task's repo when it resolves,
 else the data dir; env is `CXTASKS_TASK_ID`, `CXTASKS_TASK_REF`,
@@ -1091,19 +1092,56 @@ sends the reader to fix the wrong number. A ceiling narrows and never widens,
 and every counter still spans every host — a per-host budget is the
 per-executor trap one level up.
 
+## Which machine runs what (invariant 30)
+
+A task names a machine in `tasks.run_on`, or it belongs to the one host with
+`takes_unassigned`. The Mac mini is that host: it is the 24/7 dev box, and
+code-editing runs live there. The laptop and the NAS run what names them.
+
+**Exactly one default is a safety property.** `claim_and_start` is a transaction
+in one replica's database, and each Mac has its own. Two hosts draining the same
+rows could both start a task inside a sync interval, on two trees, and nothing
+would notice until the commits collided. `queue_sql` makes that impossible rather
+than unlikely: the default's predicate is `(run_on IS NULL OR run_on = '<id>')`,
+everyone else's is `run_on = '<id>'`. `register_self` won't create a second
+default, `db::hosts::set_default` moves it in one transaction, and only a host
+with a live workspace may hold it.
+
+`admit` asks only the machine that would run the task, because "some host could"
+is no comfort when the others will never claim it. A machine that could never run
+it refuses at queue time; one that's asleep warns and the task waits. `preflight`
+runs at queue time only when the queueing machine is that machine, since another
+machine's login and repos can't be seen from here, and its own preflight is the
+one that counts. Queueing for a host with no live workspace also sets
+`bg_remote_allowed`, the column its drain reads.
+
+**A task never moves on its own.** That is the difference from `routing`'s
+capability matching, and it's why `run_on` is optional: a pin may be for safety,
+so running it somewhere else to keep things moving would be the wrong kind of
+helpful.
+
+**Tripwires.** `run_on` beats holding the file. Assigned elsewhere, a host never
+evaluates it, of any kind, even with the script on disk; that's what stops two
+holders doubling up. Assigned here with no script, it's this host's error, because
+skipping would hide the task from the only machine told to run it. Assigned
+elsewhere and quiet for `max(3 × cadence, 3 days)`, another host reports it through
+the orphan path, naming the machine. An unassigned script still runs wherever it
+is held, and an unassigned agent check belongs to the default.
+
 ## Scripts-only hosts
 
 A host declaring **no workspaces** (`CXTASKS_HOST_WORKSPACES=none`) evaluates the
 scripts it holds and nothing else: no queued work, no agent checks, no
-interpretations, no mirror pushes. This is the Mac mini. Empty rather than a new
-flag because `queue_sql` already reads it as `0 = 1` and `satisfies` already never
-offers such a host a task. `tick` returns right after the script lane, because
-`agent_pass` reads no query and would otherwise start a check. `gate` skips the
-"no usable executor" test for these hosts, or a signed-out CLI would read as
-`HostDisabled` and stop the scripts too; the three switches still stop them.
+interpretations, no mirror pushes. No host is set up this way now; the mini was
+until it became the default machine. Empty rather than a new flag because
+`queue_sql` already reads it as `0 = 1` and `satisfies` already never offers such
+a host a task. `tick` returns right after the script lane, because `agent_pass`
+reads no query and would otherwise start a check. `gate` skips the "no usable
+executor" test for these hosts, or a signed-out CLI would read as `HostDisabled`
+and stop the scripts too; the three switches still stop them.
 
 Declared policy is not re-asserted on restart (invariant 24), so a machine whose
-row already says `live` needs that row changed as well as the env var.
+row already exists needs that row changed as well as the env var.
 
 ## The claim
 

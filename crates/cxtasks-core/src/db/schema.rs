@@ -6,7 +6,7 @@ use crate::error::AppError;
 use rusqlite::{Connection, Result};
 
 /// Bump this and add a `create_tables_vN` when the schema changes.
-pub const CURRENT_VERSION: i32 = 29;
+pub const CURRENT_VERSION: i32 = 30;
 
 /// The version of the **wire protocol** between this build and a sync peer.
 ///
@@ -137,6 +137,10 @@ pub fn initialize(conn: &Connection) -> Result<(), AppError> {
 
     if version < 29 {
         create_tables_v29(conn)?;
+    }
+
+    if version < 30 {
+        create_tables_v30(conn)?;
     }
 
     // Stamp FORWARD only. Three binaries share this DB and they don't upgrade
@@ -1608,6 +1612,39 @@ fn create_tables_v29(conn: &Connection) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// v30: a task can name the machine it runs on, and one machine takes the rest.
+///
+/// `tasks.run_on` is a host id, NULL for "whichever machine takes unassigned
+/// work". `hosts.takes_unassigned` is that machine, and there must be exactly
+/// one: a claim is a transaction in one replica's database, so two hosts draining
+/// the same rows could each start the same task inside a sync interval.
+///
+/// The backfill has to reach the same answer on every replica, because each runs
+/// this alone and none of them writes `updated_at`: the oldest host with a live
+/// workspace, which is the machine that was already doing this work.
+fn create_tables_v30(conn: &Connection) -> Result<()> {
+    for sql in [
+        "ALTER TABLE tasks ADD COLUMN run_on TEXT",
+        "ALTER TABLE hosts ADD COLUMN takes_unassigned INTEGER NOT NULL DEFAULT 0",
+    ] {
+        if let Err(e) = conn.execute(sql, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e);
+            }
+        }
+    }
+    conn.execute(
+        "UPDATE hosts SET takes_unassigned = 1
+          WHERE id = (SELECT id FROM hosts
+                       WHERE ',' || workspaces || ',' LIKE '%,live,%'
+                       ORDER BY datetime(created_at) ASC, id ASC LIMIT 1)
+            AND NOT EXISTS (SELECT 1 FROM hosts WHERE takes_unassigned = 1)",
+        [],
+    )?;
     Ok(())
 }
 

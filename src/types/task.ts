@@ -48,6 +48,9 @@ export interface Task {
    *  Default false, in a column no pre-v23 binary reads — standing up a remote
    *  host makes nothing newly claimable. */
   bg_remote_allowed: boolean;
+  /** The machine this task and its tripwire run on, as a host id. Null is
+   *  whichever host takes unassigned work. */
+  run_on: string | null;
   /** Comma-separated MCP server NAMES a repo-less run may reach. Empty grants
    *  nothing beyond the write-back router, which is the design: an ungranted
    *  detached run can read nothing. */
@@ -830,6 +833,7 @@ export interface TaskPatch {
   bg_writes_allowed?: boolean;
   bg_shell_allowed?: boolean;
   bg_remote_allowed?: boolean;
+  run_on?: string | null;
   bg_mcp_servers?: string | null;
   model?: string | null;
   section_id?: string | null;

@@ -20,6 +20,23 @@
 //! deployment. Removing one is a row delete — every task it could have run
 //! simply routes elsewhere, with nothing to rewrite.
 //!
+//! # A task may still name a machine
+//!
+//! Everything above stands for a task that doesn't care. `tasks.run_on` is for
+//! the one that does: Chris deciding where the work happens, which capability
+//! can't express. It is optional, and it can't leave work stranded in silence: a
+//! task naming a machine that is off waits and says so, and another host reports
+//! a tripwire nobody has checked. It never moves somewhere he didn't choose.
+//!
+//! # Exactly one host takes unassigned work
+//!
+//! A claim is a transaction in ONE replica's database, and two Macs each hold
+//! their own. Both draining unassigned rows could start the same task inside a
+//! sync interval, on two trees. So [`HostCapability::takes_unassigned`] is true
+//! for one host and every other host claims only what names it, which makes a
+//! double claim impossible rather than unlikely. It is what the tree-holding
+//! machine's priority was standing in for while there was only one.
+//!
 //! # Declared versus observed
 //!
 //! A capability has two halves and the split is load-bearing. **Declared** is
@@ -190,6 +207,10 @@ pub struct HostCapability {
     /// Tie-break among hosts of equal workspace freshness. Lower wins.
     pub priority: i64,
     pub enabled: bool,
+    /// Does this host run tasks that don't name a machine? True for exactly one
+    /// host (see the module docs); [`crate::db::hosts::set_default`] moves it.
+    #[serde(default)]
+    pub takes_unassigned: bool,
 
     // ── observed: what the host last said about itself ──────────────────────
     pub last_seen_at: Option<String>,
@@ -221,6 +242,7 @@ impl HostCapability {
             headroom_pct: 0,
             priority: 0,
             enabled: true,
+            takes_unassigned: true,
             last_seen_at: None,
             paused: false,
             gate: None,
@@ -288,6 +310,9 @@ impl HostCapability {
         // Derived last, so it reflects whatever the workspace declaration
         // ended up being rather than what it started as.
         cap.can_checkpoint = cap.is_local();
+        // Only a machine holding the trees can be the default, and
+        // `db::hosts::register_self` refuses a second one.
+        cap.takes_unassigned = cap.is_local();
         // Observed starts empty and is filled by the first heartbeat. Declaring
         // an executor READY before looking would defeat the whole intersection.
         cap.executors_ready = Vec::new();
@@ -312,6 +337,18 @@ impl HostCapability {
     /// `CXTASKS_HOST_WORKSPACES=none` declares it.
     pub fn is_scripts_only(&self) -> bool {
         self.workspaces.is_empty()
+    }
+
+    /// Is a task with this `run_on` this host's to run?
+    ///
+    /// The one answer to "whose is it", shared by the queue and the agent lane.
+    /// A script tripwire with no `run_on` doesn't use it: that belongs to
+    /// whichever hosts hold the file.
+    pub fn is_mine(&self, run_on: Option<&str>) -> bool {
+        match run_on {
+            Some(id) => id == self.id,
+            None => self.takes_unassigned,
+        }
     }
 
     /// The opt-in column this host's drain query tests.
@@ -638,6 +675,14 @@ pub fn queue_sql(cap: &HostCapability) -> String {
         clauses.push(tier);
     }
 
+    // ── ownership: a claim here is the claim, so two hosts can't both match ──
+    let id = cap.id.replace('\'', "''");
+    clauses.push(if cap.takes_unassigned {
+        format!("(run_on IS NULL OR run_on = '{id}')")
+    } else {
+        format!("run_on = '{id}'")
+    });
+
     clauses.join(" AND ")
 }
 
@@ -689,6 +734,7 @@ mod tests {
             headroom_pct: 50,
             priority: 10,
             enabled: true,
+            takes_unassigned: false,
             last_seen_at: None,
             paused: false,
             gate: None,
@@ -717,12 +763,43 @@ mod tests {
     /// before `hosts` existed, and if this fails the question is not "update
     /// the expectation" but "why did the local host's behaviour change".
     #[test]
+    fn a_task_belongs_to_the_machine_it_names_and_the_rest_to_the_default() {
+        let mut laptop = mac();
+        laptop.id = "laptop".into();
+        laptop.takes_unassigned = false;
+        let mini = mac();
+        assert!(mini.is_mine(None));
+        assert!(!laptop.is_mine(None), "two hosts draining unassigned work is a double claim");
+        assert!(laptop.is_mine(Some("laptop")));
+        assert!(!mini.is_mine(Some("laptop")));
+        assert!(!nas().is_mine(None));
+    }
+
+    /// The drain predicate, not just the helper: this SQL is the last gate
+    /// before an unattended agent starts on a tree.
+    #[test]
+    fn only_the_default_host_drain_can_match_an_unassigned_task() {
+        let mut laptop = mac();
+        laptop.id = "o'brien".into();
+        laptop.takes_unassigned = false;
+        assert!(queue_sql(&mac()).contains("(run_on IS NULL OR run_on = 'mac')"));
+        let sql = queue_sql(&laptop);
+        assert!(sql.ends_with("run_on = 'o''brien'"), "quoted, and no NULL arm: {sql}");
+        assert!(!sql.contains("run_on IS NULL"));
+    }
+
+    #[test]
     fn queue_sql_for_the_local_host_is_byte_identical_to_the_pre_v23_filter() {
+        // Identical but for ownership, the one clause a lone Mac can't skip: a
+        // task naming another machine has to stay invisible to it.
+        let cap = mac();
         let pre_v23 = format!(
-            "{} AND repo_path IS NOT NULL AND TRIM(repo_path) <> ''",
-            BackgroundExecutor::enabled_sql()
+            "{} AND repo_path IS NOT NULL AND TRIM(repo_path) <> '' \
+             AND (run_on IS NULL OR run_on = '{}')",
+            BackgroundExecutor::enabled_sql(),
+            cap.id
         );
-        assert_eq!(queue_sql(&mac()), pre_v23);
+        assert_eq!(queue_sql(&cap), pre_v23);
     }
 
     /// The generated half of failing closed: a read-only host's own SQL denies

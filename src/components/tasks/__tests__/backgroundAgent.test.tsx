@@ -59,6 +59,7 @@ function task(overrides: Partial<Task> = {}): Task {
     bg_writes_allowed: false,
     bg_shell_allowed: false,
     bg_remote_allowed: false,
+    run_on: null,
     bg_mcp_servers: null,
     reminded_at: null,
     model: null,

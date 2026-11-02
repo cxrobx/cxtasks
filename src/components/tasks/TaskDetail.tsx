@@ -31,6 +31,7 @@ import {
   TIER_HINTS,
 } from "@/lib/format";
 import { ReferenceChip } from "@/components/shared/ReferenceChip";
+import { RunOnField } from "@/components/tasks/RunOnField";
 import { DispatchBar } from "@/components/tasks/DispatchBar";
 import { PropertyStrip } from "@/components/tasks/PropertyStrip";
 import { DetailTabs } from "@/components/tasks/DetailTabs";
@@ -761,52 +762,10 @@ function AccessEnvelope({ task, tier }: { task: Task; tier: BackgroundTier }) {
         {TIER_HINTS[task.bg_executor][tier]}
       </p>
 
-      <RemoteEnvelope task={task} tier={tier} />
+      <div className="mt-3 border-t border-border-subtle pt-2.5">
+        <RunOnField task={task} tier={tier} />
+      </div>
     </fieldset>
-  );
-}
-
-/**
- * May this task leave the machine that holds its repo?
- *
- * Sits under the tool grant rather than beside it, because it is a strictly
- * narrower question: a task that may not run unattended at all cannot run
- * unattended elsewhere. Off by default, and the copy says what turning it on
- * means rather than what the flag is called — "this Mac only" is a fact about
- * where work happens, `bg_remote_allowed` is a column name.
- *
- * Disabled above read-only, and that is not a UI opinion: the only remote host
- * declares `read-only` and cannot checkpoint, so `routing::satisfies` would
- * refuse a Shell or Write task anyway. Showing an enabled switch that produces
- * a refusal at queue time is worse than showing why it is off.
- */
-function RemoteEnvelope({ task, tier }: { task: Task; tier: BackgroundTier }) {
-  const patch = useTaskStore((s) => s.patch);
-  const mutating = tier !== "read-only";
-  return (
-    <div className="mt-3 border-t border-border-subtle pt-2.5">
-      <label className="flex cursor-default items-start gap-2">
-        <input
-          type="checkbox"
-          className="mt-[2px]"
-          checked={task.bg_remote_allowed}
-          disabled={mutating}
-          onChange={(event) =>
-            void patch(task.id, { bg_remote_allowed: event.target.checked })
-          }
-        />
-        <span className="min-w-0">
-          <span className="block text-[11px] font-medium">May run on another host</span>
-          <span className="mt-0.5 block text-[10.5px] leading-relaxed text-content-faint">
-            {mutating
-              ? "Only read-only work can leave this Mac — a remote host works from a mirror, so there is no tree to write back to."
-              : task.bg_remote_allowed
-                ? "This can run on a mirror of the repo while the lid is shut. It still runs here when this Mac is awake — the live tree wins."
-                : "This Mac only. Turn on to let an idle host pick it up while the lid is shut."}
-          </span>
-        </span>
-      </label>
-    </div>
   );
 }
 

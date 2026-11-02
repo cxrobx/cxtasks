@@ -103,6 +103,10 @@ pub struct FileTaskParams {
     )]
     pub recurrence: Option<String>,
     #[schemars(
+        description = "The machine this task and its tripwire run on: a label like 'Mac mini', or a word that picks out one, like 'mini'. Omit for whichever machine takes unassigned work. A task assigned to a machine that is off waits for it; it never moves on its own."
+    )]
+    pub run_on: Option<String>,
+    #[schemars(
         description = "ABSOLUTE path to the repo this task should be worked in — pass YOUR CURRENT WORKING DIRECTORY when the task is about the code you are looking at. This is what lets CXTasks hand the task back to a Claude session later with the right context. Omit for a task that isn't about a codebase."
     )]
     pub repo_path: Option<String>,
@@ -363,6 +367,10 @@ pub struct UpdateTaskParams {
     pub prompt: Option<String>,
     #[schemars(description = "Allow unattended background execution")]
     pub bg_allowed: Option<bool>,
+    #[schemars(
+        description = "The machine this task and its tripwire run on: a label like 'Mac mini', or a word that picks out one, like 'mini'. Omit for whichever machine takes unassigned work; pass an empty string to clear. A task assigned to a machine that is off waits for it; it never moves on its own."
+    )]
+    pub run_on: Option<String>,
     #[schemars(
         description = "Allow this task to run on a host that is not the machine holding its repo — e.g. so it can run while the laptop is shut. Only meaningful for read-only work: a remote host works from a mirror, which is a throwaway clone with no tree to write back to, so anything above read-only is refused at queue time."
     )]
@@ -1452,6 +1460,9 @@ fn format_detail(
     if let Some(r) = t.repo_path.as_deref() {
         s.push_str(&format!("  repo_path:  {r}\n"));
     }
+    if let Some(id) = t.run_on.as_deref() {
+        s.push_str(&format!("  run_on:     {id}\n"));
+    }
     if t.bg_allowed {
         s.push_str(&format!(
             "  background: {} ({}{})\n",
@@ -1977,6 +1988,16 @@ impl CxTasksMcp {
         };
         let project = given.map(str::to_string).or_else(|| owner.clone());
 
+        let run_on = match params.run_on.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => {
+                let conn = self.open_db()?;
+                let host = db::hosts::resolve(&conn, name)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                Some(host.id)
+            }
+            None => None,
+        };
+
         let new = db::tasks::NewTask {
             // Server-side creation: let the DB mint the id.
             id: None,
@@ -1998,6 +2019,7 @@ impl CxTasksMcp {
             // Remote eligibility is never inferred from a filing. It is a
             // routing decision, made deliberately — `update_task` sets it.
             bg_remote_allowed: None,
+            run_on,
             bg_mcp_servers: params.bg_mcp_servers.clone(),
             model: params.model.clone(),
             section_id: None,
@@ -2377,6 +2399,16 @@ impl CxTasksMcp {
             .as_deref()
             .map(|b| crate::prose::render_note(b, crate::prose::Channel::Notes))
             .unwrap_or_default();
+        let run_on = match params.run_on.as_deref().map(str::trim) {
+            Some("") => Some(None),
+            Some(name) => {
+                let conn = self.open_db()?;
+                let host = db::hosts::resolve(&conn, name)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                Some(Some(host.id))
+            }
+            None => None,
+        };
         let patch = db::tasks::TaskPatch {
             title: params.title,
             body: params.body.map(Some),
@@ -2394,6 +2426,7 @@ impl CxTasksMcp {
             bg_writes_allowed: params.bg_writes_allowed,
             bg_shell_allowed: params.bg_shell_allowed,
             bg_remote_allowed: params.bg_remote_allowed,
+            run_on,
             bg_mcp_servers: params.bg_mcp_servers.clone(),
             model: params.model.map(Some),
             section_id: None,
@@ -4118,6 +4151,7 @@ mod tests {
 
     fn update_params(task_id: &str) -> UpdateTaskParams {
         UpdateTaskParams {
+            run_on: None,
             task_id: task_id.into(),
             title: None,
             body: None,
@@ -4733,6 +4767,7 @@ mod tests {
         let server = CxTasksMcp::with_mode(db.to_string_lossy().to_string(), McpMode::Interactive);
         let err = server
             .file_task(Parameters(FileTaskParams {
+            run_on: None,
                 title: "straight to the queue".into(),
                 why: Some("chris-asked".into()),
                 decision: None,
@@ -4779,6 +4814,7 @@ mod tests {
     /// `file_task` treats as absent.
     fn plain_filing(title: &str, why: Option<&str>) -> FileTaskParams {
         FileTaskParams {
+            run_on: None,
             title: title.into(),
             why: why.map(str::to_string),
             decision: None,

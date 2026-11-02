@@ -73,6 +73,14 @@ pub async fn remove_host(state: State<'_, AppState>, host_id: String) -> Result<
     Ok(out.as_bool().unwrap_or(false))
 }
 
+/// Make this the one machine that takes tasks not assigned to any machine.
+#[tauri::command]
+pub async fn set_default_host(state: State<'_, AppState>, host_id: String) -> Result<(), AppError> {
+    let mut conn = state.db.safe_lock();
+    api::dispatch_synced(&mut conn, "set_default_host", &json!({ "host_id": host_id }))?;
+    Ok(())
+}
+
 /// "4 runs finished on the NAS while you were away."
 ///
 /// The gap this closes predates multi-host: if the app was closed when a run

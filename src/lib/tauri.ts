@@ -419,6 +419,7 @@ export const api = {
     setMirrorRemote: (hostId: string, remote: string | null) =>
       invoke<void>("set_host_mirror_remote", { hostId, remote }),
     remove: (hostId: string) => invoke<boolean>("remove_host", { hostId }),
+    setDefault: (hostId: string) => invoke<void>("set_default_host", { hostId }),
   },
 };
 
@@ -443,6 +444,9 @@ export interface HostCapability {
   headroom_pct: number;
   priority: number;
   enabled: boolean;
+  /** Runs tasks that don't name a machine. True for exactly one host, because a
+   *  claim happens in one replica and two takers could start the same task. */
+  takes_unassigned: boolean;
   /** Observed, not declared. There is deliberately no way to edit these: a
    *  settable "Claude is installed" checkbox is a lie waiting to be believed
    *  by the router. */

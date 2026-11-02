@@ -86,6 +86,13 @@ mac() {
       CXTASKS_HOST_EXECUTORS=claude,codex \
       "$RUNNER" "$@"
 }
+laptop() {
+  env HOME="$MAC_HOME" CXTASKS_DATA_DIR="$MAC_DATA" TZ=America/Chicago \
+      CXTASKS_HOST_ID=laptop-sim CXTASKS_HOST_LABEL="the laptop" \
+      CXTASKS_HOST_WORKSPACES=live CXTASKS_HOST_MAX_TIER=write \
+      CXTASKS_HOST_EXECUTORS=claude,codex \
+      "$RUNNER" "$@"
+}
 nas() {
   env HOME="$NAS_HOME" CXTASKS_DATA_DIR="$MAC_DATA" TZ=America/Chicago \
       CXTASKS_HOST_ID=nas-sim CXTASKS_HOST_LABEL="the NAS" \
@@ -132,10 +139,14 @@ expect "the NAS reads the remote opt-in column" "bg_remote_allowed = 1"
 # binary produces, and it is how these rows would look to a runner that has
 # never heard of the columns being tested.
 new_task() { # id title bg_allowed bg_remote writes shell
+  # A remote-eligible task here is one assigned to the NAS: a host that isn't the
+  # default claims only what names it, so that no task ever has two claimants.
+  local run_on=NULL
+  [ "$4" = 1 ] && run_on="'nas-sim'"
   q "INSERT INTO tasks (id, title, status, repo_path, bg_allowed, bg_remote_allowed,
-                        bg_writes_allowed, bg_shell_allowed, bg_executor, short_id)
+                        bg_writes_allowed, bg_shell_allowed, bg_executor, short_id, run_on)
      VALUES ('$1', '$2', 'queued', '$REPO', $3, $4, $5, $6, 'claude',
-             (SELECT COALESCE(MAX(short_id),0)+1 FROM tasks));"
+             (SELECT COALESCE(MAX(short_id),0)+1 FROM tasks), $run_on);"
 }
 
 say "a task marked local-only is invisible to the NAS"
@@ -151,8 +162,23 @@ new_task writes "writes to the tree" 1 1 1 0
 capture nas --dry-run
 expect "the NAS refuses it — its own SQL cannot express the claim" "nothing queued"
 capture mac --dry-run
-expect "the Mac takes it" "writes to the tree"
+expect "and the Mac leaves it — it names the NAS, and it never moves on its own" "nothing queued"
 q "DELETE FROM tasks WHERE id = 'writes';"
+
+say "two Macs, one queue: every task has exactly one claimant"
+capture laptop --dry-run
+expect "a second Mac registers without becoming a second default" "capability"
+new_task unassigned "nobody named" 1 0 0 0
+capture mac --dry-run
+expect "the default machine sees unassigned work" "nobody named"
+capture laptop --dry-run
+expect "the other Mac does not" "nothing queued"
+q "UPDATE tasks SET run_on = 'laptop-sim' WHERE id = 'unassigned';"
+capture laptop --dry-run
+expect "naming the other Mac gives it the task" "nobody named"
+capture mac --dry-run
+expect "and takes it away from the default" "nothing queued"
+q "DELETE FROM tasks WHERE id = 'unassigned';"
 
 say "a read-only remote task"
 new_task readonly "investigate the failure" 0 1 0 0

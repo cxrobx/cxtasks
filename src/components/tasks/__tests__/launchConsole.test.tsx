@@ -22,6 +22,7 @@ const executorAvailable = vi.fn<(e: BackgroundExecutor) => Promise<string | null
 
 vi.mock("@/lib/tauri", () => ({
   api: {
+    hosts: { list: () => Promise.resolve([]) },
     dispatch: {
       executorAvailable: (e: BackgroundExecutor) => executorAvailable(e),
       queueBackground: vi.fn(),
@@ -62,6 +63,7 @@ const TASK: Task = {
   bg_writes_allowed: false,
   bg_shell_allowed: false,
   bg_remote_allowed: false,
+  run_on: null,
   bg_mcp_servers: null,
   reminded_at: null,
   model: null,
@@ -271,48 +273,6 @@ describe("collapsing the console", () => {
  * so a second host could be running and correctly claim nothing at all. These
  * pin the control that closes that, and the one rule it enforces.
  */
-describe("the may-run-elsewhere switch", () => {
-  const remoteSwitch = () => screen.getByRole("checkbox", { name: /another host/ });
-
-  it("is off by default and says what this Mac only means", () => {
-    mount();
-    fireEvent.click(node(/Capability/));
-    expect((remoteSwitch() as HTMLInputElement).checked).toBe(false);
-    expect(screen.getByText(/This Mac only/)).toBeTruthy();
-  });
-
-  it("writes the flag and nothing else", () => {
-    mount();
-    fireEvent.click(node(/Capability/));
-    fireEvent.click(remoteSwitch());
-    // Exactly one key. The tool grant is a separate decision and a patch that
-    // rewrote it here would silently change what an unattended agent may touch.
-    expect(useTaskStore.getState().patch).toHaveBeenCalledWith("t1", {
-      bg_remote_allowed: true,
-    });
-  });
-
-  /**
-   * **Not a UI opinion.** A remote host works from a mirror — a throwaway clone
-   * — so there is no tree to write back to, and `can_checkpoint` is false
-   * there, which makes `routing::satisfies` refuse anything above read-only.
-   * An enabled switch that produces a refusal at queue time is worse than a
-   * disabled one that explains itself.
-   */
-  it("is disabled above read-only, and says why", () => {
-    mount({ bg_writes_allowed: true });
-    fireEvent.click(node(/Capability/));
-    expect((remoteSwitch() as HTMLInputElement).disabled).toBe(true);
-    expect(screen.getByText(/no tree to write back to/)).toBeTruthy();
-  });
-
-  it("explains that the live tree still wins once it is on", () => {
-    mount({ bg_remote_allowed: true });
-    fireEvent.click(node(/Capability/));
-    expect(screen.getByText(/still runs here when this Mac is awake/)).toBeTruthy();
-  });
-});
-
 describe("the executor availability warning", () => {
   /**
    * The regression this guards is silent: move the probe back inside the runner

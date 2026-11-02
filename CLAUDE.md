@@ -210,7 +210,7 @@ the Tauri side.
 Full schema (table-by-table, tags/deps/comments, migration discipline):
 `.claude/rules/database.md`. Always-relevant:
 
-- `schema.rs` is at `CURRENT_VERSION = 29`; the stamp only moves **forward**
+- `schema.rs` is at `CURRENT_VERSION = 30`; the stamp only moves **forward**
   (three binaries share one DB and don't upgrade in lockstep). Don't hardcode the
   number in a test — compare against `schema::CURRENT_VERSION`.
 - **A version number is spent the moment any binary stamps it on a real DB —
@@ -252,6 +252,7 @@ global** — code comments, tests and the gotchas cite them as "invariant N".
 | 24 | A host row means "a machine that runs tasks" — only the RUNNER writes one, on the machine it describes; declared is policy and observed is what it saw, effective is the intersection, and absence of an observation is not a negative one | execution |
 | 25 | A detached run is bounded by its TOOL SURFACE, not its filesystem — `bg_mcp_servers` holds names validated against a registry, defaults to empty, and there is no "is detached" column because every pre-existing drain query already carries `repo_path IS NOT NULL` | execution |
 | 26 | A tripwire hides like a defer and never stays hidden after a failure — only `armed` hides; an attempt is a leased, CAS-recorded transition (claim → run → record in ONE transaction, notify after commit); volatile bookkeeping lives on `tripwire_runtime`, never on `tasks`; the defer gate is evaluated first; scripts are names plus one hostile `$1`, never argv; one-shot across recurrence. A script runs only on a host that HOLDS it; a non-holder records nothing until nobody has checked it for `max(3 × cadence, 3 days)`, then reports that through the ordinary failure path. An AGENT check is the same attempt with a RUN ROW as its lease: `intent = check` is machine-only (never on a task), its grant/bounds are pinned by the lane that started it and never read off a row, a verdict is not a handoff, and UNSURE is an error. A MONITOR (`on_trip = 'monitor'`) is a standing check: done does not stop it (only archive does), completing it re-arms it, a trip reopens it, and it can't recur. An INTERPRET trip gets one zero-tool run that reads its evidence and never acts on it | database |
+| 30 | A task may name its machine (`tasks.run_on`, a host id, for background runs and tripwires alike) and otherwise belongs to the ONE host with `takes_unassigned`. A claim happens in one replica, so two hosts draining the same rows could start one task twice: `queue_sql` gives every row exactly one claimant, and that is the guarantee, not a preference. A named machine that is off makes the task WAIT and warn, and it never moves on its own; another host reports a tripwire nobody has checked, without running it | execution |
 | 22 | A grouping node is an AREA or a PROJECT and only a project ENDS; areas nest in areas to ANY depth, nothing nests in a project (it holds sections), and nothing nests inside its own subtree; `parent_id` is the one join keyed by ID not name; the roll-up lives ONLY in `expand_scope`, and project→directory may inherit while directory→project may not. A session can run the WHOLE lifecycle: `create_project` starts one, `update_project` ends it | database |
 | 27 | `supersedes` preserves a conclusion without leaving old work actionable: replacement → older task, both directions readable, cycles refused, and every path that hands out work subtracts the older task; pure plan churn is deleted instead | database |
 | 28 | A self-initiated filing declares WHY it isn't being done now (`why`), is tagged `agent-filed`, and asks Chris before the row exists; "so it isn't lost" is not a reason — Chris asking is the only ungated path, and a reviewer or another agent is not Chris | mcp-plugin |
@@ -418,7 +419,9 @@ Sync is **on** on the live database, paired to the NAS canonical node over
 the tailnet (`sync_peer_url` in `app_meta`), and **reconciles on a five-minute
 timer while the app is open** — `cxtasks_core::sync::auto`, spawned as its own
 thread in `lib.rs`. **The NAS is the source of truth; the laptop and the mini are
-replicas of it.** With the app closed the runner steps in
+replicas of it.** The mini is the default machine for unassigned work, code-editing
+runs included; the laptop and NAS run what names them (invariant 30). `cx-reconcile`
+moves commits between the two Macs, unpushed ones too. With the app closed the runner steps in
 (`auto::backstop_pass`, once the last attempt is over six minutes old), so a
 tripwire result reaches the hub whether or not anyone opened the app. Before that loop existed the Mac only reconciled when
 somebody pressed the Settings button, and the failure had no symptom: the live

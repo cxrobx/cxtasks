@@ -277,6 +277,9 @@ pub struct Task {
     /// every task that already existed says no. See [`crate::routing`] for the
     /// other half — the host's own capability-generated drain SQL.
     pub bg_remote_allowed: bool,
+    /// The machine this task runs on, as a host id; `None` is whichever host
+    /// takes unassigned work (`routing`'s module docs).
+    pub run_on: Option<String>,
     /// Comma-separated MCP server NAMES a detached run of this task may reach,
     /// validated against [`crate::mcp_registry::REGISTRY`].
     ///
@@ -393,7 +396,7 @@ pub(crate) const COLUMNS: &str = "id, title, body, status, priority, project, du
      deleted_at, archived_at, short_id, bg_shell_allowed, bg_executor, bg_codex_allowed, \
      blocked_reason, bg_intent, bg_timeout_minutes, bg_run_token_cap, bg_remote_allowed, \
      bg_mcp_servers, tripwire, tripwire_every_minutes, tripwire_on_trip, tripwire_state, \
-     tripwire_tripped_at";
+     tripwire_tripped_at, run_on";
 
 pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
     // Index 16 is the RAW `bg_allowed` column — Claude's gate alone — and index
@@ -442,6 +445,7 @@ pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         tripwire_on_trip: row.get(35)?,
         tripwire_state: row.get(36)?,
         tripwire_tripped_at: row.get(37)?,
+        run_on: row.get(38)?,
     })
 }
 
@@ -558,6 +562,8 @@ pub struct NewTask {
     pub bg_writes_allowed: Option<bool>,
     pub bg_shell_allowed: Option<bool>,
     pub bg_remote_allowed: Option<bool>,
+    #[serde(default)]
+    pub run_on: Option<String>,
     pub bg_mcp_servers: Option<String>,
     pub model: Option<String>,
     pub section_id: Option<String>,
@@ -784,9 +790,9 @@ pub fn create(conn: &Connection, new: &NewTask) -> Result<Task, AppError> {
                             short_id, bg_executor, bg_codex_allowed, blocked_reason,
                             bg_timeout_minutes, bg_run_token_cap, bg_remote_allowed,
                             bg_mcp_servers, tripwire, tripwire_every_minutes, tripwire_on_trip,
-                            tripwire_state)
+                            tripwire_state, run_on)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
         params![
             id,
             title,
@@ -818,6 +824,7 @@ pub fn create(conn: &Connection, new: &NewTask) -> Result<Task, AppError> {
             tripwire_cols.as_ref().and_then(|t| t.every),
             tripwire_cols.as_ref().and_then(|t| t.on_trip.clone()),
             tripwire_cols.as_ref().map(|_| TripwireState::Armed.as_str()),
+            new.run_on.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ],
     )?;
     if tripwire_cols.is_some() {
@@ -1480,6 +1487,10 @@ pub struct TaskPatch {
     pub bg_remote_allowed: Option<bool>,
     /// `Some("")` clears the list; absent leaves it alone.
     pub bg_mcp_servers: Option<String>,
+    /// The machine this task runs on, as a host id. `Some(None)` clears it, so
+    /// the task goes back to whichever host takes unassigned work.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub run_on: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
@@ -1553,6 +1564,7 @@ impl TaskPatch {
             && self.bg_writes_allowed.is_none()
             && self.bg_shell_allowed.is_none()
             && self.bg_remote_allowed.is_none()
+            && self.run_on.is_none()
             && self.bg_mcp_servers.is_none()
             && self.model.is_none()
             && self.section_id.is_none()
@@ -2014,6 +2026,12 @@ pub fn update(conn: &Connection, id: &str, patch: &TaskPatch) -> Result<Task, Ap
     if let Some(v) = patch.bg_remote_allowed {
         sets.push("bg_remote_allowed = ?");
         binds.push(Box::new(i64::from(v)));
+    }
+    if let Some(v) = &patch.run_on {
+        sets.push("run_on = ?");
+        binds.push(Box::new(
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        ));
     }
     if let Some(v) = &patch.bg_mcp_servers {
         sets.push("bg_mcp_servers = ?");

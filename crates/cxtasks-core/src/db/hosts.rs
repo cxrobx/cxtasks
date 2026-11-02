@@ -78,7 +78,7 @@ fn workspaces(raw: &str) -> Vec<WorkspaceKind> {
 
 const COLUMNS: &str = "id, label, max_tier, executors, workspaces, can_checkpoint, \
      max_concurrent, headroom_pct, priority, enabled, last_seen_at, paused, gate, \
-     executors_ready, mirrors";
+     executors_ready, mirrors, takes_unassigned";
 
 fn row_to_host(row: &Row) -> rusqlite::Result<HostCapability> {
     Ok(HostCapability {
@@ -96,6 +96,7 @@ fn row_to_host(row: &Row) -> rusqlite::Result<HostCapability> {
         headroom_pct: row.get(7)?,
         priority: row.get(8)?,
         enabled: row.get::<_, i64>(9)? != 0,
+        takes_unassigned: row.get::<_, i64>(15)? != 0,
         last_seen_at: row.get(10)?,
         paused: row.get::<_, i64>(11)? != 0,
         gate: row.get(12)?,
@@ -161,8 +162,11 @@ pub fn mirrors(conn: &Connection, id: &str) -> Result<Vec<String>, AppError> {
 pub fn register_self(conn: &Connection, default_cap: &HostCapability) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO hosts (id, label, max_tier, executors, workspaces, can_checkpoint,
-                            max_concurrent, headroom_pct, priority, enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                            max_concurrent, headroom_pct, priority, enabled,
+                            takes_unassigned)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 CASE WHEN EXISTS (SELECT 1 FROM hosts WHERE takes_unassigned = 1)
+                      THEN 0 ELSE ?11 END)
          ON CONFLICT(id) DO NOTHING",
         params![
             default_cap.id,
@@ -183,9 +187,66 @@ pub fn register_self(conn: &Connection, default_cap: &HostCapability) -> Result<
             default_cap.headroom_pct,
             default_cap.priority,
             i64::from(default_cap.enabled),
+            i64::from(default_cap.takes_unassigned),
         ],
     )?;
     Ok(())
+}
+
+/// Make this host the one that takes unassigned work, and no other.
+///
+/// One transaction, because the invariant is "exactly one" and a moment with two
+/// is the double claim it exists to prevent. Each changed row moves `updated_at`
+/// so the change travels; rows already right don't, so a repeat writes nothing.
+pub fn set_default(conn: &Connection, id: &str) -> Result<(), AppError> {
+    let Some(host) = get(conn, id)? else {
+        return Err(AppError::NotFound(format!("no host {id}")));
+    };
+    if !host.is_local() {
+        return Err(AppError::Dispatch(format!(
+            "{} can't be the default machine: it has no live workspace, so it could not run \
+             a task that writes to its repo.",
+            host.label
+        )));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE hosts SET takes_unassigned = (id = ?1), updated_at = datetime('now')
+          WHERE takes_unassigned <> (id = ?1)",
+        params![id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The host that takes unassigned work, if one does.
+pub fn default_host(conn: &Connection) -> Result<Option<HostCapability>, AppError> {
+    Ok(list(conn)?.into_iter().find(|h| h.takes_unassigned))
+}
+
+/// Find a host from what a person or an agent calls it: its id, its label, or a
+/// word that picks out exactly one label ("mini").
+pub fn resolve(conn: &Connection, name: &str) -> Result<HostCapability, AppError> {
+    let hosts = list(conn)?;
+    let wanted = name.trim().to_lowercase();
+    if let Some(h) = hosts
+        .iter()
+        .find(|h| h.id == name.trim() || h.label.to_lowercase() == wanted)
+    {
+        return Ok(h.clone());
+    }
+    let found: Vec<&HostCapability> = hosts
+        .iter()
+        .filter(|h| !wanted.is_empty() && h.label.to_lowercase().contains(&wanted))
+        .collect();
+    if let [one] = found.as_slice() {
+        return Ok((*one).clone());
+    }
+    let names: Vec<&str> = hosts.iter().map(|h| h.label.as_str()).collect();
+    Err(AppError::Dispatch(format!(
+        "No single machine matches '{name}'. The machines are: {}.",
+        names.join(", ")
+    )))
 }
 
 /// The observed half: what this host just learned by looking at itself.
@@ -488,6 +549,45 @@ mod tests {
             "an unknown tier must fall to the least capable value, not the most"
         );
         assert_eq!(got.executors, vec![BackgroundExecutor::Claude]);
+    }
+
+    #[test]
+    fn exactly_one_host_takes_unassigned_work_whatever_order_they_arrive() {
+        let conn = crate::db::schema::test_conn();
+        let mac = |id: &str| HostCapability::local_default(id.into(), id.into());
+        register_self(&conn, &mac("first")).unwrap();
+        register_self(&conn, &mac("second")).unwrap();
+        assert_eq!(default_host(&conn).unwrap().unwrap().id, "first");
+        assert!(!get(&conn, "second").unwrap().unwrap().takes_unassigned);
+
+        set_default(&conn, "second").unwrap();
+        let takers: Vec<_> = list(&conn).unwrap().into_iter().filter(|h| h.takes_unassigned).collect();
+        assert_eq!(takers.len(), 1);
+        assert_eq!(takers[0].id, "second");
+    }
+
+    #[test]
+    fn a_host_with_no_live_workspace_cannot_be_the_default() {
+        let conn = crate::db::schema::test_conn();
+        let mut nas = HostCapability::local_default("nas".into(), "the NAS".into());
+        nas.workspaces = vec![WorkspaceKind::Mirror];
+        register_self(&conn, &HostCapability::local_default("mac".into(), "Mac".into())).unwrap();
+        register_self(&conn, &nas).unwrap();
+        assert!(set_default(&conn, "nas").is_err());
+        assert_eq!(default_host(&conn).unwrap().unwrap().id, "mac");
+    }
+
+    #[test]
+    fn a_word_finds_a_machine_only_when_it_picks_out_one() {
+        let conn = crate::db::schema::test_conn();
+        for (id, label) in [("a", "Mac mini"), ("b", "MacBook Pro")] {
+            register_self(&conn, &HostCapability::local_default(id.into(), label.into())).unwrap();
+        }
+        assert_eq!(resolve(&conn, "mini").unwrap().id, "a");
+        assert_eq!(resolve(&conn, "MACBOOK PRO").unwrap().id, "b");
+        assert_eq!(resolve(&conn, "b").unwrap().id, "b");
+        let err = resolve(&conn, "mac").unwrap_err().to_string();
+        assert!(err.contains("Mac mini") && err.contains("MacBook Pro"), "{err}");
     }
 
     #[test]

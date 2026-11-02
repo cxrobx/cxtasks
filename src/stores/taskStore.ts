@@ -2068,6 +2068,7 @@ const UNDOABLE_FIELDS = [
   "bg_writes_allowed",
   "bg_shell_allowed",
   "bg_remote_allowed",
+  "run_on",
   "bg_mcp_servers",
   "model",
   "section_id",

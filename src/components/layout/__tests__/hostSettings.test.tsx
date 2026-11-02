@@ -32,6 +32,7 @@ const host = (over: Partial<HostEntry["capability"]> = {}, entry: Partial<HostEn
   capability: {
     id: "nas",
     label: "the NAS",
+    takes_unassigned: false,
     max_tier: "read-only",
     executors: ["claude"],
     workspaces: ["mirror"],

@@ -1,3 +1,4 @@
+import { RunOnField } from "@/components/tasks/RunOnField";
 import { Combobox } from "@/components/shared/Combobox";
 import { useEffect, useState } from "react";
 import { RefreshCw, Zap } from "lucide-react";
@@ -307,6 +308,8 @@ export function TripwireField({
           </span>
         </div>
       )}
+
+      {task.tripwire !== null && <RunOnField task={task} />}
     </div>
   );
 }

@@ -95,6 +95,9 @@ export function HostSettings() {
               {h.is_this_host && (
                 <span className="text-[10px] text-content-faint">this Mac</span>
               )}
+              {c.takes_unassigned && (
+                <span className="text-[10px] text-accent">default</span>
+              )}
               <span className="ml-auto text-[10px] text-content-faint">
                 {idle ? idle : "ready"}
               </span>
@@ -151,6 +154,18 @@ export function HostSettings() {
               >
                 {c.enabled ? "Switch off" : "Switch on"}
               </button>
+
+              {/* Only a machine holding the repos can take unassigned work. */}
+              {!c.takes_unassigned && c.workspaces.includes("live") && (
+                <button
+                  type="button"
+                  className="rounded border border-border px-1.5 py-0.5 text-[11px]"
+                  disabled={busy !== null}
+                  onClick={() => void run("default", () => api.hosts.setDefault(c.id))}
+                >
+                  Make default
+                </button>
+              )}
 
               {/* Removing the machine you are sitting at would take the local
                   runner out of its own registry, and it would put itself back

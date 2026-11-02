@@ -385,6 +385,7 @@ pub fn dispatch(conn: &mut Connection, cmd: &str, args: &Value) -> Result<Value,
             opt::<String>(args, "remote")?.as_deref(),
         )?),
         "remove_host" => ok(db::hosts::remove(conn, &arg::<String>(args, "host_id")?)?),
+        "set_default_host" => ok(db::hosts::set_default(conn, &arg::<String>(args, "host_id")?)?),
         // "4 runs finished on the NAS while you were away." No outbox table:
         // `task_runs` already replicates whole-row and carries `host` and
         // `finished_at`, so a cursor turns it into the same feature with
@@ -737,7 +738,7 @@ pub const ALL_VERBS: &[&str] = &[
     "project_for_repo_path", "list_sections", "create_section", "rename_section", "delete_section",
     "reorder_sections", "set_section_target_date", "set_section_completed", "move_task_to_section",
     "post_project_update", "list_project_updates",
-    "list_hosts", "set_host_policy", "set_host_mirror_remote", "remove_host",
+    "list_hosts", "set_host_policy", "set_host_mirror_remote", "remove_host", "set_default_host",
     "runs_finished_elsewhere",
 ];
 

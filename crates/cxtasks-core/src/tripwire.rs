@@ -87,7 +87,7 @@ pub const ORPHAN_CADENCES: i64 = 3;
 /// How a non-holder's error opens. [`is_orphaned`] reads it back, because that
 /// error stamps `checked_at` and would otherwise look like the check it reports
 /// as missing.
-pub const ORPHAN_NOTE: &str = "No host holding this script has checked it";
+pub const ORPHAN_NOTE: &str = "No machine that should run this has checked it";
 /// Bytes kept from each of stdout and stderr. The rest is drained and dropped.
 pub const CAPTURE_BYTES: usize = 4096;
 /// The one argv value a script tripwire may carry.
