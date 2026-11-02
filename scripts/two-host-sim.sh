@@ -44,6 +44,15 @@ printf '{"permissions":{"allow":[],"deny":[]}}\n' > "$MAC_HOME/.claude/settings.
 cp "$MAC_HOME/.claude/settings.json" "$NAS_HOME/.claude/settings.json"
 
 RUNNER="target/debug/cxtasks-runner"
+
+# Every host here has a fake $HOME, so a real install under the real one can't be
+# found, and a host with no executor reports HostDisabled before any gate this
+# script is testing. It never runs an agent, so a stub that answers --version is
+# all it needs, and the result doesn't depend on what this machine has installed.
+mkdir -p "$ROOT/bin"
+printf '%s\n' '#!/bin/sh' 'echo "2.0.0 (stub)"' > "$ROOT/bin/claude"
+chmod +x "$ROOT/bin/claude"
+export PATH="$ROOT/bin:$PATH"
 DB="$MAC_DATA/cxtasks.db"
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
