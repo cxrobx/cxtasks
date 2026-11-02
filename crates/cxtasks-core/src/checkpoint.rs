@@ -30,6 +30,14 @@
 //! So a write-enabled run now: checkpoint whatever state exists → let the agent
 //! work → `git diff <checkpoint>` is exactly what the agent did, and restoring
 //! the checkpoint undoes it — dirty WIP and all.
+//!
+//! # Committing what a run finished
+//!
+//! The same snapshot is what lets the runner commit a run's work without
+//! sweeping in anything else ([`commit_run`], invariant 31). The checkpoint's
+//! parent is HEAD before the run and its tree is the working tree before the
+//! run, so the checkpoint alone says which files were already dirty, and the
+//! diff from it says which ones the run changed.
 
 use std::path::Path;
 use std::process::Command;
@@ -53,14 +61,16 @@ pub fn ref_for_run(run_id: &str) -> String {
 fn git(repo: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Result<String, AppError> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
     // Keep the caller's identity out of it and make the commit reproducible.
+    // A checkpoint is never seen; `commit_run` passes the repo's own identity,
+    // which is why `extra_env` is applied after this.
     cmd.env("GIT_AUTHOR_NAME", "CXTasks")
         .env("GIT_AUTHOR_EMAIL", "cxtasks@localhost")
         .env("GIT_COMMITTER_NAME", "CXTasks")
         .env("GIT_COMMITTER_EMAIL", "cxtasks@localhost");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
 
     let out = cmd
         .output()
@@ -253,6 +263,104 @@ pub fn restore(repo: &Path, ref_name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// What [`commit_run`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RunCommit {
+    /// The new commit, or `None` when the run left nothing to commit.
+    pub sha: Option<String>,
+    pub committed: Vec<String>,
+    /// Files the run changed that already had uncommitted changes when it
+    /// started. Left alone, because the two sets of changes can't be told apart.
+    pub left_out: Vec<String>,
+}
+
+/// NUL-separated names of the files that differ between two tree-ishes.
+fn changed_paths(repo: &Path, from: &str, to: &str) -> Result<Vec<String>, AppError> {
+    let out = git(repo, &["diff", "--name-only", "--no-renames", "-z", from, to, "--"], &[])?;
+    Ok(out.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect())
+}
+
+/// Commit the files a run changed onto the current branch, and nothing else.
+///
+/// Works in a throwaway index and moves the branch by compare-and-swap, so a
+/// commit made elsewhere in the meantime fails this rather than being lost, and
+/// the working tree is never written. Not pushed, and hooks don't run: the
+/// run's own report is the verification, and the pre-push gate still stands.
+pub fn commit_run(repo: &Path, ref_name: &str, message: &str) -> Result<RunCommit, AppError> {
+    let head = git(repo, &["rev-parse", "--verify", "HEAD"], &[])
+        .map_err(|_| AppError::General("the repo has no commits yet".into()))?;
+    git(repo, &["symbolic-ref", "-q", "HEAD"], &[])
+        .map_err(|_| AppError::General("HEAD is detached, so there is no branch to commit to".into()))?;
+    for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"] {
+        if git(repo, &["rev-parse", "-q", "--verify", marker], &[]).is_ok() {
+            return Err(AppError::General(format!("{marker} is set: an operation is in progress")));
+        }
+    }
+    let before = format!("{ref_name}^");
+    git(repo, &["rev-parse", "--verify", &before], &[])
+        .map_err(|_| AppError::General(format!("checkpoint {ref_name} has no parent to compare with")))?;
+
+    let now = snapshot_tree(repo, "commit")?;
+    // Against HEAD as well as the checkpoint: a file the agent committed itself
+    // is already done, and a file nobody changed is not ours to touch.
+    let uncommitted = changed_paths(repo, &head, &now)?;
+    let by_run: std::collections::HashSet<String> =
+        changed_paths(repo, ref_name, &now)?.into_iter().collect();
+    let dirty_before: std::collections::HashSet<String> =
+        changed_paths(repo, &before, ref_name)?.into_iter().collect();
+
+    let (left_out, committed): (Vec<String>, Vec<String>) = uncommitted
+        .into_iter()
+        .filter(|p| by_run.contains(p))
+        // A name git printed that isn't valid UTF-8 can't be handed back to it.
+        .partition(|p| dirty_before.contains(p) || p.contains('\u{FFFD}'));
+    if committed.is_empty() {
+        return Ok(RunCommit { sha: None, committed, left_out });
+    }
+
+    let git_dir = git(repo, &["rev-parse", "--absolute-git-dir"], &[])?;
+    let index_path = format!("{git_dir}/cxtasks-commit-{}.index", std::process::id());
+    let list_path = format!("{git_dir}/cxtasks-commit-{}.paths", std::process::id());
+    struct TempFiles<'a>(&'a str, &'a str);
+    impl Drop for TempFiles<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+            let _ = std::fs::remove_file(self.1);
+        }
+    }
+    let _guard = TempFiles(&index_path, &list_path);
+    std::fs::write(&list_path, committed.join("\0"))
+        .map_err(|e| AppError::General(format!("could not write the path list: {e}")))?;
+    let from_file = format!("--pathspec-from-file={list_path}");
+    // A file really can be called `:(glob)*`.
+    let literal = ("GIT_LITERAL_PATHSPECS", "1");
+
+    let name = git(repo, &["config", "user.name"], &[]).unwrap_or_default();
+    let email = git(repo, &["config", "user.email"], &[]).unwrap_or_default();
+    let mut env = vec![("GIT_INDEX_FILE", index_path.as_str()), literal];
+    if !name.is_empty() && !email.is_empty() {
+        env.extend([
+            ("GIT_AUTHOR_NAME", name.as_str()),
+            ("GIT_AUTHOR_EMAIL", email.as_str()),
+            ("GIT_COMMITTER_NAME", name.as_str()),
+            ("GIT_COMMITTER_EMAIL", email.as_str()),
+        ]);
+    }
+    git(repo, &["read-tree", &head], &env)?;
+    git(repo, &["add", "-A", &from_file, "--pathspec-file-nul"], &env)?;
+    let tree = git(repo, &["write-tree"], &env)?;
+    let sha = git(repo, &["commit-tree", &tree, "-p", &head, "-m", message], &env)?;
+    git(repo, &["update-ref", "-m", "cxtasks: commit run", "HEAD", &sha, &head], &[])?;
+
+    // The real index still holds the old versions of these files, so without
+    // this they would read as staged reversals of the commit just made.
+    if let Err(e) = git(repo, &["reset", "-q", &from_file, "--pathspec-file-nul"], &[literal]) {
+        log::warn!("checkpoint: committed {sha} but could not refresh the index: {e}");
+    }
+    log::info!("checkpoint: committed {sha} in {} from {ref_name}", repo.display());
+    Ok(RunCommit { sha: Some(sha), committed, left_out })
+}
+
 /// Delete a checkpoint ref. Called when its run row is pruned.
 pub fn drop_ref(repo: &Path, ref_name: &str) -> Result<(), AppError> {
     let _ = git(repo, &["update-ref", "-d", ref_name], &[]);
@@ -280,6 +388,112 @@ mod tests {
         git(&dir, &["config", "user.email", "t@t"], &[]).unwrap();
         git(&dir, &["config", "user.name", "t"], &[]).unwrap();
         TempRepo(dir)
+    }
+
+    fn tracked(repo: &Path) -> String {
+        git(repo, &["show", "--name-only", "--format=", "HEAD"], &[]).unwrap()
+    }
+
+    #[test]
+    fn a_run_commit_takes_only_what_the_run_changed() {
+        let r = new_repo("commit-only-the-run");
+        commit_file(&r.0, "seed.txt", "seed\n");
+        commit_file(&r.0, "other.txt", "other\n");
+        commit_file(&r.0, "gone.txt", "gone\n");
+        // Chris's work in progress, before the run.
+        fs::write(r.0.join("wip.txt"), "wip\n").unwrap();
+        fs::write(r.0.join("other.txt"), "other, edited\n").unwrap();
+        let cp = capture(&r.0, "run-1").unwrap();
+
+        fs::write(r.0.join("seed.txt"), "seed, by the run\n").unwrap();
+        fs::write(r.0.join("new file :(glob).txt"), "new\n").unwrap();
+        fs::remove_file(r.0.join("gone.txt")).unwrap();
+
+        let done = commit_run(&r.0, &cp, "feat: the run").unwrap();
+        assert_eq!(done.committed.len(), 3, "{done:?}");
+        assert!(done.left_out.is_empty());
+        assert_eq!(git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap(), done.sha.unwrap());
+        let shown = tracked(&r.0);
+        assert!(shown.contains("seed.txt") && shown.contains("gone.txt"), "{shown}");
+        assert!(!shown.contains("wip.txt") && !shown.contains("other.txt"), "{shown}");
+
+        // The WIP is exactly as it was, and the commit reads clean: nothing
+        // staged, no reversal of the commit showing in status.
+        let status = git(&r.0, &["status", "--porcelain"], &[]).unwrap();
+        assert_eq!(status, "M other.txt\n?? wip.txt", "{status}");
+        assert_eq!(fs::read_to_string(r.0.join("other.txt")).unwrap(), "other, edited\n");
+    }
+
+    #[test]
+    fn a_file_that_was_already_dirty_is_left_out_and_named() {
+        let r = new_repo("commit-dirty-overlap");
+        commit_file(&r.0, "both.txt", "base\n");
+        commit_file(&r.0, "seed.txt", "seed\n");
+        fs::write(r.0.join("both.txt"), "mine\n").unwrap();
+        let cp = capture(&r.0, "run-2").unwrap();
+
+        fs::write(r.0.join("both.txt"), "mine and the run's\n").unwrap();
+        fs::write(r.0.join("seed.txt"), "by the run\n").unwrap();
+
+        let done = commit_run(&r.0, &cp, "fix: partial").unwrap();
+        assert_eq!(done.committed, vec!["seed.txt".to_string()]);
+        assert_eq!(done.left_out, vec!["both.txt".to_string()]);
+        assert_eq!(fs::read_to_string(r.0.join("both.txt")).unwrap(), "mine and the run's\n");
+        assert_eq!(git(&r.0, &["status", "--porcelain"], &[]).unwrap(), "M both.txt");
+    }
+
+    #[test]
+    fn a_run_that_changed_nothing_commits_nothing() {
+        let r = new_repo("commit-nothing");
+        commit_file(&r.0, "seed.txt", "seed\n");
+        fs::write(r.0.join("wip.txt"), "wip\n").unwrap();
+        let head = git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap();
+        let cp = capture(&r.0, "run-3").unwrap();
+
+        assert_eq!(commit_run(&r.0, &cp, "nope").unwrap(), RunCommit::default());
+        assert_eq!(git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap(), head);
+    }
+
+    #[test]
+    fn work_the_agent_committed_itself_is_not_committed_twice() {
+        let r = new_repo("commit-agent-did");
+        commit_file(&r.0, "seed.txt", "seed\n");
+        let cp = capture(&r.0, "run-4").unwrap();
+        commit_file(&r.0, "seed.txt", "the agent committed this\n");
+        let head = git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap();
+
+        assert_eq!(commit_run(&r.0, &cp, "nope").unwrap().sha, None);
+        assert_eq!(git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap(), head);
+    }
+
+    #[test]
+    fn a_detached_head_or_an_open_merge_commits_nothing() {
+        let r = new_repo("commit-refused");
+        commit_file(&r.0, "seed.txt", "seed\n");
+        let cp = capture(&r.0, "run-5").unwrap();
+        fs::write(r.0.join("seed.txt"), "by the run\n").unwrap();
+        let head = git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap();
+
+        fs::write(r.0.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        let err = commit_run(&r.0, &cp, "nope").unwrap_err().to_string();
+        assert!(err.contains("MERGE_HEAD"), "{err}");
+        fs::remove_file(r.0.join(".git/MERGE_HEAD")).unwrap();
+
+        git(&r.0, &["checkout", "-q", "--detach"], &[]).unwrap();
+        let err = commit_run(&r.0, &cp, "nope").unwrap_err().to_string();
+        assert!(err.contains("detached"), "{err}");
+        assert_eq!(git(&r.0, &["rev-parse", "HEAD"], &[]).unwrap(), head);
+    }
+
+    #[test]
+    fn a_run_commit_carries_the_repos_own_identity() {
+        let r = new_repo("commit-identity");
+        commit_file(&r.0, "seed.txt", "seed\n");
+        let cp = capture(&r.0, "run-6").unwrap();
+        fs::write(r.0.join("seed.txt"), "by the run\n").unwrap();
+        commit_run(&r.0, &cp, "feat: x").unwrap();
+        let who = git(&r.0, &["log", "-1", "--format=%an <%ae>"], &[]).unwrap();
+        assert_eq!(who, "t <t@t>");
     }
 
     fn commit_file(repo: &Path, name: &str, body: &str) {

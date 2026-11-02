@@ -943,6 +943,33 @@ pub fn count_running_background(conn: &Connection) -> Result<i64, AppError> {
     Ok(n)
 }
 
+/// Whether another write run on this machine overlapped this one in the same
+/// repo. If one did, the working tree holds both runs' changes and a checkpoint
+/// can't separate them, so neither may commit (invariant 31).
+pub fn overlapped_in_repo(
+    conn: &Connection,
+    run_id: &str,
+    repo_path: &str,
+) -> Result<bool, AppError> {
+    let me = crate::host::host_id();
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*)
+           FROM task_runs o
+           JOIN tasks t ON t.id = o.task_id
+           JOIN task_runs r ON r.id = ?1
+          WHERE o.id <> r.id
+            AND o.mode = 'background'
+            AND o.scratch_dir LIKE 'refs/cxtasks/%'
+            AND t.repo_path = ?2
+            AND (o.host IS NULL OR o.host = ?3)
+            AND (o.status = 'running'
+                 OR datetime(o.finished_at) >= datetime(r.started_at))",
+        params![run_id, repo_path, me],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Refuse anything that would resolve a foreign run against THIS machine's disk.
 ///
 /// A checkpoint is a git ref in the repo the run executed against. Both
@@ -1260,6 +1287,55 @@ mod tests {
     use super::*;
     use crate::db::schema::test_conn;
     use crate::db::tasks::{self, NewTask};
+
+    #[test]
+    fn write_runs_that_overlap_in_a_repo_are_seen_and_others_are_not() {
+        let conn = test_conn();
+        let in_repo = |repo: &str| {
+            tasks::create(
+                &conn,
+                &NewTask {
+                    title: "t".into(),
+                    repo_path: Some(repo.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .id
+        };
+        let start_at = |task: &str, writes: bool, started: &str, finished: Option<&str>| {
+            let run = start(&conn, task, "background", None, BackgroundExecutor::Claude, BackgroundIntent::Work, None).unwrap();
+            conn.execute(
+                "UPDATE task_runs SET started_at = ?2, finished_at = ?3,
+                        status = CASE WHEN ?3 IS NULL THEN 'running' ELSE 'succeeded' END
+                  WHERE id = ?1",
+                params![run.id, started, finished],
+            )
+            .unwrap();
+            if writes {
+                set_checkpoint(&conn, &run.id, "refs/cxtasks/checkpoints/x").unwrap();
+            }
+            run.id
+        };
+        let (a, b) = (in_repo("/r/a"), in_repo("/r/b"));
+        let me = start_at(&a, true, "2026-11-02 10:00:00", Some("2026-11-02 10:30:00"));
+
+        // Before this run, a read-only run, and another repo: none of them count.
+        start_at(&a, true, "2026-11-02 09:00:00", Some("2026-11-02 09:59:00"));
+        let read_only = start_at(&a, false, "2026-11-02 10:05:00", Some("2026-11-02 10:10:00"));
+        conn.execute("UPDATE task_runs SET scratch_dir = '/tmp/session' WHERE id = ?1", params![read_only]).unwrap();
+        start_at(&b, true, "2026-11-02 10:05:00", None);
+        assert!(!overlapped_in_repo(&conn, &me, "/r/a").unwrap());
+
+        // Finished during this run: its changes are in the tree, so it counts.
+        start_at(&a, true, "2026-11-02 10:05:00", Some("2026-11-02 10:10:00"));
+        assert!(overlapped_in_repo(&conn, &me, "/r/a").unwrap());
+
+        let other = in_repo("/r/c");
+        let mine = start_at(&other, true, "2026-11-02 10:00:00", Some("2026-11-02 10:30:00"));
+        start_at(&other, true, "2026-11-02 10:20:00", None);
+        assert!(overlapped_in_repo(&conn, &mine, "/r/c").unwrap(), "still running");
+    }
 
     fn seed_task(conn: &Connection) -> String {
         tasks::create(

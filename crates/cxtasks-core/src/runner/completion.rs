@@ -24,6 +24,10 @@ struct Report {
     status: Status,
     verified: Vec<String>,
     remaining: Vec<String>,
+    /// The agent's commit message. It writes it because it has read the repo:
+    /// its commit style, and what must stay out of a public repo's history.
+    #[serde(default)]
+    commit: Option<String>,
 }
 
 pub struct Assessment {
@@ -104,6 +108,17 @@ pub fn assess(text: &str) -> Assessment {
     }
 }
 
+/// What a ready report offers for the commit message, if anything usable.
+pub fn commit_message(text: &str) -> Option<String> {
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    let json = line.trim().strip_prefix(MARKER)?;
+    let report = serde_json::from_str::<Report>(json.trim()).ok()?;
+    report
+        .commit
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty() && !m.contains(MARKER) && m.chars().count() <= 2000)
+}
+
 pub fn label(status: &str) -> &str {
     match status {
         READY => "Ready for review",
@@ -138,11 +153,37 @@ needs_action when required work remains, with concrete remaining steps. Use need
 when the result is prepared but a required check remains, listing that check in remaining. \
 verified lists only what you actually checked (it may be empty for incomplete work). Each \
 list may contain at most 20 short strings. The opening sentence must match this disposition: \
-say what remains up front when the task is incomplete.\n";
+say what remains up front when the task is incomplete.\n\n\
+If you changed files in a repo, also add \"commit\" to that JSON: a commit message in this \
+repo's style, under 2000 characters, following its rules for what may appear in history. \
+The runner commits finished work itself, only the files you changed and only on \
+ready_for_review, so do not run git commit or git push unless the task asks for it.\n";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_commit_message_comes_from_the_report_and_never_blocks_it() {
+        let with = |msg: &str| {
+            format!(
+                "Done.\nCXTASKS_RESULT: {{\"status\":\"ready_for_review\",\"verified\":[\"ran it\"],\"remaining\":[],\"commit\":{msg}}}"
+            )
+        };
+        let good = with("\"fix(x): the thing\\n\\nBecause.\"");
+        assert_eq!(assess(&good).status, READY);
+        assert_eq!(commit_message(&good).as_deref(), Some("fix(x): the thing\n\nBecause."));
+
+        // Absent, empty or oversized: the report stands, the runner writes one.
+        let none = "Done.\nCXTASKS_RESULT: {\"status\":\"ready_for_review\",\"verified\":[\"ran it\"],\"remaining\":[]}";
+        assert_eq!(assess(none).status, READY);
+        assert_eq!(commit_message(none), None);
+        assert_eq!(commit_message(&with("\"  \"")), None);
+        assert_eq!(commit_message(&with("null")), None);
+        let long = with(&format!("\"{}\"", "x".repeat(2001)));
+        assert_eq!(assess(&long).status, READY);
+        assert_eq!(commit_message(&long), None);
+    }
 
     #[test]
     fn an_exit_without_evidence_cannot_claim_task_success() {

@@ -1779,7 +1779,7 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
                 task_for_thread.id,
                 repo.display()
             );
-            let outcome = run_one_recorded(
+            let mut outcome = run_one_recorded(
                 &task_for_thread,
                 &repo,
                 provider,
@@ -1789,8 +1789,32 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
                 RunKind::Work,
             );
 
+            // Before recording, so the handoff the next agent reads says where
+            // the work went. A commit that fails costs the commit, never the run.
+            let committed = commit_finished_work(
+                &task_for_thread,
+                &repo,
+                &workspace,
+                &run_id,
+                &outcome,
+            );
+            if let (Some(note), Some(text)) = (&committed, outcome.result_text.as_mut()) {
+                text.push_str("\n\n");
+                text.push_str(note);
+            }
+
             if let Err(e) = finish_run(&task_for_thread, &run_id, &outcome) {
                 log::error!("runner: could not record run {run_id}: {e}");
+            }
+            if let (Some(note), Ok(conn)) = (&committed, open_db()) {
+                if let Err(e) = db::comments::add(
+                    &conn,
+                    &task_for_thread.id,
+                    outcome.executor.as_str(),
+                    note,
+                ) {
+                    log::warn!("runner: could not record the commit as a comment: {e}");
+                }
             }
             // AFTER recording, and only for a mirror — `release` is a no-op on a
             // live workspace, which is the only thing standing between this
@@ -1801,6 +1825,111 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
     }
 
     Ok(started)
+}
+
+/// The only runs whose work is committed: finished and verified, in a real tree.
+///
+/// READY alone would not do: a mirror has no tree to keep, and a read-only tier
+/// has no checkpoint to compare against. Keyed on the outcome, not the task,
+/// because `needs_action`, `unverified` and every kind of stop mean the work
+/// isn't a claim anyone is making yet.
+fn commits_its_work(task: &Task, workspace: &Workspace, outcome_status: &str) -> bool {
+    outcome_status == completion::READY
+        && workspace.snapshot.is_none()
+        && ToolTier::for_task(task).needs_checkpoint()
+}
+
+/// The commit message: the agent's own, or the task's name failing that.
+/// The trailers tie the commit back to the task and the run either way.
+fn run_commit_message(task: &Task, run_id: &str, outcome: &RunOutcome) -> String {
+    let reference = task
+        .short_id
+        .map(|n| format!("T{n}"))
+        .unwrap_or_else(|| task.id.clone());
+    let body = outcome
+        .result_text
+        .as_deref()
+        .and_then(completion::commit_message)
+        .unwrap_or_else(|| {
+            format!("{reference}: {}", providers::bounded(task.title.trim(), 200))
+        });
+    let author = match outcome.executor {
+        crate::executor::BackgroundExecutor::Codex => "Codex <noreply@openai.com>",
+        _ => "Claude <noreply@anthropic.com>",
+    };
+    format!(
+        "{body}\n\nCXTasks-Task: {reference}\nCXTasks-Run: {run_id}\n\
+         Co-Authored-By: {author}"
+    )
+}
+
+/// Commit a finished run's work (invariant 31). Returns the sentence to put on
+/// the task, or `None` when there is nothing to say.
+///
+/// Every refusal leaves the work exactly where it is, in the working tree.
+fn commit_finished_work(
+    task: &Task,
+    repo: &std::path::Path,
+    workspace: &Workspace,
+    run_id: &str,
+    outcome: &RunOutcome,
+) -> Option<String> {
+    if !commits_its_work(task, workspace, &outcome.status) {
+        return None;
+    }
+    let repo_path = task.repo_path.as_deref()?;
+    match open_db().map(|conn| db::runs::overlapped_in_repo(&conn, run_id, repo_path)) {
+        Ok(Ok(false)) => {}
+        Ok(Ok(true)) => {
+            return Some(
+                "Not committed: another run worked in this repo at the same time, so \
+                 their changes can't be told apart. The work is in the working tree."
+                    .into(),
+            )
+        }
+        Ok(Err(e)) | Err(e) => {
+            log::warn!("runner: could not check run {run_id} for overlap: {e}");
+            return Some("Not committed: couldn't check for overlapping runs.".into());
+        }
+    }
+    let message = run_commit_message(task, run_id, outcome);
+    let ref_name = crate::checkpoint::ref_for_run(run_id);
+    match crate::checkpoint::commit_run(repo, &ref_name, &message) {
+        Ok(done) => commit_note(&done),
+        Err(e) => {
+            log::warn!("runner: could not commit run {run_id}: {e}");
+            Some(format!("Not committed: {e}. The work is in the working tree."))
+        }
+    }
+}
+
+/// What a commit attempt tells the task. Silent only if nothing changed at all.
+fn commit_note(done: &crate::checkpoint::RunCommit) -> Option<String> {
+    let names = |paths: &[String]| {
+        let shown: Vec<String> = paths.iter().take(10).map(|p| format!("`{p}`")).collect();
+        let more = paths.len().saturating_sub(10);
+        if more > 0 {
+            format!("{} and {more} more", shown.join(", "))
+        } else {
+            shown.join(", ")
+        }
+    };
+    let mut parts = Vec::new();
+    if let Some(sha) = done.sha.as_deref() {
+        let n = done.committed.len();
+        let short = sha.get(..9).unwrap_or(sha);
+        parts.push(format!(
+            "Committed `{short}` ({n} file{}).",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    if !done.left_out.is_empty() {
+        parts.push(format!(
+            "Left uncommitted because they already had changes before the run: {}.",
+            names(&done.left_out)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// How much of a handoff the comment log carries.

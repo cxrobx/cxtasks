@@ -1128,6 +1128,33 @@ elsewhere and quiet for `max(3 × cadence, 3 days)`, another host reports it thr
 the orphan path, naming the machine. An unassigned script still runs wherever it
 is held, and an unassigned agent check belongs to the default.
 
+## Invariant 31 — a verified run commits its own work
+
+A background run whose report says `ready_for_review`, in a live tree, on a tier
+that checkpoints, is committed by the RUNNER to the current branch
+(`checkpoint::commit_run`, called from `commit_finished_work` before the run is
+recorded). `needs_action`, `unverified`, every stop, read-only runs and mirrors
+commit nothing. Nothing is ever pushed.
+
+- **The runner commits, not the agent,** because only the checkpoint knows which
+  files the run changed. Its parent is HEAD before the run and its tree is the
+  working tree before the run.
+- **A file already dirty at the start is left out and named on the task.** Its
+  changes and the run's can't be separated, so neither gets committed.
+- **Overlapping write runs in one repo commit nothing** (`db::runs::overlapped_in_repo`):
+  the tree holds both sets of changes. `max_concurrent` is per host, not per repo.
+- **The agent writes the message** (`commit` in `CXTASKS_RESULT`), because it has
+  read the repo's style and what must stay out of a public repo's history. An
+  absent or oversized message never blocks the report; the runner falls back to
+  `T<N>: title`. Trailers name the task and the run.
+- **A failed commit costs the commit, never the run.** The reason goes on the task
+  and the work stays in the working tree. A detached HEAD, an open merge and a repo
+  with no commits are all refusals of that kind.
+- **Not covered:** an interactive session editing the same repo during a run. Its
+  files look like the run's, the same limit the checkpoint diff has always had.
+- **Undo** is `git revert`. The Restore button still returns the tree to its
+  pre-run state but doesn't move HEAD, so it reads as uncommitted changes.
+
 ## A run's PATH
 
 launchd starts the runner on a bare PATH, and Claude Code keeps the PATH it was

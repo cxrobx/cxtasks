@@ -1783,3 +1783,98 @@ fn a_scripts_only_declaration_round_trips_through_the_registry() {
     assert!(got.is_scripts_only(), "{:?}", got.workspaces);
     assert!(db::hosts::local(&conn, &scripts_only_host()).unwrap().is_scripts_only());
 }
+
+// ── committing a finished run (invariant 31) ──────────────────────────────
+
+fn live_workspace() -> Workspace {
+    Workspace {
+        path: PathBuf::from("/tmp/repo"),
+        kind: crate::routing::WorkspaceKind::Live,
+        snapshot: None,
+    }
+}
+
+fn commit_task(conn: &Connection, writes: bool) -> Task {
+    let t = create(
+        conn,
+        &NewTask {
+            title: "Fix the  thing".into(),
+            repo_path: Some("/tmp/repo".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut t = crate::db::tasks::get(conn, &t.id).unwrap().unwrap();
+    t.bg_writes_allowed = writes;
+    t.bg_shell_allowed = writes;
+    t
+}
+
+#[test]
+fn only_a_verified_finish_in_a_live_tree_with_a_checkpoint_commits() {
+    let conn = crate::db::schema::test_conn();
+    let task = commit_task(&conn, true);
+    assert!(commits_its_work(&task, &live_workspace(), completion::READY));
+
+    for status in [completion::NEEDS_ACTION, completion::UNVERIFIED, "succeeded", "failed", "timeout", "cancelled", "turns_exhausted"] {
+        assert!(!commits_its_work(&task, &live_workspace(), status), "{status}");
+    }
+    let read_only = commit_task(&conn, false);
+    assert!(!commits_its_work(&read_only, &live_workspace(), completion::READY));
+
+    let mut mirror = live_workspace();
+    mirror.kind = crate::routing::WorkspaceKind::Mirror;
+    mirror.snapshot = Some(crate::mirror::Snapshot {
+        repo_key: "k".into(),
+        sha: "s".into(),
+        taken_at: "t".into(),
+        dirty_files: 0,
+    });
+    assert!(!commits_its_work(&task, &mirror, completion::READY));
+}
+
+#[test]
+fn the_commit_message_is_the_agents_with_the_task_and_run_attached() {
+    let conn = crate::db::schema::test_conn();
+    let task = commit_task(&conn, true);
+    let reference = format!("T{}", task.short_id.unwrap());
+    let mut outcome = RunOutcome::default_failed(BackgroundExecutor::Claude, String::new());
+    outcome.result_text = Some(
+        "Done.\nCXTASKS_RESULT: {\"status\":\"ready_for_review\",\"verified\":[\"ran\"],\"remaining\":[],\"commit\":\"fix(x): the agent's words\"}".into(),
+    );
+    let msg = run_commit_message(&task, "run-1", &outcome);
+    assert!(msg.starts_with("fix(x): the agent's words\n\n"), "{msg}");
+    assert!(msg.contains(&format!("CXTasks-Task: {reference}\n")), "{msg}");
+    assert!(msg.contains("CXTasks-Run: run-1\n"), "{msg}");
+    assert!(msg.ends_with("Co-Authored-By: Claude <noreply@anthropic.com>"), "{msg}");
+
+    outcome.result_text = Some("Done.".into());
+    outcome.executor = BackgroundExecutor::Codex;
+    let msg = run_commit_message(&task, "run-1", &outcome);
+    assert!(msg.starts_with(&format!("{reference}: Fix the thing\n\n")), "{msg}");
+    assert!(msg.ends_with("Co-Authored-By: Codex <noreply@openai.com>"), "{msg}");
+}
+
+#[test]
+fn the_task_is_told_what_was_committed_and_what_was_left() {
+    use crate::checkpoint::RunCommit;
+    assert_eq!(commit_note(&RunCommit::default()), None);
+    let note = commit_note(&RunCommit {
+        sha: Some("0123456789abcdef".into()),
+        committed: vec!["a.rs".into(), "b.rs".into()],
+        left_out: vec!["c.rs".into()],
+    })
+    .unwrap();
+    assert_eq!(
+        note,
+        "Committed `012345678` (2 files). Left uncommitted because they already had \
+         changes before the run: `c.rs`."
+    );
+    let only_left = commit_note(&RunCommit {
+        sha: None,
+        committed: vec![],
+        left_out: (0..12).map(|n| format!("f{n}")).collect(),
+    })
+    .unwrap();
+    assert!(only_left.ends_with("`f9` and 2 more."), "{only_left}");
+}
