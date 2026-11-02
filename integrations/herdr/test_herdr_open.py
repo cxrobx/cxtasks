@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -355,6 +356,142 @@ class ClaudeTrustTests(unittest.TestCase):
                 unittest.mock.patch("builtins.print"):
             self.assertEqual(router.main(["--cwd", str(self.repo), "--launch", str(script)]), 0)
         self.assertIs(seen["entry"]["hasTrustDialogAccepted"], True)
+
+
+# Stands in for /usr/bin/ssh: runs the remote command in a shell, with the local session
+# folder swapped for a "host" one so a real copy happens and real quoting is exercised.
+FAKE_SSH = """#!/usr/bin/python3
+import json, os, subprocess, sys
+state = os.environ["FAKE_SSH_STATE"]
+with open(state, "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+if os.environ.get("FAKE_SSH_EXIT"):
+    sys.exit(int(os.environ["FAKE_SSH_EXIT"]))
+command = sys.argv[-1].replace(os.environ["FAKE_FROM"], os.environ["FAKE_TO"])
+sys.exit(subprocess.run(["/bin/sh", "-c", command]).returncode)
+"""
+
+
+class RemoteHostTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="cx-herdr-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.home = self.root / "laptop"
+        (self.home / ".local/bin").mkdir(parents=True)
+        (self.home / ".local/bin/herdr").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.home / ".local/bin/herdr").chmod(0o700)
+        # A space in the path, as ~/Library/Application Support has.
+        self.session = self.root / "App Support/Sessions/one"
+        self.session.mkdir(parents=True)
+        (self.session / "prompt.txt").write_text("the prompt", encoding="utf-8")
+        self.launch = self.session / "launch.command"
+        self.launch.write_text("#!/bin/zsh\nexec claude\n", encoding="utf-8")
+        self.launch.chmod(0o700)
+        self.host_home = self.root / "mini"
+        self.remote_helper = self.host_home / ".local/bin/cx-open-in-herdr"
+        self.remote_helper.parent.mkdir(parents=True)
+        self.helper_reply("{\"workspace_id\": \"w\", \"tab_id\": \"t\"}", 0)
+        self.state = self.root / "ssh.log"
+        fake = self.root / "fake-ssh"
+        fake.write_text(FAKE_SSH, encoding="utf-8")
+        fake.chmod(0o700)
+        self.mirror = self.root / "on-host"
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.host_home), "FAKE_SSH_STATE": str(self.state),
+                    "FAKE_FROM": str(self.session), "FAKE_TO": str(self.mirror)}
+        for patch in (unittest.mock.patch.object(router, "SSH", [str(fake)]),
+                      unittest.mock.patch.object(router.Path, "home", return_value=self.home),
+                      unittest.mock.patch.dict(router.os.environ, self.env)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def helper_reply(self, reply, status):
+        self.remote_helper.write_text(f"import sys\nprint({reply!r})\nsys.exit({status})\n", encoding="utf-8")
+
+    def calls(self):
+        return [json.loads(line) for line in self.state.read_text(encoding="utf-8").splitlines()]
+
+    def open(self, host="cx@mini"):
+        with unittest.mock.patch.dict(router.os.environ, {router.HOST_VARIABLE: host}), \
+                unittest.mock.patch.object(router, "request", side_effect=AssertionError("local Herdr touched")) as local, \
+                unittest.mock.patch.object(router, "show_terminal") as terminal, \
+                unittest.mock.patch("builtins.print") as printed:
+            status = router.main(["--cwd", "/Users/you/Projects/only-on-host", "--launch", str(self.launch),
+                                  "--tab", "Quick Ask · Claude", "--space", "Quick Ask"])
+        self.assertFalse(local.called)
+        return status, terminal, printed
+
+    def test_a_named_host_gets_the_session_and_never_the_local_herdr(self):
+        status, terminal, printed = self.open()
+        self.assertEqual(status, 0)
+        self.assertEqual((self.mirror / "prompt.txt").read_text(encoding="utf-8"), "the prompt")
+        self.assertTrue(os.access(self.mirror / "launch.command", os.X_OK))
+        command = self.calls()[-1][-1]
+        self.assertIn("--headless", command)
+        self.assertIn("'Quick Ask · Claude'", command)
+        self.assertEqual(terminal.call_args.args[3], "cx@mini")
+        self.assertEqual(json.loads(printed.call_args.args[0])["tab_id"], "t")
+
+    def test_no_host_keeps_the_local_route(self):
+        with unittest.mock.patch.object(router, "open_on_host") as forwarded, \
+                unittest.mock.patch.object(router, "request", side_effect=OSError("stop here")), \
+                unittest.mock.patch.object(router, "show_terminal"), \
+                unittest.mock.patch.object(router.time, "monotonic", side_effect=[0, 99]):
+            for value in ("", "   "):
+                with unittest.mock.patch.dict(router.os.environ, {router.HOST_VARIABLE: value}), \
+                        self.assertRaises(router.RoutingError):
+                    router.main(["--cwd", str(self.root), "--launch", str(self.launch)])
+                router.time.monotonic.side_effect = [0, 99]
+        self.assertFalse(forwarded.called)
+
+    def test_the_host_itself_never_forwards_again(self):
+        with unittest.mock.patch.dict(router.os.environ, {router.HOST_VARIABLE: "cx@mini"}), \
+                unittest.mock.patch.object(router, "open_on_host") as forwarded, \
+                self.assertRaises(router.HostError):
+            router.main(["--headless", "--cwd", str(self.root / "missing"), "--launch", str(self.launch)])
+        self.assertFalse(forwarded.called)
+
+    def test_an_unreachable_host_opens_nothing_anywhere(self):
+        with unittest.mock.patch.dict(router.os.environ, {"FAKE_SSH_EXIT": "255"}), \
+                self.assertRaisesRegex(router.HostError, "Nothing was opened"):
+            self.open()
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_host_without_the_helper_says_so(self):
+        self.remote_helper.unlink()
+        with self.assertRaisesRegex(router.HostError, "isn't installed on cx@mini"):
+            self.open()
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_the_hosts_own_sentence_reaches_the_client(self):
+        self.helper_reply('{"message": "/x doesn\'t exist on the Herdr host."}', 1)
+        with self.assertRaisesRegex(router.HostError, "doesn't exist on the Herdr host"):
+            self.open()
+
+    def test_a_lost_reply_never_claims_nothing_opened(self):
+        self.helper_reply("not json", 1)
+        with self.assertRaises(router.HostError) as caught:
+            self.open()
+        self.assertIn("Check Herdr there", str(caught.exception))
+        self.assertNotIn("Nothing was opened", str(caught.exception))
+        self.assertEqual(len(self.calls()), 2)  # One copy, one launch: never a retry.
+
+    def test_a_target_cannot_become_an_ssh_option(self):
+        with self.assertRaisesRegex(router.HostError, "isn't an SSH target"):
+            self.open("-oProxyCommand=touch /tmp/x")
+        self.assertFalse(self.state.exists())
+
+    def test_the_terminal_attaches_to_the_host(self):
+        state = self.root / "state"
+        state.mkdir()
+        script = router.terminal_script(state, Path("/bin/herdr"), "cx@mini").read_text(encoding="utf-8")
+        self.assertIn("/bin/herdr --remote cx@mini", script)
+        script = router.terminal_script(state, Path("/bin/herdr")).read_text(encoding="utf-8")
+        self.assertIn("/bin/herdr --session default", script)
+
+    def test_a_bare_claude_command_still_earns_trust_on_the_host(self):
+        self.launch.write_text("cd /repo\nexec 'claude' --model opus -- \"$(cat p)\"\n", encoding="utf-8")
+        self.assertEqual(router.claude_folder(self.launch, self.root), Path("/repo"))
 
 
 if __name__ == "__main__":

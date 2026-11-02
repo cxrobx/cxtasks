@@ -40,6 +40,29 @@ It uses Herdr's documented newline-delimited socket API (0.9.3 or later).
   launch in a different terminal. After a confirmed launch, a display/focus
   failure is a warning, so the same click cannot launch two sessions.
 
+## Running sessions on another Mac
+
+The client says where Herdr runs by setting `CX_HERDR_HOST` when it starts this
+helper: unset or empty means this Mac, anything else is an SSH target such as
+`user@host`. Nothing here names a machine, so one build works on every Mac. A
+GUI app doesn't see your shell's environment, so the app has to supply the value;
+Quick Ask keeps it in Settings as **Herdr host**. Only clients that set it move.
+
+With a host set, the helper copies the launch script's folder to the same
+absolute path there, runs its own copy on that host with `--headless`, then
+attaches a local Ghostty with `herdr --remote`. Routing, spaces and the folder
+trust all happen on the host, against its own files.
+
+- The host needs this helper in `~/.local/bin`, `python3` on a non-interactive
+  SSH `PATH`, and a running Herdr. SSH must work without a prompt.
+- Both Macs must reach the same absolute paths. If the home folders differ, link
+  one to the other.
+- Launch scripts must name the CLI so it resolves on the host: Quick Ask writes a
+  bare `claude` or `codex` when a host is set.
+- There is no fallback to local Herdr. A session that opened on the wrong Mac
+  would split the work this exists to keep in one place, so an unreachable host
+  or a folder missing there is an error, and nothing opens.
+
 Verify without touching a live Herdr session:
 
 ```sh

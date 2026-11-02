@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import socket
 import subprocess
@@ -19,6 +20,10 @@ import uuid
 
 
 TITLE = "Herdr · CX Apps"
+# The client says where Herdr runs. Unset or empty: this Mac. Otherwise an SSH target.
+HOST_VARIABLE = "CX_HERDR_HOST"
+REMOTE_HELPER = '"$HOME/.local/bin/cx-open-in-herdr"'
+SSH = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 MAX_RESPONSE = 8 * 1024 * 1024
 CLAUDE_CONFIG = Path.home() / ".claude.json"
 # What Claude Code writes for a project it has no entry for when its trust prompt is accepted.
@@ -31,6 +36,10 @@ NEW_CLAUDE_PROJECT = {
 
 class RoutingError(Exception):
     pass
+
+
+class HostError(RoutingError):
+    """A sentence written here for the person, safe to show in the client as it stands."""
 
 
 def request(socket_path, method, params=None):
@@ -280,10 +289,11 @@ def extend_claude_trust(folder, config=None):
         lock.rmdir()
 
 
-def terminal_script(state_dir, herdr):
+def terminal_script(state_dir, herdr, host=None):
     script = state_dir / "attach.command"
+    target = ["--remote", host] if host else ["--session", "default"]
     script.write_text(
-        "#!/bin/zsh -l\nexec " + shlex.quote(str(herdr)) + " --session default\n",
+        "#!/bin/zsh -l\nexec " + shlex.join([str(herdr), *target]) + "\n",
         encoding="utf-8",
     )
     script.chmod(0o700)
@@ -310,9 +320,9 @@ def freeze_launch(launch, state_dir):
     return frozen
 
 
-def show_terminal(herdr, state_dir, cwd):
+def show_terminal(herdr, state_dir, cwd, host=None):
     """Focus an attached Herdr client, or attach in a new Ghostty window."""
-    script = terminal_script(state_dir, herdr)
+    script = terminal_script(state_dir, herdr, host)
     apple = '''on run argv
 if application id "com.mitchellh.ghostty" is not running then return "cold"
 tell application id "com.mitchellh.ghostty"
@@ -350,6 +360,61 @@ end run'''
         raise RoutingError("Could not open the Herdr terminal: " + result.stderr.strip())
 
 
+def send_session(host, folder):
+    """Copy a launch script's folder to the same absolute path on `host`.
+
+    The scripts name their prompt and images by absolute path, so both Macs have
+    to reach one path (a home-folder link does that). Nothing has started yet, so
+    every failure here is a clean "nothing was opened".
+    """
+    target = shlex.quote(str(folder))
+    remote = f"test -f {REMOTE_HELPER} || exit 3; mkdir -p -m 700 {target} && tar -xpf - -C {target}"
+    with subprocess.Popen(["/usr/bin/tar", "-C", str(folder), "-cf", "-", "."],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          env={**os.environ, "COPYFILE_DISABLE": "1"}) as archive:
+        try:
+            # Attachments can make this slow; connecting is capped by ConnectTimeout.
+            result = subprocess.run([*SSH, host, remote], stdin=archive.stdout,
+                                    capture_output=True, text=True, timeout=25)
+        except subprocess.TimeoutExpired:
+            raise HostError(f"Copying the session to {host} took too long. Nothing was opened.")
+        finally:
+            archive.stdout.close()
+    if result.returncode == 255:
+        raise HostError(f"Couldn't reach {host}. Nothing was opened.")
+    if result.returncode == 3:
+        raise HostError(f"cx-open-in-herdr isn't installed on {host}. Nothing was opened.")
+    if result.returncode:
+        raise HostError(f"Couldn't copy the session to {host}. Nothing was opened.")
+
+
+def open_on_host(host, args, launch):
+    """Run this helper on `host`, where Herdr, the trust file and the checkout all live."""
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._@%-]*", host):
+        raise HostError(f"{HOST_VARIABLE} isn't an SSH target: use a name or user@host.")
+    send_session(host, launch.parent)
+    words = ["--headless", "--cwd", str(args.cwd), "--launch", str(launch)]
+    for flag, value in (("--space", args.space), ("--scope", args.scope), ("--tab", args.tab)):
+        if value:
+            words += [flag, value]
+    # A dropped connection doesn't prove the tab didn't open, so never invite a blind retry.
+    lost = f"Lost track of the launch on {host}. Check Herdr there before trying again."
+    try:
+        result = subprocess.run([*SSH, host, f"exec python3 {REMOTE_HELPER} {shlex.join(words)}"],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise HostError(lost)
+    try:
+        reply = json.loads(result.stdout)
+    except ValueError:
+        reply = {}
+    if result.returncode == 0 and reply.get("workspace_id") and reply.get("tab_id"):
+        return reply
+    if result.returncode and isinstance(reply.get("message"), str):
+        raise HostError(reply["message"])
+    raise HostError(lost)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cwd", type=Path, required=True)
@@ -357,26 +422,46 @@ def main(argv=None):
     parser.add_argument("--space", help="Display label; identity comes from the checkout or --scope")
     parser.add_argument("--scope", help="Explicit app/project identity for repo-less handoffs")
     parser.add_argument("--tab", help="Label for the fresh conversation tab")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run for another Mac: open the session here and show no terminal")
     args = parser.parse_args(argv)
-    cwd = args.cwd.resolve(strict=True)
     launch = args.launch.resolve(strict=True)
-    if not cwd.is_dir() or not launch.is_file():
-        raise RoutingError("The working directory or launch script is missing.")
     herdr = Path.home() / ".local/bin/herdr"
     if not os.access(herdr, os.X_OK):
         raise RoutingError("Herdr is not installed at ~/.local/bin/herdr.")
-    # Desktop clicks target the local default session, even when the app was
-    # started from a named/remote Herdr pane. Never inherit its focused target.
+    # Desktop clicks target the default session of the Herdr the client named, even
+    # when the app was started from a named/remote Herdr pane. Never inherit its
+    # focused target.
     config_dir = Path.home() / ".config/herdr"
     socket_path = config_dir / "herdr.sock"
     state_dir = Path.home() / "Library/Application Support/cx-herdr"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    host = "" if args.headless else os.environ.get(HOST_VARIABLE, "").strip()
+    if host:
+        # The folder only has to exist on the host; a checkout can live there alone.
+        if not launch.is_file():
+            raise RoutingError("The working directory or launch script is missing.")
+        result = open_on_host(host, args, launch)
+        # Past this point the tab is open: a display problem must not read as a failure.
+        try:
+            show_terminal(herdr, state_dir, Path.home(), host)
+        except (OSError, ValueError, RoutingError, subprocess.TimeoutExpired) as error:
+            result["warning"] = "Session opened in Herdr: " + str(error)
+        print(json.dumps(result))
+        return 0
+    if args.headless and not args.cwd.is_dir():
+        raise HostError(f"{args.cwd} doesn't exist on the Herdr host. Nothing was opened.")
+    cwd = args.cwd.resolve(strict=True)
+    if not cwd.is_dir() or not launch.is_file():
+        raise RoutingError("The working directory or launch script is missing.")
     with (state_dir / "routing.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         rpc = lambda method, params=None: request(socket_path, method, params)
         try:
             rpc("ping")
         except (OSError, RoutingError):
+            if args.headless:
+                raise HostError("Herdr isn't running on the Herdr host. Nothing was opened.")
             show_terminal(herdr, state_dir, cwd)
             deadline = time.monotonic() + 10
             while True:
@@ -409,8 +494,9 @@ def main(argv=None):
         try:
             cache_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
             rpc("client.window_title.set", {"title": TITLE})
-            time.sleep(0.1)  # Let the attached client emit the title to Ghostty.
-            show_terminal(herdr, state_dir, cwd)
+            if not args.headless:
+                time.sleep(0.1)  # Let the attached client emit the title to Ghostty.
+                show_terminal(herdr, state_dir, cwd)
         except (OSError, ValueError, RoutingError, subprocess.TimeoutExpired) as error:
             result["warning"] = "Session opened in Herdr: " + str(error)
         print(json.dumps(result))
@@ -420,6 +506,10 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except HostError as error:
+        print(json.dumps({"message": str(error)}))
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
     except (RoutingError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
