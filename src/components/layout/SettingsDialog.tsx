@@ -12,6 +12,7 @@ import {
   useUiStore,
   type ThemePreference,
 } from "@/stores/uiStore";
+import { HerdrHostSetting } from "./HerdrHostSetting";
 import { HostSettings } from "./HostSettings";
 import { JevSettingsPanel } from "./JevSettings";
 import { SyncSettings } from "./SyncSettings";
@@ -291,6 +292,13 @@ export function SettingsDialog() {
               Hosts
             </h3>
             <HostSettings />
+          </section>
+
+          <section className="mt-4 border-t border-border pt-3.5">
+            <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-content-faint">
+              Herdr
+            </h3>
+            <HerdrHostSetting />
           </section>
         </Dialog.Content>
       </Dialog.Portal>

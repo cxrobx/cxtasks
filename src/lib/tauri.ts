@@ -318,6 +318,10 @@ export const api = {
       invoke<DispatchResult>("dispatch_foreground", { taskId }),
     prompt: (taskId: string) =>
       invoke<string>("get_dispatch_prompt", { taskId }),
+    /** The SSH target saved on this Mac; `null` means this Mac's own Herdr. */
+    herdrHost: () => invoke<string | null>("herdr_host"),
+    saveHerdrHost: (host: string) =>
+      invoke<string | null>("save_herdr_host", { host }),
     queueBackground: (taskId: string) =>
       invoke<QueueResult>("queue_background", { taskId }),
     /**

@@ -1,6 +1,7 @@
 //! Foreground dispatch: hand a task to Claude in its Herdr space when the
 //! shared desktop router is installed, otherwise in a Ghostty window.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use tauri::State;
@@ -8,7 +9,7 @@ use tauri::State;
 use crate::db;
 use crate::dispatch::{
     find_claude_cli, resolve_repo_or_home, write_launch_script, write_scratch,
-    PromptTarget,
+    PromptTarget, ENV_HERDR_HOST, HOST_CLAUDE_CLI,
 };
 use crate::error::AppError;
 use crate::executor::BackgroundExecutor;
@@ -29,8 +30,20 @@ fn herdr_router() -> Option<std::path::PathBuf> {
 
 /// Repo-less Herdr sessions have their own task directory. An explicit repo
 /// still wins; the standalone Ghostty fallback retains its existing behavior.
-fn foreground_repo(task: &db::tasks::Task) -> Result<std::path::PathBuf, AppError> {
-    if herdr_router().is_some()
+///
+/// With a Herdr host the repo is the host's business, so nothing here checks it
+/// exists on this Mac. The scratch directory is also where the launch script
+/// lives, so the helper's copy of that folder creates this cwd on the host.
+fn foreground_repo(
+    task: &db::tasks::Task,
+    routed: bool,
+    host: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    let on_host = host.and(crate::dispatch::repo_on_host(task));
+    if let Some(repo) = on_host {
+        return Ok(repo);
+    }
+    if (routed || host.is_some())
         && task
             .repo_path
             .as_deref()
@@ -42,6 +55,62 @@ fn foreground_repo(task: &db::tasks::Task) -> Result<std::path::PathBuf, AppErro
     } else {
         resolve_repo_or_home(task)
     }
+}
+
+/// A host means the session belongs on that Mac, and only the router can put it
+/// there. Falling through to the standalone Ghostty path would open it here, on
+/// the wrong checkout, which is the split a host exists to prevent.
+fn require_router_for(host: Option<&str>, router: Option<&Path>) -> Result<(), AppError> {
+    if host.is_some() && router.is_none() {
+        return Err(AppError::Dispatch(
+            "A Herdr host is set, but cx-open-in-herdr isn't installed on this Mac. \
+             Nothing was opened."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The CLI a launch script names: found here for this Mac, or left for the
+/// host's login shell to resolve.
+fn session_cli(host: Option<&str>) -> Result<PathBuf, AppError> {
+    if host.is_some() {
+        return Ok(PathBuf::from(HOST_CLAUDE_CLI));
+    }
+    find_claude_cli().ok_or_else(|| {
+        AppError::Dispatch(
+            "The Claude Code CLI (`claude`) wasn't found on PATH. Install it (e.g. \
+             `npm install -g @anthropic-ai/claude-code`) and try again."
+                .into(),
+        )
+    })
+}
+
+/// The `cx-open-in-herdr` invocation. The environment is touched only for a
+/// host, so a local handoff starts the helper exactly as it always has.
+fn router_command(
+    router: &Path,
+    repo: &Path,
+    launch: &Path,
+    space: &str,
+    scope: Option<&str>,
+    host: Option<&str>,
+) -> Command {
+    let mut command = Command::new(router);
+    command
+        .arg("--cwd")
+        .arg(repo)
+        .arg("--launch")
+        .arg(launch)
+        .arg("--space")
+        .arg(space);
+    if let Some(scope) = scope {
+        command.arg("--scope").arg(scope);
+    }
+    if let Some(host) = host {
+        command.env(ENV_HERDR_HOST, host);
+    }
+    command
 }
 
 fn record_foreground_launch(
@@ -71,19 +140,19 @@ pub async fn dispatch_foreground(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<DispatchResult, AppError> {
-    let ghostty_app = crate::ghostty_macos::find_ghostty_app().ok_or_else(|| {
-        AppError::Dispatch(
+    let host = crate::dispatch::herdr_host(&state.db.safe_lock())?;
+    let router = herdr_router();
+    require_router_for(host.as_deref(), router.as_deref())?;
+    // With a host, Ghostty only shows the session and its absence is the
+    // helper's warning, never a reason not to open one.
+    let ghostty_app = crate::ghostty_macos::find_ghostty_app();
+    if ghostty_app.is_none() && host.is_none() {
+        return Err(AppError::Dispatch(
             "Ghostty is not installed. Install it from https://ghostty.org/download and try again."
                 .into(),
-        )
-    })?;
-    let claude_cli = find_claude_cli().ok_or_else(|| {
-        AppError::Dispatch(
-            "The Claude Code CLI (`claude`) wasn't found on PATH. Install it (e.g. \
-             `npm install -g @anthropic-ai/claude-code`) and try again."
-                .into(),
-        )
-    })?;
+        ));
+    }
+    let claude_cli = session_cli(host.as_deref())?;
 
     let task = {
         let conn = state.db.safe_lock();
@@ -91,7 +160,7 @@ pub async fn dispatch_foreground(
             .ok_or_else(|| AppError::NotFound(format!("task {task_id} not found")))?
     };
 
-    let repo = foreground_repo(&task)?;
+    let repo = foreground_repo(&task, router.is_some(), host.as_deref())?;
     // Always Claude: foreground opens a session the user drives, and the whole
     // write-back loop it's told to close runs through the CXTasks MCP.
     let scratch = write_scratch(&task, &repo, PromptTarget::Foreground, None)?;
@@ -145,7 +214,6 @@ pub async fn dispatch_foreground(
     let working_dir_arg = format!("--working-directory={}", repo.display());
     let launch_for_err = launch_path.clone();
     let repo_for_spawn = repo.clone();
-    let router = herdr_router();
     let space = task.project.clone().unwrap_or_else(|| "CXTasks".into());
     let scope = task
         .repo_path
@@ -155,18 +223,16 @@ pub async fn dispatch_foreground(
         .then(|| format!("cxtasks:{}", task.project.as_deref().unwrap_or("inbox")));
     let launched = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         if let Some(router) = router {
-            let mut command = Command::new(router);
-            command
-                .arg("--cwd")
-                .arg(&repo_for_spawn)
-                .arg("--launch")
-                .arg(&launch_for_err)
-                .arg("--space")
-                .arg(&space);
-            if let Some(scope) = scope {
-                command.arg("--scope").arg(scope);
-            }
-            let output = command.stdin(Stdio::null()).output()?;
+            let output = router_command(
+                &router,
+                &repo_for_spawn,
+                &launch_for_err,
+                &space,
+                scope.as_deref(),
+                host.as_deref(),
+            )
+            .stdin(Stdio::null())
+            .output()?;
             return if output.status.success() {
                 Ok(())
             } else {
@@ -195,6 +261,11 @@ pub async fn dispatch_foreground(
                  falling back to a new Ghostty instance"
             ),
         }
+
+        let Some(ghostty_app) = ghostty_app else {
+            // Only a host skips the check above, and a host always has a router.
+            return Err(AppError::Dispatch("Ghostty is not installed.".into()));
+        };
 
         // Fallback: `open -na` forces a NEW Ghostty instance, which is what
         // makes our `-e` command honored even when Ghostty is already running
@@ -262,9 +333,25 @@ pub async fn get_dispatch_prompt(
         db::tasks::get(&conn, &task_id)?
             .ok_or_else(|| AppError::NotFound(format!("task {task_id} not found")))?
     };
-    let repo = foreground_repo(&task)?;
+    let host = crate::dispatch::herdr_host(&state.db.safe_lock())?;
+    let repo = foreground_repo(&task, herdr_router().is_some(), host.as_deref())?;
     let conn = state.db.safe_lock();
     Ok(crate::dispatch::build_prompt_with_context(&conn, &task, &repo, PromptTarget::Foreground, None))
+}
+
+/// The Herdr host saved on this Mac, for Settings. An inherited environment
+/// value is not a setting, so it doesn't appear here.
+#[tauri::command]
+pub async fn herdr_host(state: State<'_, AppState>) -> Result<Option<String>, AppError> {
+    db::meta::herdr_host(&state.db.safe_lock())
+}
+
+#[tauri::command]
+pub async fn save_herdr_host(
+    state: State<'_, AppState>,
+    host: String,
+) -> Result<Option<String>, AppError> {
+    db::meta::save_herdr_host(&state.db.safe_lock(), &host)
 }
 
 /// The serializable face of [`crate::dispatch::QueueOutcome`] — see there for
@@ -545,5 +632,112 @@ mod herdr_tests {
         let run = db::runs::get(&conn, &run.id).unwrap().unwrap();
         assert_eq!(run.status, db::runs::FOREGROUND_STATUS);
         assert_eq!(run.result_text.as_deref(), Some("The session already answered"));
+    }
+
+    fn task_with_repo(repo_path: Option<&str>) -> db::tasks::Task {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::schema::initialize(&conn).unwrap();
+        db::tasks::create(
+            &conn,
+            &db::tasks::NewTask {
+                title: "A foreground handoff".into(),
+                repo_path: repo_path.map(str::to_string),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_blank_host_stays_local_and_sets_no_env() {
+        let command = router_command(
+            Path::new("/bin/helper"),
+            Path::new("/repo"),
+            Path::new("/scratch/launch.sh"),
+            "CXTasks",
+            Some("cxtasks:inbox"),
+            None,
+        );
+        assert_eq!(command.get_envs().count(), 0);
+        assert_eq!(
+            args_of(&command),
+            ["--cwd", "/repo", "--launch", "/scratch/launch.sh", "--space", "CXTasks", "--scope", "cxtasks:inbox"]
+        );
+    }
+
+    /// Runs a real child, because the contract is what the helper process sees.
+    #[test]
+    fn a_host_reaches_the_helpers_environment_with_the_same_arguments() {
+        let dir = std::env::temp_dir().join(format!("cxtasks-herdr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let helper = dir.join("helper");
+        std::fs::write(&helper, "#!/bin/sh\nprintf '%s' \"$CX_HERDR_HOST\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut command = router_command(
+            &helper,
+            Path::new("/only/on/the/host"),
+            Path::new("/scratch/launch.sh"),
+            "CXTasks",
+            None,
+            Some("dana@build-host"),
+        );
+        assert_eq!(
+            args_of(&command),
+            ["--cwd", "/only/on/the/host", "--launch", "/scratch/launch.sh", "--space", "CXTasks"]
+        );
+        let output = command.stdin(Stdio::null()).output().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "dana@build-host");
+    }
+
+    #[test]
+    fn a_host_is_never_refused_for_a_repo_or_cli_only_it_has() {
+        let task = task_with_repo(Some("/nowhere/on/this/mac"));
+        assert!(resolve_repo_or_home(&task).is_err(), "the local check still stands");
+        assert_eq!(
+            foreground_repo(&task, true, Some("dana@build-host")).unwrap(),
+            PathBuf::from("/nowhere/on/this/mac")
+        );
+        assert_eq!(
+            session_cli(Some("dana@build-host")).unwrap(),
+            PathBuf::from("claude")
+        );
+    }
+
+    /// The helper copies the launch script's folder and nothing else, so
+    /// repo-less work only has a cwd on the host if the two are the same folder.
+    #[test]
+    fn repo_less_work_on_a_host_has_its_cwd_inside_the_copied_folder() {
+        let task = task_with_repo(None);
+        let repo = foreground_repo(&task, true, Some("dana@build-host")).unwrap();
+        let scratch = write_scratch(&task, &repo, PromptTarget::Foreground, None).unwrap();
+        let launch = write_launch_script(&scratch, &repo, Path::new(HOST_CLAUDE_CLI)).unwrap();
+        let script = std::fs::read_to_string(&launch).unwrap();
+        let prompt = scratch.join("prompt.txt");
+        let has_prompt = prompt.is_file();
+        std::fs::remove_dir_all(&scratch).unwrap();
+
+        assert_eq!(launch.parent(), Some(repo.as_path()));
+        assert!(has_prompt);
+        let cd = format!("cd {}\n", crate::dispatch::shell_quote(&repo.to_string_lossy()));
+        assert!(script.contains(&cd), "{script}");
+        assert!(script.contains("exec 'claude' "), "{script}");
+    }
+
+    #[test]
+    fn a_host_without_the_local_helper_never_falls_through_to_this_mac() {
+        let error = require_router_for(Some("dana@build-host"), None).unwrap_err();
+        assert!(error.to_string().contains("Nothing was opened"), "{error}");
+        assert!(require_router_for(Some("dana@build-host"), Some(Path::new("/h"))).is_ok());
+        assert!(require_router_for(None, None).is_ok(), "no host keeps the Ghostty route");
     }
 }

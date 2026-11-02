@@ -182,6 +182,47 @@ pub fn set(conn: &Connection, key: &str, value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// The SSH target of the Mac whose Herdr opens this Mac's foreground sessions.
+/// Absent means this Mac.
+///
+/// One build runs on both ends and only the client names a host, so the value
+/// has to stay on the machine that set it: it is deliberately not in
+/// `sync::tables::SYNCED_META_KEYS`. A synced value would send the host's own
+/// sessions back to itself.
+pub const KEY_HERDR_HOST: &str = "herdr_host";
+
+pub fn herdr_host(conn: &Connection) -> Result<Option<String>, AppError> {
+    Ok(get(conn, KEY_HERDR_HOST)?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+/// Store a Herdr host, or clear it when blank. A blank setting leaves no row.
+///
+/// Checked here as well as in `cx-open-in-herdr`, because the helper can only
+/// object at the click, long after this was typed.
+pub fn save_herdr_host(conn: &Connection, raw: &str) -> Result<Option<String>, AppError> {
+    let host = raw.trim();
+    if host.is_empty() {
+        conn.execute("DELETE FROM app_meta WHERE key = ?1", params![KEY_HERDR_HOST])?;
+        return Ok(None);
+    }
+    if !is_ssh_target(host) {
+        return Err(AppError::Validation(
+            "Herdr host must be an SSH target: a name or user@host.".into(),
+        ));
+    }
+    set(conn, KEY_HERDR_HOST, host)?;
+    Ok(Some(host.to_string()))
+}
+
+/// The same shape `open_on_host` accepts in `integrations/herdr/herdr_open.py`.
+fn is_ssh_target(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || "._@%-".contains(c))
+}
+
 /// Take the next T-number and advance the counter, atomically.
 ///
 /// **Never reuse is the invariant; gaps are fine.** A number claimed here and
@@ -555,6 +596,33 @@ pub fn budget_status(conn: &Connection) -> Result<BudgetStatus, AppError> {
 mod tests {
     use super::*;
     use crate::db::schema::test_conn;
+
+    #[test]
+    fn a_herdr_host_is_trimmed_cleared_by_blank_and_never_syncs() {
+        let conn = test_conn();
+        assert_eq!(herdr_host(&conn).unwrap(), None);
+
+        assert_eq!(
+            save_herdr_host(&conn, "  dana@build-host \n").unwrap().as_deref(),
+            Some("dana@build-host")
+        );
+        assert_eq!(herdr_host(&conn).unwrap().as_deref(), Some("dana@build-host"));
+
+        assert_eq!(save_herdr_host(&conn, "   ").unwrap(), None);
+        assert_eq!(get(&conn, KEY_HERDR_HOST).unwrap(), None, "blank leaves no row");
+
+        assert!(!crate::sync::tables::meta_key_travels(KEY_HERDR_HOST));
+    }
+
+    #[test]
+    fn a_herdr_host_that_is_not_an_ssh_target_is_refused_and_keeps_the_old_value() {
+        let conn = test_conn();
+        save_herdr_host(&conn, "build-host").unwrap();
+        for bad in ["-oProxyCommand=x", "dana@host; rm", "two words", "dana@host:22"] {
+            assert!(save_herdr_host(&conn, bad).is_err(), "{bad}");
+        }
+        assert_eq!(herdr_host(&conn).unwrap().as_deref(), Some("build-host"));
+    }
 
     #[test]
     fn defaults_apply_when_unset() {

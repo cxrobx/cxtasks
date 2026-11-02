@@ -132,6 +132,11 @@ pub const HOST_LOCAL: &[&str] = &[
     "sync_now",
     "sync_set_enabled",
     "sync_unpair",
+    // Where THIS machine opens its foreground sessions. Through a server it
+    // would point the server's sessions somewhere, and a phone's token could
+    // redirect the Mac's.
+    "herdr_host",
+    "save_herdr_host",
 ];
 
 /// Is this a verb only the owning host may run?

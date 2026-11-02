@@ -851,6 +851,30 @@ nowhere — and nowhere is the standing choice.
 
 # Multi-host execution (Phase 3) and repo-less runs (Phase 4)
 
+## Foreground on another Mac
+
+**Herdr host** (Settings, `app_meta` key `herdr_host`) names an SSH target whose
+Herdr opens this Mac's foreground sessions, so a laptop can work in one checkout
+on another machine. Blank means this Mac, and an inherited `CX_HERDR_HOST` then
+applies. `integrations/herdr/README.md` owns the helper's half of the contract.
+
+* **It stays on the Mac that set it.** The key is outside `SYNCED_META_KEYS` and
+  both verbs are in `api::HOST_LOCAL`. One build runs on both ends, and a synced
+  value would send the host's own sessions back to itself.
+* **Everything that ran on this Mac moves.** With a host set, `dispatch_foreground`
+  writes the bare `claude`, and skips the local repo, CLI and Ghostty checks. The
+  host resolves the CLI through its login shell and the helper refuses a folder it
+  doesn't have, so a repo may exist only there.
+* **The launch script's folder is the only thing copied**, which is why repo-less
+  work keeps the scratch folder as both its cwd and the home of `launch.sh`.
+* **There is no fallback.** A host with no local `cx-open-in-herdr` is refused, not
+  routed to the standalone Ghostty path, because that opens the session here. Any
+  helper failure records a failed run and is never retried.
+
+**The session writes back to the host's database.** `complete_task` there needs
+the task to have synced, so a task filed moments before the click can read as not
+found until the host next reconciles.
+
 ## Invariant 24 — a host row means "a machine that runs tasks"
 
 `hosts` is a registry of machines that execute, and **only the runner writes a

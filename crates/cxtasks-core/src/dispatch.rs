@@ -139,6 +139,35 @@ pub fn find_claude_cli() -> Option<PathBuf> {
     None
 }
 
+/// Tells `cx-open-in-herdr` which Mac's Herdr to use. Unset or empty means this
+/// Mac; `integrations/herdr/README.md` owns the contract.
+pub const ENV_HERDR_HOST: &str = "CX_HERDR_HOST";
+
+/// What a launch script runs on a Herdr host. The helper runs scripts through a
+/// login shell there, and a path found on this Mac need not exist on that one.
+pub const HOST_CLAUDE_CLI: &str = "claude";
+
+/// The Herdr host for this process: the setting, then an inherited
+/// [`ENV_HERDR_HOST`]. A GUI app rarely inherits one, which is why the setting
+/// comes first.
+pub fn herdr_host(conn: &rusqlite::Connection) -> Result<Option<String>, AppError> {
+    Ok(choose_herdr_host(
+        crate::db::meta::herdr_host(conn)?,
+        std::env::var_os(ENV_HERDR_HOST),
+    ))
+}
+
+/// Split from the env read so it is testable without mutating process env.
+fn choose_herdr_host(
+    setting: Option<String>,
+    inherited: Option<std::ffi::OsString>,
+) -> Option<String> {
+    setting
+        .or_else(|| inherited.map(|value| value.to_string_lossy().into_owned()))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn sanitize_id(s: &str) -> String {
     let mut out: String = s
         .chars()
@@ -213,6 +242,12 @@ fn validate_exists(raw: &str) -> Result<PathBuf, AppError> {
         )));
     }
     Ok(path)
+}
+
+/// A task's repo as a Herdr host will see it. Deliberately unchecked: the repo
+/// may exist only there, and the helper refuses a folder the host doesn't have.
+pub fn repo_on_host(task: &Task) -> Option<PathBuf> {
+    non_empty_repo_path(task).map(PathBuf::from)
 }
 
 /// Per-task scratch directory holding `task.json` + `prompt.txt`.
@@ -2144,6 +2179,40 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "launch.sh must be executable");
         fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn a_blank_herdr_host_means_this_mac_and_a_set_one_wins_over_the_environment() {
+        assert_eq!(choose_herdr_host(None, None), None);
+        assert_eq!(choose_herdr_host(None, Some("  ".into())), None);
+        assert_eq!(
+            choose_herdr_host(None, Some(" dana@inherited ".into())).as_deref(),
+            Some("dana@inherited")
+        );
+        assert_eq!(
+            choose_herdr_host(Some("dana@set".into()), Some("dana@inherited".into())).as_deref(),
+            Some("dana@set")
+        );
+    }
+
+    #[test]
+    fn a_host_launch_script_names_the_cli_by_its_bare_name() {
+        let scratch = std::env::temp_dir().join("cxtasks-test-host-launch");
+        fs::create_dir_all(&scratch).unwrap();
+        let path = write_launch_script(&scratch, Path::new("/tmp/some repo"), Path::new(HOST_CLAUDE_CLI))
+            .unwrap();
+        let script = fs::read_to_string(&path).unwrap();
+        assert!(script.contains("exec 'claude' --dangerously-skip-permissions"), "{script}");
+        fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn a_repo_on_the_host_is_not_checked_here_and_a_blank_one_is_no_repo() {
+        let mut t = task("x", None, None);
+        t.repo_path = Some("  /nowhere/on/this/mac  ".into());
+        assert_eq!(repo_on_host(&t), Some(PathBuf::from("/nowhere/on/this/mac")));
+        t.repo_path = Some("   ".into());
+        assert_eq!(repo_on_host(&t), None);
     }
 
     #[test]

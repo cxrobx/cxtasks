@@ -160,6 +160,8 @@ pub fn run() {
             commands::tasks::set_section_completed,
             commands::dispatch::dispatch_foreground,
             commands::dispatch::get_dispatch_prompt,
+            commands::dispatch::herdr_host,
+            commands::dispatch::save_herdr_host,
             commands::dispatch::queue_background,
             commands::dispatch::executor_available,
             commands::dispatch::run_queue_once,

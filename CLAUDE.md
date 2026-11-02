@@ -18,6 +18,8 @@ The shared router lives in `integrations/herdr/`. It selects a space by canonica
 checkout path, creates one when missing, and starts each handoff in a fresh tab.
 Repo-less foreground tasks use per-task scratch directories grouped by project
 or Inbox. Without the router, foreground retains its standalone Ghostty path.
+**Herdr host** in Settings names another Mac to open foreground sessions on
+(`.claude/rules/execution.md` § Foreground on another Mac).
 
 Foreground is always **Claude Code**. Background is per-task: **Claude Code**
 (the default) or **Codex** (`codex exec`), chosen by `tasks.bg_executor`.
