@@ -20,6 +20,17 @@
 //! No in-flight set: the lease IS the claim. A crash between claim and
 //! record leaves a lease to expire, and the next tick reclaims it.
 //!
+//! # A script runs where it lives
+//!
+//! Every host shares one task list and each holds its own `tripwires/` folder,
+//! so "due" is a fact about the row and "mine" is a fact about the disk. A host
+//! claims only what it holds. Recording "not found here" instead puts a false
+//! failure on a row another host answers correctly: the NAS did that to every
+//! script it came across, because it has no such folder at all.
+//!
+//! Skipping alone would leave a mistyped script hidden forever, so a non-holder
+//! reports one nobody has checked for a long time ([`tripwire::is_orphaned`]).
+//!
 //! # The agent lane (Release 2)
 //!
 //! An `agent:<condition>` tripwire is evaluated by a real `claude -p` — so it
@@ -89,10 +100,10 @@ pub enum Check {
     Unsupported(String),
 }
 
-/// How many due tripwires the agent lane looks through to find ONE agent
-/// spec. Scripts and agents share `list_due`, so a board with many script
-/// tripwires must not hide the one agent check behind the script limit.
-const AGENT_SCAN: usize = 200;
+/// How many due tripwires a lane looks through to find its own. Every spec
+/// shares `list_due`, so a limit applied there would let a board of scripts
+/// hide the one agent check, or ten scripts held elsewhere hide this host's.
+const DUE_SCAN: usize = 200;
 
 /// One leased attempt, carrying everything needed to run it without the DB.
 #[derive(Debug, Clone)]
@@ -108,12 +119,41 @@ pub struct Claimed {
 /// it belongs to the other lane, which has a budget to consult first. A
 /// script lane that claimed it would have to record something, and "not
 /// mine" is not an outcome a tripwire has.
-pub fn claim_due(conn: &Connection, limit: usize) -> Result<Vec<Claimed>, AppError> {
+///
+/// `dir` is this host's scripts folder: a script not in it is skipped the same
+/// way, unless nobody has checked it for long enough to say so.
+pub fn claim_due(conn: &Connection, dir: &Path, limit: usize) -> Result<Vec<Claimed>, AppError> {
     let host = crate::host::host_id();
+    let now = chrono::Utc::now();
     let mut out = Vec::new();
-    for (task, _runtime) in db::tripwires::list_due(conn, limit)? {
+    for (task, runtime) in db::tripwires::list_due(conn, DUE_SCAN)? {
+        if out.len() >= limit {
+            break;
+        }
         let Some(spec) = task.tripwire.clone() else { continue };
         let check = match Tripwire::parse(&spec) {
+            Ok(Tripwire::Script { name, .. }) if !tripwire::script_is_held_in(dir, &name) => {
+                let since = runtime
+                    .checked_at
+                    .as_deref()
+                    .or(runtime.requested_at.as_deref())
+                    .or(Some(task.created_at.as_str()))
+                    .and_then(tripwire::parse_stamp);
+                if !tripwire::is_orphaned(
+                    task.tripwire_every_minutes,
+                    since,
+                    runtime.last_note.as_deref(),
+                    now,
+                ) {
+                    continue;
+                }
+                Check::Unsupported(format!(
+                    "{} since {}. It isn't on this host; put an executable named '{name}' in \
+                     the tripwires folder of the machine that should run it.",
+                    tripwire::ORPHAN_NOTE,
+                    since.map(|s| s.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "it began".into()),
+                ))
+            }
             Ok(Tripwire::Script { name, arg }) => Check::Script { name, arg },
             Ok(Tripwire::Agent { .. }) => continue,
             Ok(Tripwire::Jev { condition }) => {
@@ -140,8 +180,15 @@ pub fn claim_due(conn: &Connection, limit: usize) -> Result<Vec<Claimed>, AppErr
 ///
 /// `in_flight` is bumped once for the batch so `--once` waits for it, the
 /// same way it waits for agent runs.
-pub fn script_pass(conn: &Connection, in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
-    let claimed = claim_due(conn, SCRIPTS_PER_TICK)?;
+///
+/// `interpret = false` on a scripts-only host, which never starts an agent. A
+/// trip there loses its reading, never its evidence: that is already a comment.
+pub fn script_pass(
+    conn: &Connection,
+    in_flight: &Arc<AtomicUsize>,
+    interpret: bool,
+) -> Result<usize, AppError> {
+    let claimed = claim_due(conn, &crate::paths::tripwires_dir(), SCRIPTS_PER_TICK)?;
     if claimed.is_empty() {
         return Ok(0);
     }
@@ -167,7 +214,7 @@ pub fn script_pass(conn: &Connection, in_flight: &Arc<AtomicUsize>) -> Result<us
         };
         let (_transitions, pending) =
             run_claimed(&conn, &crate::paths::tripwires_dir(), claimed);
-        if pending.is_empty() {
+        if pending.is_empty() || !interpret {
             return;
         }
         // Sequential, on this thread, below everything else the batch did. The
@@ -225,9 +272,24 @@ pub fn check_model_for(task: &Task, settings: &BudgetSettings) -> Option<String>
     }
 }
 
+/// How many due script tripwires are held on some other host — what `--status`
+/// prints beside "due now", so a due count that isn't this host's work doesn't
+/// read as a stuck runner.
+pub fn due_elsewhere(conn: &Connection, dir: &Path) -> Result<usize, AppError> {
+    Ok(db::tripwires::list_due(conn, usize::MAX)?
+        .iter()
+        .filter(|(task, _)| {
+            matches!(
+                task.tripwire.as_deref().map(Tripwire::parse),
+                Some(Ok(Tripwire::Script { ref name, .. })) if !tripwire::script_is_held_in(dir, name)
+            )
+        })
+        .count())
+}
+
 /// The ONE due agent tripwire the lane would run next, if any.
 fn next_due_agent(conn: &Connection) -> Result<Option<(Task, String, String)>, AppError> {
-    for (task, _rt) in db::tripwires::list_due(conn, AGENT_SCAN)? {
+    for (task, _rt) in db::tripwires::list_due(conn, DUE_SCAN)? {
         let Some(spec) = task.tripwire.clone() else { continue };
         if let Ok(Tripwire::Agent { condition }) = Tripwire::parse(&spec) {
             return Ok(Some((task, spec, condition)));
@@ -1075,7 +1137,7 @@ mod tests {
     /// existing callers stay a one-liner and the interpretation tests can see
     /// the half they care about.
     fn pass_full(conn: &Connection, root: &Path) -> (Vec<Transition>, Vec<Pending>) {
-        let claimed = claim_due(conn, SCRIPTS_PER_TICK).unwrap();
+        let claimed = claim_due(conn, &root.join("tripwires"), SCRIPTS_PER_TICK).unwrap();
         run_claimed(conn, &root.join("tripwires"), claimed)
     }
 
@@ -1160,7 +1222,7 @@ mod tests {
         let r = root("discard-interp");
         script(&r, "slow-true", "echo 'the report'; exit 0");
         let t = armed(&conn, "script:slow-true", Some(60), Some("interpret"));
-        let claimed = claim_due(&conn, SCRIPTS_PER_TICK).unwrap();
+        let claimed = claim_due(&conn, &r.join("tripwires"), SCRIPTS_PER_TICK).unwrap();
         assert_eq!(claimed.len(), 1);
         // The spec changes under the claim.
         crate::db::tasks::update(
@@ -1237,20 +1299,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(&r);
     }
 
+    /// The NAS shape: a script some other host holds. Not ours, so nothing is
+    /// recorded at all. A false error here lands on a row the holder is
+    /// answering correctly.
     #[test]
-    fn a_missing_script_is_an_error_not_a_hang_and_a_cadenced_one_backs_off() {
+    fn a_script_held_elsewhere_is_left_alone() {
         let conn = test_conn();
-        let r = root("missing");
-        let t = armed(&conn, "script:does-not-exist", Some(5), None);
-        let transitions = pass(&conn, &r);
-        assert!(transitions.is_empty(), "first failure of a cadenced tripwire is tolerated");
+        let r = root("elsewhere");
+        let t = armed(&conn, "script:only-on-the-laptop", Some(5), None);
+        assert!(pass(&conn, &r).is_empty());
+        let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert_eq!(rt.failures, 0);
+        assert!(rt.checked_at.is_none() && rt.lease_id.is_none(), "not claimed: {rt:?}");
+        assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed());
+        assert_eq!(due_elsewhere(&conn, &r.join("tripwires")).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// No folder at all is the same answer, and it is what the NAS really has.
+    #[test]
+    fn a_host_with_no_tripwires_folder_claims_nothing() {
+        let conn = test_conn();
+        let r = root("nofolder");
+        armed(&conn, "script:anything", Some(5), None);
+        let missing = r.join("not-a-folder");
+        assert!(claim_due(&conn, &missing, SCRIPTS_PER_TICK).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// Scripts held elsewhere must not use up the scan: this is the failure a
+    /// `list_due(limit)` would have, one host's backlog starving another's.
+    #[test]
+    fn scripts_held_elsewhere_cannot_starve_one_held_here() {
+        let conn = test_conn();
+        let r = root("starve");
+        for i in 0..(SCRIPTS_PER_TICK + 5) {
+            armed(&conn, &format!("script:elsewhere-{i}"), Some(5), None);
+        }
+        script(&r, "mine", "echo no; exit 1");
+        let mine = armed(&conn, "script:mine", Some(5), None);
+        let claimed = claim_due(&conn, &r.join("tripwires"), SCRIPTS_PER_TICK).unwrap();
+        assert_eq!(claimed.len(), 1, "{claimed:?}");
+        assert_eq!(claimed[0].task.id, mine.id);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// A file that IS here and refused stays this host's error. Skipping it
+    /// would hide a broken script behind "somebody else must have it".
+    #[test]
+    fn a_script_here_that_is_not_runnable_is_still_an_error() {
+        let conn = test_conn();
+        let r = root("noexec");
+        let p = r.join("tripwires/not-executable");
+        std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let t = armed(&conn, "script:not-executable", Some(5), None);
+        pass(&conn, &r);
         let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
         assert_eq!(rt.failures, 1);
-        assert!(rt.last_note.as_deref().unwrap().contains("does-not-exist"));
-        assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed());
-        // Backed off: not due again yet.
-        assert!(claim_due(&conn, 10).unwrap().is_empty());
+        assert!(rt.last_note.as_deref().unwrap().contains("not-executable"));
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    fn backdate(conn: &Connection, id: &str) {
+        conn.execute(
+            "UPDATE tripwire_runtime SET checked_at = '2000-01-01 00:00:00' WHERE task_id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    /// The other half of skipping: a script nobody holds must not hide its
+    /// task forever. It climbs the ordinary failure path, surfaces, and a
+    /// non-holder's own error does not read as the check it says is missing.
+    #[test]
+    fn a_script_no_host_has_checked_for_days_surfaces_through_a_non_holder() {
+        let conn = test_conn();
+        let r = root("orphan");
+        let t = armed(&conn, "script:typo-in-the-name", Some(5), None);
+        conn.execute(
+            "UPDATE tasks SET created_at = '2000-01-01 00:00:00' WHERE id = ?1",
+            rusqlite::params![t.id],
+        )
+        .unwrap();
+        let mut transitions = Vec::new();
+        for attempt in 1..=5 {
+            transitions = pass(&conn, &r);
+            let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+            assert_eq!(rt.failures, attempt, "{rt:?}");
+            assert!(rt.last_note.as_deref().unwrap().starts_with(tripwire::ORPHAN_NOTE));
+            assert!(rt.last_note.as_deref().unwrap().contains("typo-in-the-name"));
+            backdate(&conn, &t.id);
+        }
+        assert!(matches!(&transitions[..], [Transition::Failed { failures: 5, .. }]), "{transitions:?}");
+        assert_eq!(get(&conn, &t.id).unwrap().unwrap().tripwire_state.as_deref(), Some("error"));
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// The pair to the test above: a holder coming back clears a non-holder's
+    /// report, so a laptop shut for a week leaves nothing behind.
+    #[test]
+    fn a_holders_answer_clears_a_non_holders_report() {
+        let conn = test_conn();
+        let holder = root("holder");
+        let bystander = root("bystander");
+        script(&holder, "shared", "echo nothing yet; exit 1");
+        let t = armed(&conn, "script:shared", Some(5), None);
+        conn.execute(
+            "UPDATE tasks SET created_at = '2000-01-01 00:00:00' WHERE id = ?1",
+            rusqlite::params![t.id],
+        )
+        .unwrap();
+        pass(&conn, &bystander);
+        assert_eq!(crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().failures, 1);
+        backdate(&conn, &t.id);
+        pass(&conn, &holder);
+        let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert_eq!(rt.failures, 0);
+        assert_eq!(rt.last_outcome.as_deref(), Some("not_yet"));
+        // And the bystander goes quiet again: a real answer is recent.
+        backdate_none(&conn, &t.id);
+        assert!(pass(&conn, &bystander).is_empty());
+        assert_eq!(crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().failures, 0);
+        let _ = std::fs::remove_dir_all(&holder);
+        let _ = std::fs::remove_dir_all(&bystander);
+    }
+
+    /// A check an hour old: due on a 5-minute cadence, far from orphaned.
+    fn backdate_none(conn: &Connection, id: &str) {
+        conn.execute(
+            "UPDATE tripwire_runtime SET checked_at = datetime('now', '-1 hour') WHERE task_id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
     }
 
     #[test]

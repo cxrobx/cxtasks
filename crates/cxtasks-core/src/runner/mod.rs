@@ -205,7 +205,7 @@ pub fn gate(
     if !cap.enabled {
         return Gate::HostDisabled;
     }
-    if cap.effective_executors().is_empty() {
+    if !cap.is_scripts_only() && cap.effective_executors().is_empty() {
         // Declared ∩ observed is empty: either nothing was declared, or
         // everything declared reported itself missing. Either way this host
         // cannot spawn anything, and saying so is better than an empty drain
@@ -1323,6 +1323,11 @@ pub fn host_max_concurrent(settings: &BudgetSettings, cap: &crate::routing::Host
 /// Mirroring all 25 repos on a timer would be a lot of ssh for trees nothing is
 /// going to ask about.
 pub fn mirror_pass(conn: &Connection) -> Result<usize, AppError> {
+    // A mirror is fed by the machine that owns the repo, and a scripts-only
+    // host owns none of what it can see.
+    if db::hosts::get(conn, &crate::host::host_id())?.is_some_and(|h| h.is_scripts_only()) {
+        return Ok(0);
+    }
     let mut pushed = 0usize;
     for host in db::hosts::list(conn)? {
         if !host.enabled || host.is_local() {
@@ -1547,10 +1552,15 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
         Ok(_) => {}
         Err(e) => log::warn!("runner: could not re-arm handled monitors: {e}"),
     }
-    match tripwire::script_pass(&conn, in_flight) {
+    match tripwire::script_pass(&conn, in_flight, !cap.is_scripts_only()) {
         Ok(0) => {}
         Ok(n) => log::info!("runner: evaluating {n} tripwire script(s)"),
         Err(e) => log::warn!("runner: tripwire pass failed: {e}"),
+    }
+    // Before anything below can start an agent. The drain alone would be safe,
+    // since its query says `0 = 1` here, but the agent lane reads no query.
+    if cap.is_scripts_only() {
+        return Ok(0);
     }
     if slots <= 0 {
         log::debug!("runner: not starting agent work ({decision:?})");

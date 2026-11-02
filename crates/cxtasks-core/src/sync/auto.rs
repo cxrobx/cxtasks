@@ -58,6 +58,34 @@ pub const INTERVAL_SECONDS: u64 = 300;
 /// four-day-old data yet.
 pub const STARTUP_DELAY_SECONDS: u64 = 10;
 
+/// How stale the last attempt must be before the runner steps in.
+///
+/// One interval and a minute: while the app is open its timer always gets there
+/// first, so there is still exactly one thing reconciling. This exists for the
+/// app being closed. A runner writes tripwire results and run outcomes either
+/// way, and with nobody reconciling they sit on this machine, out of the hub
+/// every other device reads.
+pub const BACKSTOP_AFTER_SECONDS: i64 = INTERVAL_SECONDS as i64 + 60;
+
+/// Is nothing else keeping this host in step?
+pub fn backstop_due(last_attempt: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match last_attempt.and_then(crate::tripwire::parse_stamp) {
+        Some(at) => (now - at).num_seconds() >= BACKSTOP_AFTER_SECONDS,
+        None => true,
+    }
+}
+
+/// [`pass`], but only when nothing else has tried recently. The runner's entry
+/// point, on a thread of its own: a reconcile can take minutes and a tick must
+/// not wait for one.
+pub fn backstop_pass(conn: &mut Connection) -> Result<Option<ReconcileReport>, AppError> {
+    let (last, _) = last_attempt(conn);
+    if !backstop_due(last.as_deref(), chrono::Utc::now()) {
+        return Ok(None);
+    }
+    pass(conn)
+}
+
 /// When a reconcile was last **attempted**, successful or not.
 ///
 /// Distinct from [`state::KEY_LAST_PULL_AT`], which only moves when a pull
@@ -132,6 +160,25 @@ pub fn last_attempt(conn: &Connection) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::db::schema::test_conn;
+
+    /// The pair: the app's timer keeps the runner out, and its absence lets the
+    /// runner in. Either half alone also passes against a broken version.
+    #[test]
+    fn the_runner_steps_in_only_when_nothing_else_has_tried() {
+        let now = chrono::Utc::now();
+        let ago = |secs: i64| crate::recurrence::to_iso(now - chrono::Duration::seconds(secs));
+        assert!(!backstop_due(Some(&ago(INTERVAL_SECONDS as i64)), now), "the app is on time");
+        assert!(backstop_due(Some(&ago(BACKSTOP_AFTER_SECONDS)), now), "the app has gone");
+        assert!(backstop_due(None, now), "nothing has ever tried");
+    }
+
+    /// An unpaired machine stays quiet even when the clock says it's due.
+    #[test]
+    fn the_backstop_never_touches_an_unpaired_host() {
+        let mut conn = test_conn();
+        assert!(backstop_pass(&mut conn).unwrap().is_none());
+        assert_eq!(last_attempt(&conn), (None, None));
+    }
 
     /// A machine that has never paired must not be told it is broken every
     /// five minutes.

@@ -78,6 +78,16 @@ pub const SCRIPT_LEASE_MINUTES: i64 = 5;
 pub const SCRIPTS_PER_TICK: usize = 10;
 /// `last_note` and the comment body are bounded to this many characters.
 pub const NOTE_CHARS: usize = 500;
+/// Days without a check before a host that does NOT hold a script says so.
+/// Long enough that a laptop shut over a weekend raises nothing.
+pub const ORPHAN_MIN_DAYS: i64 = 3;
+/// Cadences a script may go unchecked before the same thing is said, for a
+/// cadence long enough that [`ORPHAN_MIN_DAYS`] would be shorter than one gap.
+pub const ORPHAN_CADENCES: i64 = 3;
+/// How a non-holder's error opens. [`is_orphaned`] reads it back, because that
+/// error stamps `checked_at` and would otherwise look like the check it reports
+/// as missing.
+pub const ORPHAN_NOTE: &str = "No host holding this script has checked it";
 /// Bytes kept from each of stdout and stderr. The rest is drained and dropped.
 pub const CAPTURE_BYTES: usize = 4096;
 /// The one argv value a script tripwire may carry.
@@ -162,6 +172,40 @@ impl TripwireKind {
             Self::Jev => JEV_MIN_MINUTES,
         }
     }
+}
+
+/// Has this script gone unchecked so long that a host WITHOUT it should say so?
+///
+/// Runners skip a script they do not hold, and on its own that would break
+/// invariant 26: a mistyped or deleted script would hold nobody's attention
+/// and stay hidden forever. So non-holders watch the clock. The verdict goes
+/// through the ordinary failure path, which means a holder's next real answer
+/// clears it, and a machine that was merely shut raises nothing lasting.
+///
+/// `since` is the last terminal attempt, else the moment the row began.
+pub fn is_orphaned(
+    every_minutes: Option<i64>,
+    since: Option<DateTime<Utc>>,
+    last_note: Option<&str>,
+    now: DateTime<Utc>,
+) -> bool {
+    if last_note.is_some_and(|n| n.starts_with(ORPHAN_NOTE)) {
+        return true;
+    }
+    let Some(since) = since else { return false };
+    let cadences = every_minutes.unwrap_or(0).saturating_mul(ORPHAN_CADENCES);
+    let grace = cadences.max(ORPHAN_MIN_DAYS * 1440);
+    now - since >= Duration::minutes(grace)
+}
+
+/// Is `name` present on this host at all?
+///
+/// Presence and not fitness. A file that is here and refused by
+/// [`script_path_in`] (a symlink, no exec bit) is this host's problem to
+/// report, so it must still be claimed and recorded as an error. Only "not
+/// here" means "somebody else's".
+pub fn script_is_held_in(dir: &Path, name: &str) -> bool {
+    std::fs::symlink_metadata(dir.join(name)).is_ok()
 }
 
 /// A parsed `tasks.tripwire` spec.

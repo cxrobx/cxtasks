@@ -303,6 +303,17 @@ impl HostCapability {
         self.workspaces.contains(&WorkspaceKind::Live)
     }
 
+    /// A host declaring no workspace has nowhere to run an agent, so it only
+    /// evaluates the scripts it holds. Empty rather than a new flag because the
+    /// drain predicate already reads it as "nothing" ([`queue_sql`]) and
+    /// [`satisfies`] already never offers such a host a task, so all three
+    /// agree without a fourth thing to keep in step.
+    ///
+    /// `CXTASKS_HOST_WORKSPACES=none` declares it.
+    pub fn is_scripts_only(&self) -> bool {
+        self.workspaces.is_empty()
+    }
+
     /// The opt-in column this host's drain query tests.
     ///
     /// The skew guard, and the same trick as `bg_codex_allowed`: a task that

@@ -903,8 +903,11 @@ fn the_timeout_kills_a_hung_child() {
     let (task, repo) = codex_task(&conn, "hang", false);
     let cli = fake_codex("hang", FakeMode::Hang);
 
+    // Eight seconds, not two: the session id below is only seen if the fake CLI
+    // gets to print it, and the whole suite running beside it can take longer
+    // than two seconds to let it.
     let started = std::time::Instant::now();
-    let outcome = run_one(&task, &repo, Provider::Codex, &cli, &limits(2));
+    let outcome = run_one(&task, &repo, Provider::Codex, &cli, &limits(8));
     let elapsed = started.elapsed();
 
     assert_eq!(outcome.status, "timeout");
@@ -1710,4 +1713,73 @@ fn the_interpretation_admission_asks_the_global_cap_before_its_own() {
         admit_interpret(49_000_001, 50_000_000, 0, 0, 1_000_000),
         InterpretAdmission::DailyCapReached { .. }
     ));
+}
+
+// ── a scripts-only host ──────────────────────────────────────────────────
+
+/// What the Mac mini is: every other capability left as a normal Mac's, so
+/// only the empty workspace list can be what keeps work off it.
+fn scripts_only_host() -> crate::routing::HostCapability {
+    let mut cap = crate::routing::HostCapability::local_default("mini".into(), "the mini".into());
+    cap.workspaces.clear();
+    cap
+}
+
+/// Its executors can be unusable (an SSH-only login, a signed-out CLI), and
+/// that must not read as "disabled", because disabled stops scripts too.
+#[test]
+fn a_scripts_only_host_keeps_its_scripts_with_no_agent_available() {
+    let settings = db::meta::budget_settings(&crate::db::schema::test_conn());
+    let mut cap = scripts_only_host();
+    cap.last_seen_at = Some("2026-11-01 00:00:00".into());
+    cap.executors_ready = Vec::new();
+    let decision = gate(false, &settings, &cap, 0, 0, 0);
+    assert!(lanes(&decision).scripts, "{decision:?}");
+
+    // The pair: the same observation on an ordinary host still stops it.
+    let mut ordinary = crate::routing::HostCapability::local_default("mac".into(), "mac".into());
+    ordinary.last_seen_at = cap.last_seen_at.clone();
+    ordinary.executors_ready = Vec::new();
+    assert_eq!(gate(false, &settings, &ordinary, 0, 0, 0), Gate::HostDisabled);
+
+    // And the switches still mean what they say.
+    assert!(!lanes(&gate(true, &settings, &cap, 0, 0, 0)).scripts);
+    cap.enabled = false;
+    assert!(!lanes(&gate(false, &settings, &cap, 0, 0, 0)).scripts);
+}
+
+/// The whole promise, against a task an ordinary host WOULD take: queued,
+/// opted in, with a repo. Asserted on both hosts so the fixture can't be
+/// what kept it off.
+#[test]
+fn a_scripts_only_host_is_handed_no_queued_work() {
+    let conn = crate::db::schema::test_conn();
+    let repo = std::env::temp_dir().to_string_lossy().to_string();
+    crate::db::tasks::create(
+        &conn,
+        &crate::db::tasks::NewTask {
+            title: "unattended work".into(),
+            status: Some("queued".into()),
+            repo_path: Some(repo),
+            bg_allowed: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ordinary = crate::routing::HostCapability::local_default("mac".into(), "mac".into());
+    assert_eq!(db::tasks::list_queued_for_background(&conn, &ordinary, 5).unwrap().len(), 1);
+    let mini = scripts_only_host();
+    assert!(db::tasks::list_queued_for_background(&conn, &mini, 5).unwrap().is_empty());
+}
+
+/// The declaration has to survive the registry, since the runner reads the
+/// row back every tick. An empty list stored as "" must not come back as a
+/// default.
+#[test]
+fn a_scripts_only_declaration_round_trips_through_the_registry() {
+    let conn = crate::db::schema::test_conn();
+    db::hosts::register_self(&conn, &scripts_only_host()).unwrap();
+    let got = db::hosts::get(&conn, "mini").unwrap().unwrap();
+    assert!(got.is_scripts_only(), "{:?}", got.workspaces);
+    assert!(db::hosts::local(&conn, &scripts_only_host()).unwrap().is_scripts_only());
 }

@@ -215,9 +215,10 @@ fn main() -> anyhow::Result<()> {
         // only the switches do.
         match db::tripwires::counts(&conn) {
             Ok(c) => println!(
-                "tripwires:     {} armed · {} due now · {} leased{}",
+                "tripwires:     {} armed · {} due now ({} held elsewhere) · {} leased{}",
                 c.armed,
                 c.due_now,
+                runner::tripwire::due_elsewhere(&conn, &paths::tripwires_dir()).unwrap_or(0),
                 c.leased,
                 if gate.is_switched_off() { " (switched off — nothing will run)" } else { "" }
             ),
@@ -291,6 +292,28 @@ fn main() -> anyhow::Result<()> {
                 }
                 std::thread::sleep(Duration::from_secs(runner::CONTROL_TICK_SECONDS));
                 since_beat += runner::CONTROL_TICK_SECONDS;
+            }
+        });
+    }
+
+    // On its own thread and connection for the control loop's reason: a
+    // reconcile can take minutes, and neither a Stop nor a tick waits for one.
+    // Off for `--once` for the same reason, too.
+    if !once {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let mut conn = match runner::open_db() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("sync backstop could not open the database: {e}");
+                    continue;
+                }
+            };
+            match cxtasks_core::sync::auto::backstop_pass(&mut conn) {
+                Ok(Some(_)) => log::info!("sync: reconciled with the hub (the app isn't doing it)"),
+                Ok(None) => {}
+                // Recorded by `auto` for Settings and `sync-control.sh status`.
+                Err(e) => log::warn!("sync: backstop reconcile failed: {e}"),
             }
         });
     }

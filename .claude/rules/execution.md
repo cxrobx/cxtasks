@@ -958,6 +958,24 @@ the reader join waits at most two seconds: a script that backgrounds something
 leaves a writer behind, and the tick must not wait on a process it did not
 start.
 
+**A script runs where it lives.** All hosts read one task list and each keeps
+its own `tripwires/` folder, so "due" is a fact about the row and "mine" is a
+fact about the disk. `claim_due` skips a script this host doesn't have and
+records nothing. Recording "not found" instead is what the NAS runner did for
+weeks: it has no such folder, so it wrote a false error onto every script row it
+reached, and only the laptop's next success kept them from surfacing. The scan
+is `DUE_SCAN`, not the claim limit, or ten scripts held elsewhere hide this
+host's. **A file that is here and refused (a symlink, no exec bit) is still this
+host's error**: `script_is_held_in` asks about presence, never fitness.
+
+**Skipping must not hide a task forever** (invariant 26), so a non-holder reports
+a script nobody has checked for `max(3 × cadence, 3 days)`, as an ordinary error
+opening with `ORPHAN_NOTE`. That note is how the next pass knows the fresh
+`checked_at` is its own report and not a check. A holder's next answer resets the
+count, so a laptop shut for a week leaves nothing behind; a script nobody holds
+climbs to five and surfaces. Two holders of one script both run it, and a trip can
+land one comment from each: the DB has no cross-host lease, only a per-replica one.
+
 **A script gets a task, not a shell.** cwd is the task's repo when it resolves,
 else the data dir; env is `CXTASKS_TASK_ID`, `CXTASKS_TASK_REF`,
 `CXTASKS_TASK_TITLE`, `CXTASKS_TRIPWIRE=1`; `$1` is the one argument, passed
@@ -1048,6 +1066,20 @@ deliberately: a host that says "I am at my share of a cap that is already gone"
 sends the reader to fix the wrong number. A ceiling narrows and never widens,
 and every counter still spans every host — a per-host budget is the
 per-executor trap one level up.
+
+## Scripts-only hosts
+
+A host declaring **no workspaces** (`CXTASKS_HOST_WORKSPACES=none`) evaluates the
+scripts it holds and nothing else: no queued work, no agent checks, no
+interpretations, no mirror pushes. This is the Mac mini. Empty rather than a new
+flag because `queue_sql` already reads it as `0 = 1` and `satisfies` already never
+offers such a host a task. `tick` returns right after the script lane, because
+`agent_pass` reads no query and would otherwise start a check. `gate` skips the
+"no usable executor" test for these hosts, or a signed-out CLI would read as
+`HostDisabled` and stop the scripts too; the three switches still stop them.
+
+Declared policy is not re-asserted on restart (invariant 24), so a machine whose
+row already says `live` needs that row changed as well as the env var.
 
 ## The claim
 

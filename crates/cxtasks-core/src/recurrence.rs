@@ -636,7 +636,15 @@ mod tests {
             .earliest()
             .unwrap()
             .with_timezone(&Utc);
-        let anchor = now - Duration::days(1) + (midnight - now) / 2;
+        // Yesterday by the CALENDAR, not `- 24h`: on the night the clocks change
+        // those differ by an hour, and `daily` keeps the wall clock.
+        let target = (now + (midnight - now) / 2).with_timezone(&Local);
+        let anchor = (target.date_naive() - Duration::days(1))
+            .and_time(target.time())
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
         let t = tasks::create(
             &conn,
             &NewTask {
