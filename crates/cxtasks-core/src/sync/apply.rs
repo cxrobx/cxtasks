@@ -97,25 +97,66 @@ fn defer_foreign_keys(conn: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
-/// [`upsert`], in a transaction of its own.
+/// When a row last changed, as SQL over `alias`, for the tables that can say.
 ///
-/// For a caller applying one intent at a time: a partially-applied batch is
-/// worse than a rejected one, because the sender is told it failed and the
-/// receiver keeps half of it.
-pub fn upsert_atomic(
+/// A table missing here has rows that never change after they are written, or
+/// no timestamp to compare, so arrival order is all there is. Every operand is
+/// wrapped in `datetime()` because two formats coexist (invariant 1), and in
+/// `COALESCE` because `MAX` with a NULL argument is NULL.
+fn changed_at_sql(table: &str, alias: &str) -> Option<String> {
+    let stamp = |column: &str| format!("COALESCE(datetime({alias}.{column}), '')");
+    match table {
+        "tasks" | "hosts" | "tripwire_runtime" => Some(stamp("updated_at")),
+        "task_runs" => Some(format!(
+            "MAX({}, {}, {}, {})",
+            stamp("started_at"),
+            stamp("heartbeat_at"),
+            stamp("finished_at"),
+            stamp("cancel_requested_at"),
+        )),
+        "task_comments" => Some(format!("MAX({}, {})", stamp("created_at"), stamp("edited_at"))),
+        _ => None,
+    }
+}
+
+/// Apply a replica's pushed post-images on the hub, in one transaction.
+///
+/// **The newer whole row wins, not the one that arrived last** (invariant 32).
+/// A replica re-sends rows it merely pulled, and the sweep's `>=` re-covers its
+/// boundary second, so a push can carry a copy older than what the hub holds.
+/// Taken at face value, that put a task another machine had finished back to
+/// `queued`, and the next pull told that machine to run it again. An older row
+/// is dropped here and the sender corrects itself on its next pull. The same
+/// second still goes to the arrival, because stamps have no finer resolution.
+///
+/// One transaction because a partially-applied batch is worse than a rejected
+/// one: the sender is told it failed and the receiver keeps half of it.
+pub fn upsert_pushed(
     conn: &mut Connection,
     table: &str,
     data: &TableSnapshot,
 ) -> Result<usize, AppError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     defer_foreign_keys(&tx)?;
-    let n = upsert(&tx, table, data)?;
+    let n = write_rows(&tx, table, data, true)?;
     tx.commit()?;
     Ok(n)
 }
 
 /// Write post-images into `table`, updating only rows that actually differ.
+///
+/// This is the pull: the hub is the source of truth, so what it says stands
+/// whatever its timestamps. Pushes go through [`upsert_pushed`].
 pub fn upsert(conn: &Connection, table: &str, data: &TableSnapshot) -> Result<usize, AppError> {
+    write_rows(conn, table, data, false)
+}
+
+fn write_rows(
+    conn: &Connection,
+    table: &str,
+    data: &TableSnapshot,
+    newer_only: bool,
+) -> Result<usize, AppError> {
     if data.rows.is_empty() {
         return Ok(0);
     }
@@ -144,6 +185,10 @@ pub fn upsert(conn: &Connection, table: &str, data: &TableSnapshot) -> Result<us
         .map(|c| format!("{table}.{c} IS NOT excluded.{c}"))
         .collect::<Vec<_>>()
         .join(" OR ");
+    let not_older = match (changed_at_sql(table, "excluded"), changed_at_sql(table, table)) {
+        (Some(incoming), Some(held)) if newer_only => format!(" AND {incoming} >= {held}"),
+        _ => String::new(),
+    };
 
     let sql = if assignments.is_empty() {
         // A table that is nothing but its key — `task_tags`. There is no update
@@ -152,7 +197,7 @@ pub fn upsert(conn: &Connection, table: &str, data: &TableSnapshot) -> Result<us
     } else {
         format!(
             "INSERT INTO {table} ({quoted}) VALUES ({placeholders})
-             ON CONFLICT({keys}) DO UPDATE SET {assignments} WHERE {differs}",
+             ON CONFLICT({keys}) DO UPDATE SET {assignments} WHERE ({differs}){not_older}",
             keys = pk.join(", ")
         )
     };
@@ -283,6 +328,103 @@ mod tests {
         crate::db::tags::attach(&conn, &t.id, "urgent").unwrap();
         crate::db::comments::add(&conn, &t.id, "me", "a note").unwrap();
         conn
+    }
+
+    fn task_row(conn: &Connection, id: &str) -> TableSnapshot {
+        crate::sync::snapshot::read_table_where(conn, "tasks", Some("id = ?1"), &[&id]).unwrap()
+    }
+
+    fn task_state(conn: &Connection, id: &str) -> (String, String) {
+        conn.query_row("SELECT status, updated_at FROM tasks WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+
+    /// **T350, as it happened.** A replica's copy says `queued`; another machine
+    /// has since finished the task, and then the replica re-sends what it has.
+    #[test]
+    fn a_pushed_row_older_than_the_hubs_cannot_undo_a_finished_task() {
+        let mut hub = seeded();
+        let id: String = hub.query_row("SELECT id FROM tasks", [], |r| r.get(0)).unwrap();
+        hub.execute(
+            "UPDATE tasks SET status = 'queued', updated_at = '2026-11-02 07:16:50'",
+            [],
+        )
+        .unwrap();
+        let stale = task_row(&hub, &id);
+        hub.execute(
+            "UPDATE tasks SET status = 'in_review', updated_at = '2026-11-02 07:17:21'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(upsert_pushed(&mut hub, "tasks", &stale).unwrap(), 0);
+        assert_eq!(task_state(&hub, &id).0, "in_review");
+
+        // The pull has no such rule: the hub's word stands on a replica even
+        // when the replica's own stamp is later.
+        let hubs = task_row(&hub, &id);
+        hub.execute("UPDATE tasks SET status = 'queued', updated_at = '2026-11-02 08:00:00'", [])
+            .unwrap();
+        assert_eq!(upsert(&hub, "tasks", &hubs).unwrap(), 1);
+        assert_eq!(task_state(&hub, &id).0, "in_review");
+    }
+
+    #[test]
+    fn a_newer_or_same_second_push_still_lands_whatever_format_it_is_in() {
+        let mut hub = seeded();
+        let id: String = hub.query_row("SELECT id FROM tasks", [], |r| r.get(0)).unwrap();
+        hub.execute("UPDATE tasks SET status = 'queued', updated_at = '2026-11-02 07:17:21'", [])
+            .unwrap();
+        hub.execute("UPDATE tasks SET status = 'done', updated_at = '2026-11-02T07:17:22.000Z'", [])
+            .unwrap();
+        let newer = task_row(&hub, &id);
+        hub.execute("UPDATE tasks SET status = 'queued', updated_at = '2026-11-02 07:17:21'", [])
+            .unwrap();
+        assert_eq!(upsert_pushed(&mut hub, "tasks", &newer).unwrap(), 1);
+        assert_eq!(task_state(&hub, &id).0, "done");
+
+        hub.execute("UPDATE tasks SET status = 'queued', updated_at = '2026-11-02 07:17:22'", [])
+            .unwrap();
+        assert_eq!(upsert_pushed(&mut hub, "tasks", &newer).unwrap(), 1);
+        assert_eq!(task_state(&hub, &id).0, "done", "the same second goes to the arrival");
+    }
+
+    #[test]
+    fn a_pushed_run_row_cannot_unfinish_a_run() {
+        let mut hub = seeded();
+        let task: String = hub.query_row("SELECT id FROM tasks", [], |r| r.get(0)).unwrap();
+        let run = crate::db::runs::start(
+            &hub,
+            &task,
+            "background",
+            None,
+            crate::executor::BackgroundExecutor::Claude,
+            crate::intent::BackgroundIntent::Work,
+            None,
+        )
+        .unwrap();
+        hub.execute(
+            "UPDATE task_runs SET status = 'running', started_at = '2026-11-02 07:17:05',
+                    heartbeat_at = '2026-11-02 07:17:10', finished_at = NULL",
+            [],
+        )
+        .unwrap();
+        let stale = crate::sync::snapshot::read_table_where(
+            &hub, "task_runs", Some("id = ?1"), &[&run.id],
+        )
+        .unwrap();
+        hub.execute(
+            "UPDATE task_runs SET status = 'ready_for_review', finished_at = '2026-11-02 07:17:21'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(upsert_pushed(&mut hub, "task_runs", &stale).unwrap(), 0);
+        let status: String =
+            hub.query_row("SELECT status FROM task_runs", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "ready_for_review");
     }
 
     /// **The cascade hazard, asserted directly.**

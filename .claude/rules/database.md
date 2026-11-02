@@ -1075,6 +1075,30 @@ second axis on `status` — invariant 16); a contacts table (the question is
 "what is open with Sam", which a tag facet answers; a CRM is cxmail's
 problem); showing decisions in Inbox as well (two rows for one task).
 
+### Invariant 32 — on a push, the newer whole row wins
+
+`sync::apply::upsert_pushed` is the hub's write path for a `sync_upsert`. It drops
+a row older than the one it holds, judged by `changed_at_sql`: `updated_at` on
+`tasks`, `hosts` and `tripwire_runtime`, the latest of the run's stamps on
+`task_runs`, and `edited_at` on `task_comments`. A pull goes through plain
+`upsert` and takes the hub's row unconditionally.
+
+Arrival order was the old rule, and it lost finished work. A replica's sweep picks
+up rows it only pulled, and its `>=` re-covers the boundary second, so a push can
+carry a copy older than the hub's. T350 hit this on 2026-11-02: the laptop re-sent
+`queued` after the mini had finished the task, and the next pull would have offered
+it to the mini's runner again. It was archived by then, so nothing ran twice. Since
+invariant 31 a repeat run would also commit twice.
+
+- A dropped row still counts as accepted. The sender isn't wrong, only behind, and
+  its next pull corrects it.
+- This compares whole rows and merges nothing, so roadmap principle 5 stands.
+- The same second goes to the arrival, because stamps have no finer resolution.
+- It trusts the machines' clocks. All three use network time, and a skew of a few
+  seconds could only drop an edit made within those seconds of another machine's.
+- Still open: a pull overwrites a local write made in the moment between that
+  host's sweep and its pull. That window is about a second.
+
 ### Invariant 23 — attachment BYTES are canonical on the peer (v22)
 
 The metadata was always going to sync: `task_attachments` is an ordinary synced

@@ -135,7 +135,7 @@ fn apply_one(
                 "rows": intent.args["rows"],
             }))
             .map_err(|e| AppError::Validation(format!("malformed sync_upsert: {e}")))?;
-        cxtasks_core::sync::apply::upsert_atomic(conn, table, &data)?;
+        cxtasks_core::sync::apply::upsert_pushed(conn, table, &data)?;
         return Ok(());
     }
 

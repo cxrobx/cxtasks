@@ -223,7 +223,7 @@ mod tests {
                         "columns": i.args["columns"], "rows": i.args["rows"]
                     }))
                     .unwrap();
-                    crate::sync::apply::upsert(&db, table, &data).map(|_| ())
+                    crate::sync::apply::upsert_pushed(&mut db, table, &data).map(|_| ())
                 } else {
                     crate::api::dispatch_synced(&mut db, &i.cmd, &i.args).map(|_| ())
                 };

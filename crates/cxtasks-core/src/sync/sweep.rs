@@ -121,8 +121,9 @@ pub fn run(conn: &Connection) -> Result<usize, AppError> {
     let mut appended = 0usize;
 
     // Read the clock BEFORE reading rows. A row written between the two reads
-    // is then swept again next time — wasteful and harmless. Reading it after
-    // would let such a row fall in the gap and never be swept at all.
+    // is then swept again next time, which is wasteful, and harmless only
+    // because the hub refuses a row older than its own (invariant 32). Reading
+    // it after would let such a row fall in the gap and never be swept at all.
     let now: String = conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?;
 
     // Emit in the applier's declared order — parents before the rows that

@@ -40,7 +40,8 @@ nothing here changed it.
    node, through `tasks::update`, so derived writes are computed correctly.
 5. **Merge whole rows, never fields.** A row is internally consistent because
    only `tasks::update` produces one. Field-level LWW is not a finer-grained row
-   merge; it is a machine for manufacturing illegal rows.
+   merge; it is a machine for manufacturing illegal rows. Choosing between two
+   whole rows is different: on a push the hub keeps the newer one (invariant 32).
 6. **Read-only runs need no checkpoint** — `ToolTier::ReadOnly.needs_checkpoint()`
    is false, so the host-local git problem *disappears* rather than needing a
    solution.
