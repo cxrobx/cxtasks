@@ -500,7 +500,11 @@ def main(argv=None):
         try:
             cache_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
             rpc("client.window_title.set", {"title": args.window_title or TITLE})
-            if not args.headless:
+            if args.headless:
+                # layout.apply's focus doesn't move an attached remote client; only these do.
+                rpc("workspace.focus", {"workspace_id": result["workspace_id"]})
+                rpc("tab.focus", {"tab_id": result["tab_id"]})
+            else:
                 time.sleep(0.1)  # Let the attached client emit the title to Ghostty.
                 show_terminal(herdr, state_dir, cwd)
         except (OSError, ValueError, RoutingError, subprocess.TimeoutExpired) as error:

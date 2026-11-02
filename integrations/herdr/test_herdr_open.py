@@ -495,6 +495,21 @@ class RemoteHostTests(unittest.TestCase):
         self.open()
         self.assertIn(router.shlex.quote(router.window_title("cx@mini")), self.calls()[-1][-1])
 
+    def test_the_host_moves_the_attached_client_to_the_new_tab(self):
+        def opened(*args, **kwargs):
+            return {"workspace_id": "w", "tab_id": "t"}
+
+        for flags, moved in ((["--headless"], True), ([], False)):
+            with unittest.mock.patch.object(router, "request", return_value={}) as rpc, \
+                    unittest.mock.patch.object(router, "route", side_effect=opened), \
+                    unittest.mock.patch.object(router, "show_terminal") as terminal, \
+                    unittest.mock.patch("builtins.print"):
+                self.assertEqual(router.main([*flags, "--cwd", str(self.root), "--launch", str(self.launch)]), 0)
+            calls = [call.args[1:] for call in rpc.call_args_list]
+            self.assertEqual(("workspace.focus", {"workspace_id": "w"}) in calls, moved)
+            self.assertEqual(("tab.focus", {"tab_id": "t"}) in calls, moved)
+            self.assertEqual(terminal.called, not moved)
+
     def test_a_bare_claude_command_still_earns_trust_on_the_host(self):
         self.launch.write_text("cd /repo\nexec 'claude' --model opus -- \"$(cat p)\"\n", encoding="utf-8")
         self.assertEqual(router.claude_folder(self.launch, self.root), Path("/repo"))
