@@ -14,13 +14,19 @@ number to its file. Numbers here are therefore non-sequential; that's deliberate
 
 ## Data Model
 
-`schema.rs` is at `CURRENT_VERSION = 29`. Every migration is `IF NOT EXISTS` or
+`schema.rs` is at `CURRENT_VERSION = 30`. Every migration is `IF NOT EXISTS` or
 version-gated, and the stamp only ever moves **forward** — three binaries share
 one DB and don't upgrade in lockstep, so a leftover older `cxtasks-runner` must
 not re-stamp a v4 file back to v3 and send the next new-binary launch through
 migrations against columns that already exist. Don't hardcode the number in a
 test; compare against `schema::CURRENT_VERSION` (a literal there broke a test on
 every migration for no signal).
+
+**v30 added `tasks.run_on` and `hosts.takes_unassigned`** (invariant 30, in
+`execution.md`). Its backfill picks the oldest host with a live workspace, keyed
+on `created_at` then `id` with no `updated_at` write, so every replica reaches the
+same answer on its own and the migration sends nothing over sync. Sync refuses
+across schema versions, so a bump means upgrading the NAS first, then both Macs.
 
 **A version number is spent the moment any binary stamps it on a real DB —
 including a `tauri dev` run.** So adding columns to an existing
