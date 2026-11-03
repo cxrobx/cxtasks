@@ -362,15 +362,28 @@ pub fn open_t3_here(task: &Task, label: &str) -> Result<Launched, String> {
         None => task.title.clone(),
     };
 
-    let start = || {
+    // `model` is only passed when the project has no default of its own (a
+    // project T3 has never opened a thread in, like the CXTasks one): then
+    // `t3` refuses with "Pass modelSelection: the project has no default
+    // model", and the start is retried with T3_FALLBACK_*.
+    let start = |model: bool| {
         let mut c = Command::new(&t3);
-        c.arg("thread").arg("start").arg("--title").arg(&title).arg(&project).arg("-");
+        c.arg("thread").arg("start").arg("--title").arg(&title);
+        if model {
+            c.arg("--provider").arg(T3_FALLBACK_PROVIDER).arg("--model").arg(T3_FALLBACK_MODEL);
+        }
+        c.arg(&project).arg("-");
         c.env("PATH", crate::runner::providers::agent_path());
         run_capture(c, Some(&prompt), T3_TIMEOUT)
     };
-    let id = match start() {
+    let needs_model = |e: &str| e.to_lowercase().contains("default model");
+    let start = |model: bool| match start(model) {
+        Err(e) if !model && needs_model(&e) => start(true),
+        other => other,
+    };
+    let id = match start(false) {
         Ok(out) => out,
-        Err(first) if first.to_lowercase().contains("project") => {
+        Err(first) if first.to_lowercase().contains("no t3 code project") => {
             let mut add = Command::new(&t3);
             add.arg("project").arg("add").arg(&project);
             if !has_repo {
@@ -379,7 +392,7 @@ pub fn open_t3_here(task: &Task, label: &str) -> Result<Launched, String> {
             add.env("PATH", crate::runner::providers::agent_path());
             run_capture(add, None, T3_TIMEOUT)
                 .map_err(|e| format!("Could not add {} to T3 Code: {e}", project.display()))?;
-            start().map_err(|e| format!("Could not start a T3 Code thread: {e}"))?
+            start(false).map_err(|e| format!("Could not start a T3 Code thread: {e}"))?
         }
         Err(e) => return Err(format!("Could not start a T3 Code thread: {e}")),
     };
@@ -389,6 +402,13 @@ pub fn open_t3_here(task: &Task, label: &str) -> Result<Launched, String> {
     }
     Ok(Launched { scratch, session_ref: Some(format!("t3:{thread}")) })
 }
+
+/// The provider and model a thread gets when its project has no default yet.
+/// T3's names, read off a working thread on the mini (`t3 thread show --json`:
+/// `providerInstanceId`, `model`). Once a project has had a thread, T3 keeps a
+/// default and these stop being used for it.
+const T3_FALLBACK_PROVIDER: &str = "claudeAgent";
+const T3_FALLBACK_MODEL: &str = "claude-opus-5-5";
 
 /// The longest the runner waits on `t3`. Starting a thread is one local call.
 const T3_TIMEOUT: Duration = Duration::from_secs(60);

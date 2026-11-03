@@ -48,6 +48,8 @@ pub fn claims_dir() -> PathBuf {
 const CLAIM_NOTE_DAYS: u64 = 3;
 
 const FAILED_PREFIX: &str = "failed\n";
+/// A note for a launch that left a reference (`t3:<thread id>`).
+const OPENED_PREFIX: &str = "dispatched\n";
 
 /// One pass: expire, then open (or refuse) every fresh request for `cap`.
 ///
@@ -80,6 +82,11 @@ where
         if let Ok(recorded) = std::fs::read_to_string(&note) {
             let failure = recorded.strip_prefix(FAILED_PREFIX);
             if db::runs::reassert_session(conn, &run.id, failure)? {
+                // The pull took the hub's whole row, so the thread reference
+                // went with it; put that back too.
+                if let Some(session_ref) = recorded.strip_prefix(OPENED_PREFIX) {
+                    db::runs::record_session_ref(conn, &run.id, session_ref.trim())?;
+                }
                 log::info!("session: re-asserted run {} after a pull reverted it", run.id);
             }
             continue;
@@ -136,6 +143,9 @@ where
                 )?;
                 if let Some(session_ref) = &launched.session_ref {
                     db::runs::record_session_ref(conn, &run.id, session_ref)?;
+                    // So a re-assert after a pull can restore the reference
+                    // as well as the status.
+                    let _ = write_note(claims, &note, &format!("{OPENED_PREFIX}{session_ref}"));
                 }
                 // As the app's dispatch does: opening a session starts the work.
                 db::tasks::update(
@@ -278,6 +288,41 @@ mod tests {
         assert_eq!(row.status, runs::FOREGROUND_STATUS);
         assert_eq!(row.session_id.as_deref(), Some("t3:thread-123"));
         assert_eq!(row.scratch_dir.as_deref(), Some("/scratch/t3"));
+    }
+
+    #[test]
+    fn a_reverted_t3_row_gets_its_thread_back_not_a_second_thread() {
+        let f = fixture();
+        let task = db::tasks::create(&f.conn, &db::tasks::NewTask {
+            title: "t3 revert".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let run = runs::request_session(
+            &f.conn, &task.id, "mini", task.bg_intent, Some(runs::SESSION_TARGET_T3),
+        )
+        .unwrap();
+        let calls = RefCell::new(0);
+        let open = |_: &Task, _: crate::session::SessionTarget| {
+            *calls.borrow_mut() += 1;
+            Ok(crate::session::Launched {
+                scratch: PathBuf::from("/scratch/t3"),
+                session_ref: Some("t3:thread-9".into()),
+            })
+        };
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap();
+        // A pull puts the hub's older copy back: requested, target only.
+        f.conn
+            .execute(
+                "UPDATE task_runs SET status = ?2, session_id = 't3', finished_at = NULL WHERE id = ?1",
+                rusqlite::params![run.id, STATUS_REQUESTED],
+            )
+            .unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap();
+        assert_eq!(*calls.borrow(), 1, "never a second thread");
+        let row = runs::get(&f.conn, &run.id).unwrap().unwrap();
+        assert_eq!(row.status, runs::FOREGROUND_STATUS);
+        assert_eq!(row.session_id.as_deref(), Some("t3:thread-9"));
     }
 
     fn opens_ok(_: &Task) -> Result<PathBuf, String> {

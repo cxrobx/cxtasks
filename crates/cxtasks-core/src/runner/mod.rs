@@ -1550,7 +1550,7 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
         },
     ) {
         Ok(0) => {}
-        Ok(n) => log::info!("runner: opened {n} requested session(s) in Herdr"),
+        Ok(n) => log::info!("runner: opened {n} requested session(s)"),
         Err(e) => log::warn!("runner: session pass failed: {e}"),
     }
     if !scripts {
