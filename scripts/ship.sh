@@ -28,15 +28,19 @@ step "Stopping any tauri dev (two instances on one DB deadlock — gotcha #12)"
 pkill -f "target/debug/cxtasks" || true
 pkill -f "tauri dev" || true
 
-step "Building (npm run tauri build)"
+step "Building (npm run tauri build, .app only)"
+# The .app only. Nothing installs from the DMG, and building one drives Finder
+# over AppleScript to lay out its window, which fails on a Mac with nobody at
+# the screen (the mini: "failed to run bundle_dmg.sh"). A manual
+# `npm run tauri build` still makes both, per tauri.conf.json.
 # Don't pipe through tee/grep: under pipefail that misreports (gotcha #37).
 LOG="$(mktemp -t cxtasks-ship)"
-if ! npm run tauri build >"$LOG" 2>&1; then
+if ! npm run tauri build -- --bundles app >"$LOG" 2>&1; then
   tail -40 "$LOG"
   die "build failed — full log: $LOG"
 fi
 out="$(cat "$LOG")"
-[[ "$out" == *"Finished 2 bundles"* ]] || die "build exited 0 but never said 'Finished 2 bundles' — log: $LOG"
+[[ "$out" == *"Finished 1 bundle"* ]] || die "build exited 0 but never said 'Finished 1 bundle' — log: $LOG"
 
 step "Checking the bundle carries all three binaries (gotcha #5)"
 for bin in cxtasks cxtasks-mcp cxtasks-runner; do

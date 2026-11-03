@@ -61,3 +61,11 @@ lto = "thin"
 codegen-units = 1
 strip = true
 opt-level = "s"
+
+# Never strip what the COMPILER loads: proc macros and build scripts. On the
+# Mac mini (Xcode 27.2), stripping a proc-macro dylib left it malformed —
+# dlopen refused it with "mis-aligned LINKEDIT string pool" and rustc reported
+# `can't find crate for serde_derive / ctor_proc_macro / phf_macros`. They never
+# ship, so stripping them saved nothing; the bundled binaries above still strip.
+[profile.release.build-override]
+strip = false
