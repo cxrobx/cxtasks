@@ -952,6 +952,21 @@ The request is a ROW instead, and the machine it names opens it.
   machine`. `scripts/two-host-sim.sh` drives the lane through the real runner
   binary against a fake helper.
 
+**T3 Code or Herdr (2026-11-03).** `request_session` takes an optional `target`,
+`herdr` (absent means this) or `t3`, kept in the run's `session_id`, which a
+request otherwise never uses: NULL is Herdr, `t3` asks for a T3 Code thread,
+and after launch the runner rewrites it to `t3:<thread id>`
+(`db::runs::record_session_ref`, which moves `finished_at` so the reference
+syncs). `session::open_t3_here` sends the SAME foreground prompt a Herdr tab
+gets, via `t3 thread start --title "T<N>: …" <project> -` on stdin, with the
+login-shell PATH. The project is the task's repo; a task with no repo goes to
+the one "CXTasks" T3 project backed by `<data dir>/t3-sessions`, so T3's project
+list doesn't grow an entry per task. A folder T3 doesn't know is added with
+`t3 project add` and the start retried once (`t3` answers "No T3 Code project
+matches …" and exits 1). A runner that predates the target opens Herdr for any
+request, which is harmless. The phone picks the target in its Settings (T3 by
+default); a double tap returns the waiting request and names ITS target.
+
 ## Invariant 24 — a host row means "a machine that runs tasks"
 
 `hosts` is a registry of machines that execute, and **only the runner writes a
