@@ -875,6 +875,83 @@ applies. `integrations/herdr/README.md` owns the helper's half of the contract.
 the task to have synced, so a task filed moments before the click can read as not
 found until the host next reconciles.
 
+## Sessions requested from another device
+
+"Open on Mac mini" on the phone. The phone talks to a server (usually the NAS hub)
+that has no Herdr and no checkouts, so nothing can be opened where the tap lands.
+The request is a ROW instead, and the machine it names opens it.
+
+* **The verb is `request_session { task_id }`** (uuid or T-number), in the table
+  and NOT in `HOST_LOCAL`, because it opens nothing where it runs. It writes a
+  `task_runs` row: mode `foreground`, status **`requested`** (`runs::STATUS_REQUESTED`),
+  executor Claude, intent = `task.bg_intent`, `host` = the task's `run_on`, else the
+  `takes_unassigned` host (`session::target_host`, invariant 30's rule, so the session
+  opens on the checkout its background work uses). It refuses a done, archived or
+  trashed task, an empty registry, a vanished `run_on`, a host with no `Live`
+  workspace (a container can't open Herdr), and a host that is disabled or paused.
+  A second tap within 15 minutes returns the waiting row. It returns
+  `session::SessionRequest`: `{ run, host_id, host_label, message, warning }`.
+* **The runner's session lane opens it** (`runner::session::session_pass`, from
+  `tick`). `db::runs::claim_session` is one conditional UPDATE
+  (`requested` → `dispatched`, `WHERE status = 'requested' AND host = me` and fresh),
+  so two ticks here can't both win and no other machine can win at all. Then
+  `session::open_here` builds the same scratch folder, launch script and repo choice
+  as the app (`foreground_repo`, `write_scratch`, `write_launch_script`, shared from
+  core now) and runs `cx-open-in-herdr --headless`, bounded at 60 s, with
+  `providers::agent_path()` as PATH and the CLI from `find_claude_cli` (bare
+  `claude` as the fallback, which the login-shell launch script resolves).
+  `--headless` opens the tab over Herdr's socket and shows no terminal: it fails
+  rather than start Herdr or a Ghostty window, and it ignores `CX_HERDR_HOST`, so
+  the session can only open on this machine. Herdr has to be running there.
+  Success sets the scratch dir and moves the task to `in_progress`, as the app's
+  dispatch does. A failure records the helper's stderr and is **never retried**,
+  because a dropped reply doesn't prove the tab didn't open.
+* **Where the lane sits in the tick: above the budget gate's return, below
+  nothing.** An interactive session is a person's own Claude, not the runner
+  spending the background budget, so a spent token cap, the run cap, the host
+  headroom or two busy slots must not stop one (gotcha #42's rule). The three
+  switches (`STOP_BACKGROUND`, host paused, host disabled) do stop it, by
+  REFUSING each waiting request with the reason (`refusal_for`) instead of letting
+  it lapse, so the phone hears why within a tick. Expiry runs whatever the
+  switches say: it opens nothing.
+* **Nothing opens late.** The target claims only a request under
+  `SESSION_REQUEST_MINUTES` (15) and fails older ones itself, naming the machine
+  ("Mac mini didn't pick this up within 15 minutes… Is its runner running?"). Any
+  other machine's runner fails a request after `SESSION_REQUEST_FOREIGN_MINUTES`
+  (30), which is what tells the phone something when the target's runner is down.
+  The gap is more than a sync interval on purpose: a stranger's later `failed`
+  would win at the hub over a session the target really opened at minute 14 and
+  hadn't pushed yet.
+* **A request is opened at most once here, whatever a pull does.** A pull takes
+  the hub's row unconditionally, so a claim made in the second between this
+  host's sweep and its pull is put back to `requested` (invariant 32's open
+  window), and the next tick would open a second session. Every claim therefore
+  leaves a host-local note in `<data dir>/session-claims/<run id>`, written before
+  the launch and rewritten with the failure if there is one; a row that comes
+  back to `requested` with a note gets its recorded outcome re-asserted
+  (`reassert_session`, stamps moved to now) instead of being opened. Notes are
+  pruned after three days.
+* **Sync.** Every transition moves `started_at` or `finished_at`, which is what
+  `task_runs` is swept and compared on (`MAX(started_at, heartbeat_at,
+  finished_at, cancel_requested_at)`): the claim stamps both with the moment the
+  session opened, a failure or refusal stamps `finished_at`. So the claim wins at
+  the hub over the hub's own `requested`, and an older re-send can't put it back
+  (`sync::apply::tests::a_claimed_session_request_wins_at_the_hub_…`).
+* **Latency, tap to tab:** the hub write is immediate; the mini sees it at its
+  next reconcile, which is the app's 5-minute timer, or the runner's backstop
+  (checked every 60 s, fires once the last attempt is 6 minutes old) when the app
+  isn't running; then up to one 20 s tick. Typically 1–5 minutes, worst case about
+  7. The outcome reaches the phone one more reconcile later.
+* **What reads it.** `sweep_abandoned`, `heal_foreground_runs`, the concurrency
+  counts and `cancel_run` all filter `status = 'running'` or `mode = 'background'`,
+  so a request is invisible to them (pinned by
+  `a_request_is_invisible_to_the_background_bookkeeping`). `is_terminal` reads
+  `requested` as terminal, which only means "not a running process to cancel".
+  The app labels it "Waiting to open"; the MCP prints the host it waits on;
+  iOS shows the raw string. `--status` prints `sessions: N requested for this
+  machine`. `scripts/two-host-sim.sh` drives the lane through the real runner
+  binary against a fake helper.
+
 ## Invariant 24 — a host row means "a machine that runs tasks"
 
 `hosts` is a registry of machines that execute, and **only the runner writes a

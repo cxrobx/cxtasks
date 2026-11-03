@@ -1556,10 +1556,16 @@ fn format_detail(
         s.push_str("\nRuns:\n");
         for r in runs.iter().take(5) {
             s.push_str(&format!(
-                "  - {}{} {} started {}{}\n",
+                "  - {}{} {}{} started {}{}\n",
                 r.mode,
                 if r.intent.is_review() { " (review)" } else { "" },
                 r.status,
+                // A session asked for from another device: say which machine
+                // it is waiting on, since nothing has opened yet.
+                match (r.status.as_str(), r.host.as_deref()) {
+                    (crate::db::runs::STATUS_REQUESTED, Some(h)) => format!(" (waiting for host {h})"),
+                    _ => String::new(),
+                },
                 r.started_at,
                 r.finished_at
                     .as_deref()

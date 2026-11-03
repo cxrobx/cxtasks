@@ -100,6 +100,8 @@ mod tests {
     fn a_board_token_may_start_an_agent() {
         for allowed in [
             "intake", "intake_route", "intake_resolve", "intake_places", "queue_background",
+            // Opening a session on the Mac mini from the phone is the same decision.
+            "request_session",
             // Starting a project from the phone is the same decision as starting
             // an agent from it: both were weighed and allowed on purpose.
             "create_project", "add_project_repo",

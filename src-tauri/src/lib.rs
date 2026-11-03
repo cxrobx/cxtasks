@@ -23,7 +23,7 @@ pub mod vibrancy_macos;
 // the only thing in the diff.
 pub use cxtasks_core::{
     checkpoint, db, dispatch, error, executor, intent, launchd, mcp, notify, notify_helper, paths,
-    platform, recurrence, runner,
+    platform, recurrence, runner, session,
 };
 
 use std::fs;

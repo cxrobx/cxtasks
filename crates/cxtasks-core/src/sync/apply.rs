@@ -427,6 +427,75 @@ mod tests {
         assert_eq!(status, "ready_for_review");
     }
 
+    /// A session request's round trip: the hub writes `requested`, the target
+    /// claims it a little later and pushes `dispatched`, which must win; a
+    /// stale re-send of the hub's own `requested` must not undo it. Each
+    /// transition moves a stamp, which is the whole reason this works.
+    #[test]
+    fn a_claimed_session_request_wins_at_the_hub_and_a_stale_copy_cannot_reopen_it() {
+        let mut hub = seeded();
+        let task: String = hub.query_row("SELECT id FROM tasks", [], |r| r.get(0)).unwrap();
+        let run = crate::db::runs::request_session(
+            &hub, &task, "mini", crate::intent::BackgroundIntent::Work,
+        )
+        .unwrap();
+        hub.execute("UPDATE task_runs SET started_at = '2026-11-02 07:00:00'", []).unwrap();
+        let requested = crate::sync::snapshot::read_table_where(
+            &hub, "task_runs", Some("id = ?1"), &[&run.id],
+        )
+        .unwrap();
+
+        // What the mini pushes after its claim, a minute and a half later.
+        hub.execute(
+            "UPDATE task_runs SET status = 'dispatched', started_at = '2026-11-02 07:01:30',
+                    finished_at = '2026-11-02 07:01:30'",
+            [],
+        )
+        .unwrap();
+        let claimed = crate::sync::snapshot::read_table_where(
+            &hub, "task_runs", Some("id = ?1"), &[&run.id],
+        )
+        .unwrap();
+        hub.execute(
+            "UPDATE task_runs SET status = 'requested', started_at = '2026-11-02 07:00:00',
+                    finished_at = NULL",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(upsert_pushed(&mut hub, "task_runs", &claimed).unwrap(), 1);
+        let status = |hub: &Connection| -> String {
+            hub.query_row("SELECT status FROM task_runs", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(status(&hub), "dispatched");
+        assert_eq!(upsert_pushed(&mut hub, "task_runs", &requested).unwrap(), 0);
+        assert_eq!(status(&hub), "dispatched", "an older re-send can't put it back to requested");
+
+        // A launch failure recorded in a later second travels the same way.
+        hub.execute(
+            "UPDATE task_runs SET status = 'failed', result_text = 'Herdr is not running',
+                    finished_at = '2026-11-02 07:01:33'",
+            [],
+        )
+        .unwrap();
+        let failed = crate::sync::snapshot::read_table_where(
+            &hub, "task_runs", Some("id = ?1"), &[&run.id],
+        )
+        .unwrap();
+        assert_eq!(upsert_pushed(&mut hub, "task_runs", &claimed).unwrap(), 0);
+        assert_eq!(status(&hub), "failed");
+
+        // And onto a hub still holding the claim, the failure wins.
+        hub.execute(
+            "UPDATE task_runs SET status = 'dispatched', result_text = NULL,
+                    finished_at = '2026-11-02 07:01:30'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(upsert_pushed(&mut hub, "task_runs", &failed).unwrap(), 1);
+        assert_eq!(status(&hub), "failed");
+    }
+
     /// **The cascade hazard, asserted directly.**
     ///
     /// Writing a task's post-image must not touch its comments or tags.

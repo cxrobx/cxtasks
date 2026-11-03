@@ -285,6 +285,42 @@ expect "the NAS is at its ceiling with one run" "AtConcurrencyLimit"
 capture mac --status
 expect "the Mac still has slots — the ceiling is per host" "gate:          Open"
 
+say "a session asked for from the phone opens on its machine, once"
+# A fake cx-open-in-herdr under the fake $HOME, so nothing reaches a real Herdr.
+# It logs its arguments and answers like the headless helper does.
+mkdir -p "$MAC_HOME/.local/bin"
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\n" "$*" >> "$(dirname "$0")/router.log"' \
+  'printf "%s\n" "{\"workspace_id\":\"w\",\"tab_id\":\"t\"}"' \
+  > "$MAC_HOME/.local/bin/cx-open-in-herdr"
+chmod +x "$MAC_HOME/.local/bin/cx-open-in-herdr"
+ROUTER_LOG="$MAC_HOME/.local/bin/router.log"
+q "INSERT INTO tasks (id, title, status, short_id)
+   VALUES ('sess', 'open me on the Mac', 'todo', (SELECT COALESCE(MAX(short_id),0)+1 FROM tasks));"
+q "INSERT INTO task_runs (id, task_id, mode, status, executor, intent, host) VALUES
+   ('sess-mac',    'sess', 'foreground', 'requested', 'claude', 'work', 'mac-sim'),
+   ('sess-laptop', 'sess', 'foreground', 'requested', 'claude', 'work', 'laptop-sim'),
+   ('sess-stale',  'sess', 'foreground', 'requested', 'claude', 'work', 'mac-sim');"
+q "UPDATE task_runs SET started_at = datetime('now', '-20 minutes') WHERE id = 'sess-stale';"
+capture mac --status
+expect "the Mac counts only its fresh request" "sessions:      1 requested for this machine"
+mac --once >/dev/null 2>&1 || true
+[ "$(q "SELECT status FROM task_runs WHERE id = 'sess-mac'")" = "dispatched" ] \
+  && pass "the Mac claimed its request and recorded it dispatched" \
+  || fail "sess-mac is '$(q "SELECT status FROM task_runs WHERE id = 'sess-mac'")'"
+LAST_OUT="$(cat "$ROUTER_LOG" 2>/dev/null || true)"
+expect "the helper was asked to open it headless" "--headless --cwd"
+expect "in the CXTasks space, scoped to the Inbox" "--space CXTasks --scope cxtasks:inbox"
+[ "$(q "SELECT status FROM task_runs WHERE id = 'sess-laptop'")" = "requested" ] \
+  && pass "the laptop's request was left for the laptop" || fail "the Mac touched the laptop's request"
+LAST_OUT="$(q "SELECT status || ': ' || result_text FROM task_runs WHERE id = 'sess-stale'")"
+expect "a stale tap was failed, naming the machine, not opened" "failed: the Mac didn't pick this up"
+[ "$(q "SELECT status FROM tasks WHERE id = 'sess'")" = "in_progress" ] \
+  && pass "opening the session started the task" || fail "the task did not move to in_progress"
+mac --once >/dev/null 2>&1 || true
+[ "$(wc -l < "$ROUTER_LOG" | tr -d ' ')" = "1" ] \
+  && pass "a second tick opened nothing" || fail "the helper ran $(wc -l < "$ROUTER_LOG") times"
+
 printf '\n'
 if [ "$FAILURES" = "0" ]; then
   printf '\033[32mall checks passed\033[0m — two hosts, one queue, no network, no tokens\n'

@@ -440,6 +440,13 @@ pub fn dispatch(conn: &mut Connection, cmd: &str, args: &Value) -> Result<Value,
             ok(crate::paths::background_paused())
         }
         "cancel_run" => ok(cancel_run(conn, &arg::<String>(args, "run_id")?)?),
+        // "Open on Mac mini" from the phone. NOT host-local, unlike
+        // `dispatch_foreground`: it opens nothing here. It records a
+        // `requested` foreground run addressed to the machine that runs the
+        // task, sync carries it there, and that machine's runner opens it in
+        // Herdr (`runner::session`). The write is an ordinary row, so it
+        // travels as a post-image like every other state change.
+        "request_session" => ok(crate::session::request(conn, &arg::<String>(args, "task_id")?)?),
         // Canonical, unlike its foreground sibling: queueing is a database
         // write plus a set of guards, none of which need a human at the
         // machine. `queue_for_background` takes a connection-lending closure
@@ -726,7 +733,7 @@ pub const ALL_VERBS: &[&str] = &[
     "filter_tasks", "count_filtered", "retrospective", "jev_status", "save_jev_settings", "jev_assess_capture",
     "jev_assess_readiness", "list_runs", "list_run_events", "recent_runs", "get_run", "budget_status",
     "save_budget_settings", "reset_budget_window", "set_background_paused", "cancel_run",
-    "queue_background", "list_tags", "task_tags", "set_task_tags", "rename_tag", "task_tag_map",
+    "request_session", "queue_background", "list_tags", "task_tags", "set_task_tags", "rename_tag", "task_tag_map",
     "tag_usage_count", "delete_tag", "task_relations", "add_dependency", "remove_dependency",
     "blocked_task_ids", "add_relation", "remove_relation", "list_tripwire_runtime",
     "list_comments", "add_comment", "edit_comment", "delete_comment",

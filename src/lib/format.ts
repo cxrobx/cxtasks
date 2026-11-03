@@ -529,6 +529,8 @@ export const INTENT_HINTS: Record<BackgroundIntent, string> = {
  * status this build has never heard of.
  */
 export const RUN_STATUS_LABELS: Record<TaskRun["status"], string> = {
+  // A session another device asked a machine to open, not opened yet.
+  requested: "Waiting to open",
   running: "Running",
   ready_for_review: "Ready for review",
   needs_action: "Needs action",
@@ -558,6 +560,7 @@ export const RUN_STATUS_LABELS: Record<TaskRun["status"], string> = {
  * is not the same as the work having broken.
  */
 export const RUN_STATUS_CLASS: Record<TaskRun["status"], string> = {
+  requested: "text-content-secondary",
   running: "text-accent",
   ready_for_review: "text-accent",
   needs_action: "text-warning",

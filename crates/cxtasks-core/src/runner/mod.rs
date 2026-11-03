@@ -56,6 +56,7 @@ pub mod completion;
 pub mod process;
 pub mod progress;
 pub mod providers;
+pub mod session;
 pub mod tripwire;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1529,6 +1530,25 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
         tokens_today,
     );
     let Lanes { scripts, slots } = lanes(&decision);
+    // The SESSION lane, above every return below. A session another device
+    // asked this machine for is a person's own interactive Claude, not the
+    // runner spending the background budget, so a spent cap or two busy slots
+    // must not stop it (gotcha #42's rule: what costs the budget nothing goes
+    // above the budget return). The switches still stop it, by refusing each
+    // waiting request with the reason; expiry runs regardless.
+    let refusal = session::refusal_for(&decision, &cap.label);
+    let label = cap.label.clone();
+    match session::session_pass(
+        &conn,
+        &cap,
+        refusal.as_deref(),
+        &session::claims_dir(),
+        |task| crate::session::open_here(task, &label),
+    ) {
+        Ok(0) => {}
+        Ok(n) => log::info!("runner: opened {n} requested session(s) in Herdr"),
+        Err(e) => log::warn!("runner: session pass failed: {e}"),
+    }
     if !scripts {
         // One of the switches. Nothing runs — not even a script.
         log::debug!("runner: switched off ({decision:?})");

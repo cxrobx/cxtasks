@@ -882,8 +882,13 @@ export interface TaskRun {
    * running. `abandoned` is a background run whose process vanished without
    * recording an outcome — distinct from `failed`, which asserts the work
    * broke, and from `timeout`, which asserts our own guard fired.
+   *
+   * `requested` is a foreground session another device (the phone) asked the
+   * machine in `host` to open in Herdr; that machine's runner moves it to
+   * `dispatched` or `failed` (`runner::session`).
    */
   status:
+    | "requested"
     | "running"
     | "ready_for_review"
     | "needs_action"

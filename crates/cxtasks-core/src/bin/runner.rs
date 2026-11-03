@@ -224,6 +224,16 @@ fn main() -> anyhow::Result<()> {
             ),
             Err(e) => println!("tripwires:     unreadable ({e})"),
         }
+        // Sessions another device asked THIS machine to open in Herdr. Not
+        // budget-gated, so only the switches matter here.
+        match db::runs::pending_session_requests(&conn, &cap.id) {
+            Ok(r) => println!(
+                "sessions:      {} requested for this machine{}",
+                r.len(),
+                if gate.is_switched_off() { " (switched off — they will be refused)" } else { "" }
+            ),
+            Err(e) => println!("sessions:      unreadable ({e})"),
+        }
 
         // Which agents THIS binary can actually reach. Printed from the runner
         // rather than the app because that is the process whose environment

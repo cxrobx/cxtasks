@@ -20,6 +20,8 @@ Repo-less foreground tasks use per-task scratch directories grouped by project
 or Inbox. Without the router, foreground retains its standalone Ghostty path.
 **Herdr host** in Settings names another Mac to open foreground sessions on
 (`.claude/rules/execution.md` § Foreground on another Mac).
+The phone asks for one with `request_session`, and the machine that runs the
+task opens it (§ Sessions requested from another device).
 
 Foreground is always **Claude Code**. Background is per-task: **Claude Code**
 (the default) or **Codex** (`codex exec`), chosen by `tasks.bg_executor`.
@@ -172,6 +174,7 @@ the Tauri side.
 | `crates/cxtasks-core/src/mcp_registry.rs` | What a detached run may reach — names, never command lines | `rules/execution.md` |
 | `crates/cxtasks-core/src/runner/` | Drain loop, budget gates, tiers, providers/{claude,codex}, salvage, `control_pass`, `ready`/`release`; **`tripwire.rs`** holds BOTH tripwire lanes — script and `jev:` checks run before the budget gate's early return (gotcha #42), while the AGENT lane (`agent_pass`) runs below it, takes one slot, and evaluates `agent:` specs as a `RunKind::Check` — read-only pinned, `get_task` only, 12 turns · 3M · 10 min, under its own daily sub-cap; an `on_trip = interpret` trip gets one zero-tool run reading its full evidence (`interpret_one`, 2 turns · 1M · 5 min). **`completion.rs`** parses the `CXTASKS_RESULT:` report every ordinary work run ends with — exit 0 is not "done" | `rules/execution.md` |
 | `crates/cxtasks-core/src/dispatch.rs` | Shared prompt/scratch-dir builder, repo resolution | `rules/execution.md` |
+| `crates/cxtasks-core/src/session.rs` + `runner/session.rs` | Herdr sessions: the router command and repo choice the app's dispatch and the runner share, and `request_session` ("Open on Mac mini" from the phone) — a `requested` run the named machine's runner claims and opens headless, above the budget return | `rules/execution.md` |
 | `crates/cxtasks-core/src/executor.rs` + `intent.rs` | `BackgroundExecutor` and `BackgroundIntent` — read as a pair | `rules/execution.md` |
 | `crates/cxtasks-core/src/checkpoint.rs` | Working-tree snapshots onto `refs/cxtasks/` for write-enabled runs, and `commit_run`, which commits what a verified run changed (invariant 31) | `rules/execution.md` |
 | `crates/cxtasks-core/src/paths.rs` | **Single source of truth** for every shared on-disk path (invariant 8); `CXTASKS_DATA_DIR` moves the root | |

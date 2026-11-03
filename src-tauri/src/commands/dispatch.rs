@@ -8,11 +8,13 @@ use tauri::State;
 
 use crate::db;
 use crate::dispatch::{
-    find_claude_cli, resolve_repo_or_home, write_launch_script, write_scratch,
-    PromptTarget, ENV_HERDR_HOST, HOST_CLAUDE_CLI,
+    find_claude_cli, write_launch_script, write_scratch, PromptTarget, HOST_CLAUDE_CLI,
 };
 use crate::error::AppError;
 use crate::executor::BackgroundExecutor;
+// Shared with the runner's session lane, so a session the phone asked for and
+// one opened from this app are built the same way.
+use crate::session::{foreground_repo, herdr_router, router_command, session_scope, session_space};
 use crate::runner::Provider;
 use crate::{AppState, LockExt};
 
@@ -21,40 +23,6 @@ pub struct DispatchResult {
     pub run_id: String,
     pub repo_path: String,
     pub scratch_dir: String,
-}
-
-fn herdr_router() -> Option<std::path::PathBuf> {
-    let path = dirs::home_dir()?.join(".local/bin/cx-open-in-herdr");
-    path.is_file().then_some(path)
-}
-
-/// Repo-less Herdr sessions have their own task directory. An explicit repo
-/// still wins; the standalone Ghostty fallback retains its existing behavior.
-///
-/// With a Herdr host the repo is the host's business, so nothing here checks it
-/// exists on this Mac. The scratch directory is also where the launch script
-/// lives, so the helper's copy of that folder creates this cwd on the host.
-fn foreground_repo(
-    task: &db::tasks::Task,
-    routed: bool,
-    host: Option<&str>,
-) -> Result<PathBuf, AppError> {
-    let on_host = host.and(crate::dispatch::repo_on_host(task));
-    if let Some(repo) = on_host {
-        return Ok(repo);
-    }
-    if (routed || host.is_some())
-        && task
-            .repo_path
-            .as_deref()
-            .map_or(true, |p| p.trim().is_empty())
-    {
-        let scratch = crate::dispatch::scratch_dir_for(task);
-        std::fs::create_dir_all(&scratch)?;
-        Ok(scratch)
-    } else {
-        resolve_repo_or_home(task)
-    }
 }
 
 /// A host means the session belongs on that Mac, and only the router can put it
@@ -84,33 +52,6 @@ fn session_cli(host: Option<&str>) -> Result<PathBuf, AppError> {
                 .into(),
         )
     })
-}
-
-/// The `cx-open-in-herdr` invocation. The environment is touched only for a
-/// host, so a local handoff starts the helper exactly as it always has.
-fn router_command(
-    router: &Path,
-    repo: &Path,
-    launch: &Path,
-    space: &str,
-    scope: Option<&str>,
-    host: Option<&str>,
-) -> Command {
-    let mut command = Command::new(router);
-    command
-        .arg("--cwd")
-        .arg(repo)
-        .arg("--launch")
-        .arg(launch)
-        .arg("--space")
-        .arg(space);
-    if let Some(scope) = scope {
-        command.arg("--scope").arg(scope);
-    }
-    if let Some(host) = host {
-        command.env(ENV_HERDR_HOST, host);
-    }
-    command
 }
 
 fn record_foreground_launch(
@@ -214,13 +155,8 @@ pub async fn dispatch_foreground(
     let working_dir_arg = format!("--working-directory={}", repo.display());
     let launch_for_err = launch_path.clone();
     let repo_for_spawn = repo.clone();
-    let space = task.project.clone().unwrap_or_else(|| "CXTasks".into());
-    let scope = task
-        .repo_path
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .is_none()
-        .then(|| format!("cxtasks:{}", task.project.as_deref().unwrap_or("inbox")));
+    let space = session_space(&task);
+    let scope = session_scope(&task);
     let launched = tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         if let Some(router) = router {
             let output = router_command(
@@ -556,6 +492,7 @@ pub async fn restore_checkpoint(
 #[cfg(test)]
 mod herdr_tests {
     use super::*;
+    use crate::dispatch::resolve_repo_or_home;
 
     fn pending_dispatch() -> (rusqlite::Connection, db::tasks::Task, db::runs::TaskRun) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

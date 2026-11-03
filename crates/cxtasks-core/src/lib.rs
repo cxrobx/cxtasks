@@ -43,6 +43,7 @@ pub mod platform;
 pub mod prose;
 pub mod recurrence;
 pub mod routing;
+pub mod session;
 pub mod sync;
 pub mod tripwire;
 pub mod runner;

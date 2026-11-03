@@ -23,7 +23,7 @@
 use crate::error::AppError;
 use crate::executor::BackgroundExecutor;
 use crate::intent::BackgroundIntent;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
 /// Terminal + non-terminal run states.
@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 /// with **no producer anywhere in Rust** — the per-run spend guard was designed
 /// and never built — which is why a stopped run used to be recorded as `failed`
 /// with nothing naming the guard.
-pub const RUN_STATUSES: [&str; 12] = [
+pub const RUN_STATUSES: [&str; 13] = [
+    "requested",
     "running",
     "ready_for_review",
     "needs_action",
@@ -67,6 +68,33 @@ pub const FOREGROUND_STATUS: &str = "dispatched";
 /// is left to say what happened. Same argument as gotcha #31's — a run we
 /// stopped on purpose is not a run that broke — one step further along.
 pub const STATUS_ABANDONED: &str = "abandoned";
+
+/// An interactive session somebody asked for from another device, which the
+/// machine named in `host` has not opened yet ("Open on Mac mini").
+///
+/// The only non-terminal FOREGROUND status. It is not `running`, on purpose:
+/// `running` means a background process this machine is executing (invariant
+/// 20), and every query that reads it (the sweep, the concurrency gate, the
+/// cancel path) filters `mode = 'background'` or `status = 'running'`, so a
+/// request is invisible to all of them. It leaves this state exactly once — to
+/// `dispatched` when the host claims it ([`claim_session`]), or to `failed`
+/// when the host refuses it or nobody claims it in time
+/// ([`expire_session_requests`]).
+pub const STATUS_REQUESTED: &str = "requested";
+
+/// How long a request may wait for its machine. Past this the machine will not
+/// open it, so a tap can never turn into a session hours later.
+pub const SESSION_REQUEST_MINUTES: i64 = 15;
+
+/// How long before a machine OTHER than the target marks a request failed.
+///
+/// Longer than [`SESSION_REQUEST_MINUTES`] by more than a sync interval: the
+/// target may have opened it at minute 14 and not pushed yet, and a stranger's
+/// "failed" stamped later would win at the hub (invariant 32) over a session
+/// that really opened. The target itself never claims past 15 minutes, so
+/// nothing opens late either way; this only decides how long the row reads
+/// "requested" when the target's runner is down.
+pub const SESSION_REQUEST_FOREIGN_MINUTES: i64 = 30;
 
 pub fn is_terminal(status: &str) -> bool {
     status != "running"
@@ -317,6 +345,200 @@ pub fn fail_foreground_dispatch(
         params![run_id, reason],
     )?;
     Ok(())
+}
+
+// ── interactive sessions requested from another device ──────────────────────
+//
+// "Open on Mac mini" from the phone. The phone talks to a server that cannot
+// open anything on the mini, so the request is a ROW: written wherever the verb
+// ran, carried to the mini by sync, claimed by the mini's runner, and its
+// outcome carried back the same way. Every transition below moves `started_at`
+// or `finished_at`, because `task_runs` is swept and compared on the latest of
+// its stamps (`sync::sweep::SWEEP`, invariant 32) — a transition that moved
+// neither would never leave the machine that made it.
+
+/// The SQL test for "still worth opening": requested within the last
+/// [`SESSION_REQUEST_MINUTES`]. Both operands wrapped (invariant 1).
+fn fresh_request_sql() -> String {
+    format!("datetime(started_at) >= datetime('now', '-{SESSION_REQUEST_MINUTES} minutes')")
+}
+
+/// Record a request for an interactive session on `host`.
+///
+/// **Idempotent per task**: a second tap while a fresh request is still waiting
+/// returns that one, so a double tap can't open two sessions. A request too old
+/// to be opened doesn't count, and is left for [`expire_session_requests`].
+pub fn request_session(
+    conn: &Connection,
+    task_id: &str,
+    host: &str,
+    intent: BackgroundIntent,
+) -> Result<TaskRun, AppError> {
+    let existing: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT id FROM task_runs
+                  WHERE task_id = ?1 AND mode = 'foreground' AND status = ?2 AND {}
+                  ORDER BY datetime(started_at) DESC LIMIT 1",
+                fresh_request_sql()
+            ),
+            params![task_id, STATUS_REQUESTED],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            // No heartbeat: nothing is executing, and the sweep never looks at
+            // a foreground row anyway.
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, mode, status, executor, intent, host)
+                 VALUES (?1, ?2, 'foreground', ?3, ?4, ?5, ?6)",
+                params![id, task_id, STATUS_REQUESTED, BackgroundExecutor::Claude, intent, host],
+            )?;
+            id
+        }
+    };
+    get(conn, &id)?.ok_or_else(|| AppError::NotFound("run vanished after insert".into()))
+}
+
+/// Fresh requests addressed to `me`, oldest first.
+pub fn pending_session_requests(conn: &Connection, me: &str) -> Result<Vec<TaskRun>, AppError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM task_runs
+          WHERE status = ?1 AND mode = 'foreground' AND host = ?2 AND {}
+          ORDER BY datetime(started_at) ASC, rowid ASC",
+        fresh_request_sql()
+    ))?;
+    let rows = stmt
+        .query_map(params![STATUS_REQUESTED, me], row_to_run)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Take a request for `me`, atomically: `requested` → `dispatched`.
+///
+/// One conditional UPDATE, so two ticks on this machine (the LaunchAgent and a
+/// hand-run `--once`) can't both win, and the `host` test means no other
+/// machine can either. It claims only a FRESH request: past
+/// [`SESSION_REQUEST_MINUTES`] the tap is stale and must not open anything.
+///
+/// The row is terminal at `dispatched` from here, exactly like the app's own
+/// dispatch (invariant 20), and `started_at`/`finished_at` become the moment
+/// the session was opened. Returns whether this caller won.
+pub fn claim_session(conn: &Connection, run_id: &str, me: &str) -> Result<bool, AppError> {
+    let n = conn.execute(
+        &format!(
+            "UPDATE task_runs
+                SET status = ?3, started_at = datetime('now'), finished_at = datetime('now')
+              WHERE id = ?1 AND status = ?4 AND mode = 'foreground' AND host = ?2 AND {}",
+            fresh_request_sql()
+        ),
+        params![run_id, me, FOREGROUND_STATUS, STATUS_REQUESTED],
+    )?;
+    Ok(n == 1)
+}
+
+/// What happened when a claimed session was handed to Herdr.
+///
+/// `Ok(scratch)` records where its prompt lives. `Err(reason)` turns the
+/// receipt into `failed` with the helper's own words, and never reopens it:
+/// a failed handoff is not retried, because a dropped reply doesn't prove the
+/// tab didn't open. Both move `finished_at`, so the outcome travels.
+pub fn record_session_launch(
+    conn: &Connection,
+    run_id: &str,
+    outcome: Result<&str, &str>,
+) -> Result<(), AppError> {
+    match outcome {
+        Ok(scratch) => conn.execute(
+            "UPDATE task_runs SET scratch_dir = ?2, finished_at = datetime('now')
+              WHERE id = ?1 AND status = ?3",
+            params![run_id, scratch, FOREGROUND_STATUS],
+        )?,
+        Err(reason) => conn.execute(
+            "UPDATE task_runs SET status = 'failed', result_text = ?2, finished_at = datetime('now')
+              WHERE id = ?1 AND mode = 'foreground' AND status = ?3
+                AND COALESCE(result_text, '') = ''",
+            params![run_id, reason, FOREGROUND_STATUS],
+        )?,
+    };
+    Ok(())
+}
+
+/// Put back an outcome this machine already recorded, onto a row a pull has
+/// reverted to `requested`.
+///
+/// A pull takes the hub's row unconditionally, so a claim made in the second
+/// between this host's sweep and its pull is overwritten by the hub's older
+/// `requested` (invariant 32's "still open" window). Claiming it again would
+/// open a SECOND session. The runner keeps a local note of every claim it made
+/// and calls this instead; the stamps move to now, so the outcome travels on
+/// the next push. Only a row still at `requested` is touched.
+pub fn reassert_session(
+    conn: &Connection,
+    run_id: &str,
+    failure: Option<&str>,
+) -> Result<bool, AppError> {
+    let n = match failure {
+        None => conn.execute(
+            "UPDATE task_runs
+                SET status = ?2, started_at = datetime('now'), finished_at = datetime('now')
+              WHERE id = ?1 AND status = ?3 AND mode = 'foreground'",
+            params![run_id, FOREGROUND_STATUS, STATUS_REQUESTED],
+        )?,
+        Some(reason) => conn.execute(
+            "UPDATE task_runs
+                SET status = 'failed', result_text = ?2, finished_at = datetime('now')
+              WHERE id = ?1 AND status = ?3 AND mode = 'foreground'",
+            params![run_id, reason, STATUS_REQUESTED],
+        )?,
+    };
+    Ok(n == 1)
+}
+
+/// Refuse a request addressed to `me` without opening it, with the reason.
+pub fn refuse_session(conn: &Connection, run_id: &str, me: &str, reason: &str) -> Result<bool, AppError> {
+    let n = conn.execute(
+        "UPDATE task_runs SET status = 'failed', result_text = ?3, finished_at = datetime('now')
+          WHERE id = ?1 AND status = ?4 AND mode = 'foreground' AND host = ?2",
+        params![run_id, me, reason, STATUS_REQUESTED],
+    )?;
+    Ok(n == 1)
+}
+
+/// Fail every request nobody opened in time, naming the machine it waited for.
+///
+/// The target gives up on its own requests at [`SESSION_REQUEST_MINUTES`];
+/// any other machine at [`SESSION_REQUEST_FOREIGN_MINUTES`], which is what
+/// tells the phone something when the target's runner is down. Cheap, costs no
+/// tokens, and runs on every tick whatever the switches say.
+pub fn expire_session_requests(conn: &Connection, me: &str) -> Result<usize, AppError> {
+    let n = conn.execute(
+        &format!(
+            "UPDATE task_runs
+                SET status = 'failed',
+                    finished_at = datetime('now'),
+                    result_text = COALESCE(
+                        (SELECT label FROM hosts WHERE hosts.id = task_runs.host),
+                        host, 'The machine'
+                    ) || ' didn''t pick this up within {SESSION_REQUEST_MINUTES} minutes, so '
+                      || 'nothing was opened. Is its runner running?'
+              WHERE status = ?1 AND mode = 'foreground'
+                AND (
+                      (host = ?2
+                       AND datetime(started_at) < datetime('now', '-{SESSION_REQUEST_MINUTES} minutes'))
+                   OR (COALESCE(host, '') <> ?2
+                       AND datetime(started_at) < datetime('now', '-{SESSION_REQUEST_FOREIGN_MINUTES} minutes'))
+                )"
+        ),
+        params![STATUS_REQUESTED, me],
+    )?;
+    if n > 0 {
+        log::info!("failed {n} session request(s) nobody opened in time");
+    }
+    Ok(n)
 }
 
 /// Write text onto a run's `result_text` without reopening the row.
