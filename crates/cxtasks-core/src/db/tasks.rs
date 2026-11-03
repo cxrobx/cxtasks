@@ -1388,6 +1388,10 @@ pub struct ViewCounts {
     pub upcoming: i64,
     pub waiting: i64,
     pub in_review: i64,
+    /// Today's rows whose due instant has PASSED — the phone's urgency pill.
+    /// A subset of `today`, so `today - overdue` is what's due later today.
+    /// New in 2026-11; a client that predates it ignores the key.
+    pub overdue: i64,
 }
 
 pub fn view_counts(conn: &Connection) -> Result<ViewCounts, AppError> {
@@ -1403,6 +1407,21 @@ pub fn view_counts(conn: &Connection) -> Result<ViewCounts, AppError> {
     };
     let count = |view: View| -> Result<i64, AppError> { Ok(rows(view)?.len() as i64) };
     let waiting = count(View::Waiting)?;
+    let today_rows = rows(View::Today)?;
+    // Through SQLite's datetime(), both operands wrapped (invariant 1): due
+    // dates are stored in more than one shape, and a byte-wise or a
+    // hand-parsed compare gets one of them wrong.
+    let mut overdue = 0i64;
+    for due in today_rows.iter().filter_map(|t| t.due_at.as_deref()) {
+        let past: bool = conn.query_row(
+            "SELECT COALESCE(datetime(?1) < datetime('now'), 0)",
+            [due],
+            |r| r.get(0),
+        )?;
+        if past {
+            overdue += 1;
+        }
+    }
     Ok(ViewCounts {
         // The Inbox view's length, like every other badge. It used to filter
         // the view's rows down to the project-less ones, because the view held
@@ -1411,7 +1430,8 @@ pub fn view_counts(conn: &Connection) -> Result<ViewCounts, AppError> {
         // badge and the header are one number and draining the Inbox means
         // exactly what the badge says: give each row a home or a date.
         inbox: count(View::Inbox)?,
-        today: count(View::Today)?,
+        today: today_rows.len() as i64,
+        overdue,
         // Legacy key, same number as `waiting` — see the field's comment.
         upcoming: waiting,
         waiting,
@@ -4647,6 +4667,23 @@ mod tests {
         // And Waiting still round-trips under its own name, which the alias
         // must not steal: serde serializes the variant, never the alias.
         assert_eq!(serde_json::to_string(&View::Waiting).unwrap(), "\"waiting\"");
+    }
+
+    /// `overdue` counts Today's rows whose due instant has passed, in either
+    /// stored shape, and nothing undated or due far ahead.
+    #[test]
+    fn overdue_counts_only_past_due_rows_of_today() {
+        let conn = test_conn();
+        let iso = seed(&conn, "late, iso");
+        let sqlite = seed(&conn, "late, sqlite shape");
+        let ahead = seed(&conn, "due far ahead");
+        let _undated = seed(&conn, "undated");
+        conn.execute("UPDATE tasks SET due_at = '2020-01-01T09:00:00.000Z' WHERE id = ?1", params![iso.id]).unwrap();
+        conn.execute("UPDATE tasks SET due_at = '2020-01-02 09:00:00' WHERE id = ?1", params![sqlite.id]).unwrap();
+        conn.execute("UPDATE tasks SET due_at = '2099-01-01T09:00:00.000Z' WHERE id = ?1", params![ahead.id]).unwrap();
+        let counts = view_counts(&conn).unwrap();
+        assert_eq!(counts.overdue, 2);
+        assert!(counts.today >= counts.overdue, "overdue is a subset of today");
     }
 
     /// The legacy `upcoming` count key is a copy of `waiting`, not a second
