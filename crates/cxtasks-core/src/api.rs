@@ -446,7 +446,11 @@ pub fn dispatch(conn: &mut Connection, cmd: &str, args: &Value) -> Result<Value,
         // task, sync carries it there, and that machine's runner opens it in
         // Herdr (`runner::session`). The write is an ordinary row, so it
         // travels as a post-image like every other state change.
-        "request_session" => ok(crate::session::request(conn, &arg::<String>(args, "task_id")?)?),
+        "request_session" => ok(crate::session::request(
+            conn,
+            &arg::<String>(args, "task_id")?,
+            crate::session::SessionTarget::parse(opt::<String>(args, "target")?.as_deref())?,
+        )?),
         // Canonical, unlike its foreground sibling: queueing is a database
         // write plus a set of guards, none of which need a human at the
         // machine. `queue_for_background` takes a connection-lending closure

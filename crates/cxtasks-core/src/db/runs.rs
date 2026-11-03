@@ -368,11 +368,18 @@ fn fresh_request_sql() -> String {
 /// **Idempotent per task**: a second tap while a fresh request is still waiting
 /// returns that one, so a double tap can't open two sessions. A request too old
 /// to be opened doesn't count, and is left for [`expire_session_requests`].
+/// `target` is where the session opens, kept in `session_id`, which an
+/// interactive request otherwise never uses: NULL is Herdr (the original, and
+/// what a runner that predates the choice does with any request), and
+/// [`SESSION_TARGET_T3`] is a T3 Code thread. Once the thread exists the runner
+/// rewrites it to `t3:<thread id>` ([`record_session_ref`]). A double tap
+/// returns the waiting request whatever target it asked for.
 pub fn request_session(
     conn: &Connection,
     task_id: &str,
     host: &str,
     intent: BackgroundIntent,
+    target: Option<&str>,
 ) -> Result<TaskRun, AppError> {
     let existing: Option<String> = conn
         .query_row(
@@ -393,9 +400,9 @@ pub fn request_session(
             // No heartbeat: nothing is executing, and the sweep never looks at
             // a foreground row anyway.
             conn.execute(
-                "INSERT INTO task_runs (id, task_id, mode, status, executor, intent, host)
-                 VALUES (?1, ?2, 'foreground', ?3, ?4, ?5, ?6)",
-                params![id, task_id, STATUS_REQUESTED, BackgroundExecutor::Claude, intent, host],
+                "INSERT INTO task_runs (id, task_id, mode, status, executor, intent, host, session_id)
+                 VALUES (?1, ?2, 'foreground', ?3, ?4, ?5, ?6, ?7)",
+                params![id, task_id, STATUS_REQUESTED, BackgroundExecutor::Claude, intent, host, target],
             )?;
             id
         }
@@ -464,6 +471,21 @@ pub fn record_session_launch(
             params![run_id, reason, FOREGROUND_STATUS],
         )?,
     };
+    Ok(())
+}
+
+/// The `session_id` of a request for a T3 Code thread, before the thread exists.
+pub const SESSION_TARGET_T3: &str = "t3";
+
+/// Where a launched session lives, e.g. `t3:<thread id>`, so the run says which
+/// thread to open. Moves `finished_at` like every other transition, or the
+/// reference would never leave this machine (invariant 32).
+pub fn record_session_ref(conn: &Connection, run_id: &str, session_ref: &str) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE task_runs SET session_id = ?2, finished_at = datetime('now')
+          WHERE id = ?1 AND mode = 'foreground' AND status = ?3",
+        params![run_id, session_ref, FOREGROUND_STATUS],
+    )?;
     Ok(())
 }
 

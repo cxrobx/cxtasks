@@ -436,7 +436,7 @@ mod tests {
         let mut hub = seeded();
         let task: String = hub.query_row("SELECT id FROM tasks", [], |r| r.get(0)).unwrap();
         let run = crate::db::runs::request_session(
-            &hub, &task, "mini", crate::intent::BackgroundIntent::Work,
+            &hub, &task, "mini", crate::intent::BackgroundIntent::Work, None,
         )
         .unwrap();
         hub.execute("UPDATE task_runs SET started_at = '2026-11-02 07:00:00'", []).unwrap();

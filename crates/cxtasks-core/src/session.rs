@@ -130,6 +130,52 @@ pub struct SessionRequest {
     pub warning: Option<String>,
 }
 
+/// Where an interactive session opens on the machine that runs the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTarget {
+    /// A fresh Claude tab in the task's Herdr space (`cx-open-in-herdr`).
+    Herdr,
+    /// A new T3 Code thread in the task's repo, or in the one "CXTasks"
+    /// project for a task with no repo (`t3 thread start`).
+    T3,
+}
+
+impl SessionTarget {
+    /// From the verb's optional `target` argument. Absent is Herdr, the
+    /// original behaviour, so an older phone keeps getting what it always did.
+    pub fn parse(raw: Option<&str>) -> Result<Self, AppError> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("herdr") => Ok(Self::Herdr),
+            Some("t3") => Ok(Self::T3),
+            Some(other) => Err(AppError::Validation(format!(
+                "unknown session target '{other}'; use 'herdr' or 't3'"
+            ))),
+        }
+    }
+
+    /// Read back off a run row's `session_id` (`db::runs::request_session`).
+    pub fn of_run(session_id: Option<&str>) -> Self {
+        match session_id {
+            Some(s) if s == db::runs::SESSION_TARGET_T3 || s.starts_with("t3:") => Self::T3,
+            _ => Self::Herdr,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Herdr => "Herdr",
+            Self::T3 => "T3 Code",
+        }
+    }
+
+    fn column(self) -> Option<&'static str> {
+        match self {
+            Self::Herdr => None,
+            Self::T3 => Some(db::runs::SESSION_TARGET_T3),
+        }
+    }
+}
+
 /// The machine whose Herdr a session for `task` belongs in: the one it names
 /// in Run on, else the one that takes unassigned work (invariant 30). The same
 /// machine its background runs would use, so the session opens on the
@@ -177,7 +223,11 @@ pub fn target_host(conn: &rusqlite::Connection, task: &Task) -> Result<HostCapab
 /// Refuses a task that is done, archived or in the Trash, and a target that
 /// could never open one. A second request while one is waiting returns the
 /// waiting one.
-pub fn request(conn: &rusqlite::Connection, task_ref: &str) -> Result<SessionRequest, AppError> {
+pub fn request(
+    conn: &rusqlite::Connection,
+    task_ref: &str,
+    target: SessionTarget,
+) -> Result<SessionRequest, AppError> {
     let task = db::tasks::resolve_ref(conn, task_ref)?
         .ok_or_else(|| AppError::NotFound(format!("task {task_ref} not found")))?;
     let name = task
@@ -200,7 +250,11 @@ pub fn request(conn: &rusqlite::Connection, task_ref: &str) -> Result<SessionReq
         )));
     }
     let host = target_host(conn, &task)?;
-    let run = db::runs::request_session(conn, &task.id, &host.id, task.bg_intent)?;
+    let run =
+        db::runs::request_session(conn, &task.id, &host.id, task.bg_intent, target.column())?;
+    // A double tap returns the waiting request, which may have asked for the
+    // other target; say what will actually open.
+    let target = SessionTarget::of_run(run.session_id.as_deref());
     let warning = (!host.is_alive(db::hosts::HOST_STALE_MINUTES)).then(|| {
         format!(
             "{} hasn't checked in recently, so its runner may be off. The request lapses \
@@ -211,8 +265,9 @@ pub fn request(conn: &rusqlite::Connection, task_ref: &str) -> Result<SessionReq
     });
     Ok(SessionRequest {
         message: format!(
-            "Requested on {}. It opens in Herdr there within a few minutes.",
-            host.label
+            "Requested on {}. It opens in {} there within a few minutes.",
+            host.label,
+            target.label()
         ),
         warning,
         host_id: host.id,
@@ -254,6 +309,119 @@ pub fn open_here(task: &Task, label: &str) -> Result<PathBuf, String> {
         .stdin(Stdio::null());
     run_bounded(command, ROUTER_TIMEOUT)?;
     Ok(scratch)
+}
+
+/// The `t3` CLI. launchd's PATH has no Homebrew, so look where it installs.
+pub fn t3_cli() -> Option<PathBuf> {
+    ["/opt/homebrew/bin/t3", "/usr/local/bin/t3"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+/// The folder behind the single "CXTasks" T3 project that every repo-less
+/// session opens in, so T3's project list doesn't grow an entry per task.
+pub fn t3_inbox_dir() -> PathBuf {
+    crate::paths::app_data_dir().join("t3-sessions")
+}
+
+/// What a launch left behind: the scratch folder holding its prompt, and where
+/// the session lives when that isn't implied (`t3:<thread id>`).
+#[derive(Debug, Clone)]
+pub struct Launched {
+    pub scratch: PathBuf,
+    pub session_ref: Option<String>,
+}
+
+/// Open `task` as a new T3 Code thread on THIS machine, with the same prompt a
+/// Herdr session gets. Returns the thread, or the reason nothing opened.
+///
+/// The thread runs in the task's repo when it has one here; otherwise in the
+/// one CXTasks project. A folder T3 doesn't know yet is added as a project
+/// first, because `thread start` only takes a path inside an existing one.
+pub fn open_t3_here(task: &Task, label: &str) -> Result<Launched, String> {
+    let t3 = t3_cli()
+        .ok_or_else(|| format!("T3 Code's `t3` CLI isn't installed on {label}, so nothing was opened."))?;
+    let has_repo = task.repo_path.as_deref().is_some_and(|p| !p.trim().is_empty());
+    let project = if has_repo {
+        resolve_repo_or_home(task).map_err(|e| e.to_string())?
+    } else {
+        let dir = t3_inbox_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        dir
+    };
+    // The prompt is built for the task's own folder (repo or scratch), exactly
+    // as for Herdr, and kept in the scratch folder for the record.
+    let prompt_cwd = foreground_repo(task, true, None).map_err(|e| e.to_string())?;
+    let scratch = write_scratch(task, &prompt_cwd, PromptTarget::Foreground, None)
+        .map_err(|e| e.to_string())?;
+    let prompt = std::fs::read_to_string(scratch.join("prompt.txt"))
+        .map_err(|e| format!("Could not read the session prompt: {e}"))?;
+    let title = match task.short_id {
+        Some(n) => format!("T{n}: {}", task.title),
+        None => task.title.clone(),
+    };
+
+    let start = || {
+        let mut c = Command::new(&t3);
+        c.arg("thread").arg("start").arg("--title").arg(&title).arg(&project).arg("-");
+        c.env("PATH", crate::runner::providers::agent_path());
+        run_capture(c, Some(&prompt), T3_TIMEOUT)
+    };
+    let id = match start() {
+        Ok(out) => out,
+        Err(first) if first.to_lowercase().contains("project") => {
+            let mut add = Command::new(&t3);
+            add.arg("project").arg("add").arg(&project);
+            if !has_repo {
+                add.arg("--title").arg("CXTasks");
+            }
+            add.env("PATH", crate::runner::providers::agent_path());
+            run_capture(add, None, T3_TIMEOUT)
+                .map_err(|e| format!("Could not add {} to T3 Code: {e}", project.display()))?;
+            start().map_err(|e| format!("Could not start a T3 Code thread: {e}"))?
+        }
+        Err(e) => return Err(format!("Could not start a T3 Code thread: {e}")),
+    };
+    let thread = id.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
+    if thread.is_empty() {
+        return Err("T3 Code started no thread and said nothing about why.".into());
+    }
+    Ok(Launched { scratch, session_ref: Some(format!("t3:{thread}")) })
+}
+
+/// The longest the runner waits on `t3`. Starting a thread is one local call.
+const T3_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run a command, feeding `stdin`, and return its stdout, or its stderr as
+/// the reason when it fails.
+fn run_capture(mut command: Command, stdin: Option<&str>, limit: Duration) -> Result<String, String> {
+    use std::io::Write as _;
+    command
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("could not run it: {e}"))?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = pipe.write_all(text.as_bytes());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(Ok(out)) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let out_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Err(if !err.is_empty() { err } else if !out_text.is_empty() { out_text } else {
+                "it failed without saying why".into()
+            })
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        // Not retried: a command that went quiet may still have started it.
+        Err(_) => Err(format!("it didn't answer within {}s", limit.as_secs())),
+    }
 }
 
 /// Run the helper, keeping its stderr as the reason when it fails.
@@ -323,7 +491,7 @@ mod tests {
         register(&c, "mini", "Mac mini", true, true);
         register(&c, "laptop", "MacBook", true, false);
         let t = task(&c, None);
-        let req = request(&c, &t.id).unwrap();
+        let req = request(&c, &t.id, SessionTarget::Herdr).unwrap();
         assert_eq!(req.host_id, "mini");
         assert_eq!(req.run.status, db::runs::STATUS_REQUESTED);
         assert_eq!(req.run.mode, "foreground");
@@ -338,7 +506,7 @@ mod tests {
         register(&c, "mini", "Mac mini", true, true);
         register(&c, "laptop", "MacBook", true, false);
         let t = task(&c, Some("laptop"));
-        let req = request(&c, &format!("T{}", t.short_id.unwrap())).unwrap();
+        let req = request(&c, &format!("T{}", t.short_id.unwrap()), SessionTarget::Herdr).unwrap();
         assert_eq!(req.host_id, "laptop");
     }
 
@@ -347,8 +515,8 @@ mod tests {
         let c = conn();
         register(&c, "mini", "Mac mini", true, true);
         let t = task(&c, None);
-        let a = request(&c, &t.id).unwrap();
-        let b = request(&c, &t.id).unwrap();
+        let a = request(&c, &t.id, SessionTarget::Herdr).unwrap();
+        let b = request(&c, &t.id, SessionTarget::Herdr).unwrap();
         assert_eq!(a.run.id, b.run.id);
         let n: i64 = c.query_row("SELECT COUNT(*) FROM task_runs", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
@@ -360,15 +528,15 @@ mod tests {
         register(&c, "mini", "Mac mini", true, true);
         let done = task(&c, None);
         crate::recurrence::complete_with_recurrence(&c, &done.id, None).unwrap();
-        assert!(request(&c, &done.id).unwrap_err().to_string().contains("is done"));
+        assert!(request(&c, &done.id, SessionTarget::Herdr).unwrap_err().to_string().contains("is done"));
 
         let archived = task(&c, None);
         db::tasks::archive(&c, &archived.id).unwrap();
-        assert!(request(&c, &archived.id).unwrap_err().to_string().contains("archived"));
+        assert!(request(&c, &archived.id, SessionTarget::Herdr).unwrap_err().to_string().contains("archived"));
 
         let trashed = task(&c, None);
         db::tasks::trash(&c, &trashed.id).unwrap();
-        assert!(request(&c, &trashed.id).unwrap_err().to_string().contains("Trash"));
+        assert!(request(&c, &trashed.id, SessionTarget::Herdr).unwrap_err().to_string().contains("Trash"));
 
         let n: i64 = c.query_row("SELECT COUNT(*) FROM task_runs", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "a refusal records nothing");
@@ -379,20 +547,20 @@ mod tests {
         let c = conn();
         let t = task(&c, None);
         assert!(
-            request(&c, &t.id).unwrap_err().to_string().contains("No machine takes unassigned"),
+            request(&c, &t.id, SessionTarget::Herdr).unwrap_err().to_string().contains("No machine takes unassigned"),
             "an empty registry"
         );
 
         register(&c, "mini", "Mac mini", true, true);
         register(&c, "nas", "the NAS", false, false);
         let on_nas = task(&c, Some("nas"));
-        assert!(request(&c, &on_nas.id).unwrap_err().to_string().contains("no checkouts"));
+        assert!(request(&c, &on_nas.id, SessionTarget::Herdr).unwrap_err().to_string().contains("no checkouts"));
 
         let gone = task(&c, Some("retired-host"));
-        assert!(request(&c, &gone.id).unwrap_err().to_string().contains("no longer exists"));
+        assert!(request(&c, &gone.id, SessionTarget::Herdr).unwrap_err().to_string().contains("no longer exists"));
 
         c.execute("UPDATE hosts SET paused = 1 WHERE id = 'mini'", []).unwrap();
-        assert!(request(&c, &t.id).unwrap_err().to_string().contains("paused on Mac mini"));
+        assert!(request(&c, &t.id, SessionTarget::Herdr).unwrap_err().to_string().contains("paused on Mac mini"));
     }
 
     #[test]
@@ -401,7 +569,7 @@ mod tests {
         register(&c, "mini", "Mac mini", true, true);
         c.execute("UPDATE hosts SET last_seen_at = datetime('now', '-2 hours')", []).unwrap();
         let t = task(&c, None);
-        let req = request(&c, &t.id).unwrap();
+        let req = request(&c, &t.id, SessionTarget::Herdr).unwrap();
         assert!(req.warning.unwrap().contains("hasn't checked in"));
     }
 
@@ -454,5 +622,29 @@ mod tests {
         hangs.args(["-c", "sleep 5"]);
         assert!(run_bounded(hangs, Duration::from_millis(200)).unwrap_err().contains("didn't answer"));
         assert!(run_bounded(Command::new("/usr/bin/true"), Duration::from_secs(10)).is_ok());
+    }
+
+    #[test]
+    fn the_target_parses_and_defaults_to_herdr() {
+        assert_eq!(SessionTarget::parse(None).unwrap(), SessionTarget::Herdr);
+        assert_eq!(SessionTarget::parse(Some("herdr")).unwrap(), SessionTarget::Herdr);
+        assert_eq!(SessionTarget::parse(Some("t3")).unwrap(), SessionTarget::T3);
+        assert!(SessionTarget::parse(Some("tmux")).is_err());
+        assert_eq!(SessionTarget::of_run(None), SessionTarget::Herdr);
+        assert_eq!(SessionTarget::of_run(Some("t3")), SessionTarget::T3);
+        assert_eq!(SessionTarget::of_run(Some("t3:abc")), SessionTarget::T3);
+    }
+
+    #[test]
+    fn a_t3_request_says_t3_and_a_double_tap_keeps_the_first_target() {
+        let c = conn();
+        register(&c, "mini", "Mac mini", true, true);
+        let t = task(&c, None);
+        let a = request(&c, &t.id, SessionTarget::T3).unwrap();
+        assert!(a.message.contains("T3 Code"), "{}", a.message);
+        assert_eq!(a.run.session_id.as_deref(), Some("t3"));
+        let b = request(&c, &t.id, SessionTarget::Herdr).unwrap();
+        assert_eq!(a.run.id, b.run.id);
+        assert!(b.message.contains("T3 Code"), "says what will actually open: {}", b.message);
     }
 }

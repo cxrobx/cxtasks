@@ -1543,7 +1543,11 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
         &cap,
         refusal.as_deref(),
         &session::claims_dir(),
-        |task| crate::session::open_here(task, &label),
+        |task, target| match target {
+            crate::session::SessionTarget::Herdr => crate::session::open_here(task, &label)
+                .map(|scratch| crate::session::Launched { scratch, session_ref: None }),
+            crate::session::SessionTarget::T3 => crate::session::open_t3_here(task, &label),
+        },
     ) {
         Ok(0) => {}
         Ok(n) => log::info!("runner: opened {n} requested session(s) in Herdr"),

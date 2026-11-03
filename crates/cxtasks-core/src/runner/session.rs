@@ -70,7 +70,7 @@ pub fn session_pass<F>(
     mut open: F,
 ) -> Result<usize, AppError>
 where
-    F: FnMut(&Task) -> Result<PathBuf, String>,
+    F: FnMut(&Task, crate::session::SessionTarget) -> Result<crate::session::Launched, String>,
 {
     db::runs::expire_session_requests(conn, &cap.id)?;
     let pending = db::runs::pending_session_requests(conn, &cap.id)?;
@@ -126,9 +126,17 @@ where
             // itself is still claimed exactly once.
             log::warn!("session: could not note the claim of run {}: {e}", run.id);
         }
-        match open(&task) {
-            Ok(scratch) => {
-                db::runs::record_session_launch(conn, &run.id, Ok(&scratch.to_string_lossy()))?;
+        let target = crate::session::SessionTarget::of_run(run.session_id.as_deref());
+        match open(&task, target) {
+            Ok(launched) => {
+                db::runs::record_session_launch(
+                    conn,
+                    &run.id,
+                    Ok(&launched.scratch.to_string_lossy()),
+                )?;
+                if let Some(session_ref) = &launched.session_ref {
+                    db::runs::record_session_ref(conn, &run.id, session_ref)?;
+                }
                 // As the app's dispatch does: opening a session starts the work.
                 db::tasks::update(
                     conn,
@@ -138,7 +146,12 @@ where
                         ..Default::default()
                     },
                 )?;
-                log::info!("session: opened task {} in Herdr (run {})", task.id, run.id);
+                log::info!(
+                    "session: opened task {} in {} (run {})",
+                    task.id,
+                    target.label(),
+                    run.id
+                );
                 opened += 1;
             }
             Err(reason) => {
@@ -213,7 +226,7 @@ mod tests {
     fn requested(f: &Fixture, host: &str) -> (String, String) {
         let task = create(&f.conn, &NewTask { title: "Fix the login bug".into(), ..Default::default() })
             .unwrap();
-        let run = runs::request_session(&f.conn, &task.id, host, task.bg_intent).unwrap();
+        let run = runs::request_session(&f.conn, &task.id, host, task.bg_intent, None).unwrap();
         (task.id, run.id)
     }
 
@@ -230,6 +243,43 @@ mod tests {
             .unwrap();
     }
 
+    /// The existing tests' launches are Herdr launches that return a scratch
+    /// folder; this adapts them to the lane's target-aware signature.
+    fn herdr<F: Fn(&Task) -> Result<PathBuf, String>>(
+        open: F,
+    ) -> impl FnMut(&Task, crate::session::SessionTarget) -> Result<crate::session::Launched, String> {
+        move |t, target| {
+            assert_eq!(target, crate::session::SessionTarget::Herdr, "these requests asked for Herdr");
+            open(t).map(|scratch| crate::session::Launched { scratch, session_ref: None })
+        }
+    }
+
+    #[test]
+    fn a_t3_request_opens_a_t3_thread_and_records_which_one() {
+        let f = fixture();
+        let task = db::tasks::create(&f.conn, &db::tasks::NewTask {
+            title: "t3 one".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let run = runs::request_session(
+            &f.conn, &task.id, "mini", task.bg_intent, Some(runs::SESSION_TARGET_T3),
+        )
+        .unwrap();
+        let open = |_: &Task, target: crate::session::SessionTarget| {
+            assert_eq!(target, crate::session::SessionTarget::T3);
+            Ok(crate::session::Launched {
+                scratch: PathBuf::from("/scratch/t3"),
+                session_ref: Some("t3:thread-123".into()),
+            })
+        };
+        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap(), 1);
+        let row = runs::get(&f.conn, &run.id).unwrap().unwrap();
+        assert_eq!(row.status, runs::FOREGROUND_STATUS);
+        assert_eq!(row.session_id.as_deref(), Some("t3:thread-123"));
+        assert_eq!(row.scratch_dir.as_deref(), Some("/scratch/t3"));
+    }
+
     fn opens_ok(_: &Task) -> Result<PathBuf, String> {
         Ok(PathBuf::from("/scratch/t"))
     }
@@ -243,7 +293,7 @@ mod tests {
             *calls.borrow_mut() += 1;
             Ok(PathBuf::from("/scratch/t"))
         };
-        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap(), 1);
+        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open)).unwrap(), 1);
         let row = runs::get(&f.conn, &run).unwrap().unwrap();
         assert_eq!(row.status, runs::FOREGROUND_STATUS);
         assert!(row.finished_at.is_some(), "terminal, like the app's own dispatch");
@@ -255,7 +305,7 @@ mod tests {
             *calls.borrow_mut() += 1;
             Ok(PathBuf::from("/x"))
         };
-        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open_again).unwrap(), 0);
+        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open_again)).unwrap(), 0);
         assert_eq!(*calls.borrow(), 1);
     }
 
@@ -275,7 +325,7 @@ mod tests {
         let f = fixture();
         let (_, run) = requested(&f, "mini");
         let open = |_: &Task| -> Result<PathBuf, String> { panic!("the laptop must not open the mini's session") };
-        assert_eq!(session_pass(&f.conn, &host(&f, "laptop"), None, &f.claims, open).unwrap(), 0);
+        assert_eq!(session_pass(&f.conn, &host(&f, "laptop"), None, &f.claims, herdr(open)).unwrap(), 0);
         assert_eq!(status(&f, &run), STATUS_REQUESTED);
     }
 
@@ -288,7 +338,7 @@ mod tests {
             *calls.borrow_mut() += 1;
             Err("Could not open Claude in Herdr: Herdr isn't running on the Herdr host.".into())
         };
-        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open)).unwrap();
         let row = runs::get(&f.conn, &run).unwrap().unwrap();
         assert_eq!(row.status, "failed");
         assert!(row.result_text.unwrap().contains("Herdr isn't running"));
@@ -298,7 +348,7 @@ mod tests {
             *calls.borrow_mut() += 1;
             Ok(PathBuf::from("/x"))
         };
-        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open)).unwrap();
         assert_eq!(*calls.borrow(), 1);
         assert_eq!(status(&f, &run), "failed");
     }
@@ -309,7 +359,7 @@ mod tests {
         let (_, run) = requested(&f, "mini");
         age(&f, &run, runs::SESSION_REQUEST_MINUTES + 1);
         let open = |_: &Task| -> Result<PathBuf, String> { panic!("a stale tap must not open") };
-        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap(), 0);
+        assert_eq!(session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open)).unwrap(), 0);
         let row = runs::get(&f.conn, &run).unwrap().unwrap();
         assert_eq!(row.status, "failed");
         let text = row.result_text.unwrap();
@@ -335,7 +385,7 @@ mod tests {
         let (_, run) = requested(&f, "mini");
         let reason = refusal_for(&Gate::Paused, "Mac mini").unwrap();
         let open = |_: &Task| -> Result<PathBuf, String> { panic!("paused means paused") };
-        session_pass(&f.conn, &host(&f, "mini"), Some(&reason), &f.claims, open).unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), Some(&reason), &f.claims, herdr(open)).unwrap();
         let row = runs::get(&f.conn, &run).unwrap().unwrap();
         assert_eq!(row.status, "failed");
         assert!(row.result_text.unwrap().contains("paused on Mac mini"));
@@ -350,7 +400,7 @@ mod tests {
         let (task, run) = requested(&f, "mini");
         crate::recurrence::complete_with_recurrence(&f.conn, &task, None).unwrap();
         let open = |_: &Task| -> Result<PathBuf, String> { panic!("closed work must not open") };
-        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open)).unwrap();
         assert_eq!(status(&f, &run), "failed");
     }
 
@@ -362,7 +412,7 @@ mod tests {
     fn a_row_a_pull_reverted_is_reasserted_not_opened_twice() {
         let f = fixture();
         let (_, run) = requested(&f, "mini");
-        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, opens_ok).unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(opens_ok)).unwrap();
 
         // The hub's copy arrives: back to requested, stamps as they were.
         f.conn
@@ -373,7 +423,7 @@ mod tests {
             )
             .unwrap();
         let open = |_: &Task| -> Result<PathBuf, String> { panic!("opened a second session") };
-        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, open).unwrap();
+        session_pass(&f.conn, &host(&f, "mini"), None, &f.claims, herdr(open)).unwrap();
         let row = runs::get(&f.conn, &run).unwrap().unwrap();
         assert_eq!(row.status, runs::FOREGROUND_STATUS);
         assert!(row.finished_at.is_some());
