@@ -244,36 +244,52 @@ pub fn handoff_tail(task: &Task, has_tools: bool) -> String {
         "START WITH ONE SENTENCE giving your VERDICT. That opening line is lifted verbatim \
          into the task's history and is the only thing shown before someone opens the full \
          text, so make it the judgement (\"Handoff is sound except step 3: \
-         lib/webhook.ts:88 has no retry to remove\"), not a restatement of the title. If you \
-         open with a markdown heading, put that sentence directly under it.\n\n"
+         lib/webhook.ts:88 has no retry to remove\"), not a restatement of the title. Do \
+         not open with a heading.\n\n"
     } else {
         "START WITH ONE SENTENCE saying what came of the run. That opening line is lifted \
          verbatim into the task's history and is the only thing shown before someone opens \
          the full text, so make it the outcome (\"Found the 429: a missing retry on \
-         lib/webhook.ts:88\"), not a restatement of the title. If you open with a markdown \
-         heading, put that sentence directly under it.\n\n"
+         lib/webhook.ts:88\"), not a restatement of the title. Do not open with a \
+         heading.\n\n"
     };
+    // **Two readers, so two parts** (2026-11-04). This used to ask for one
+    // handoff "for a fresh agent with none of your context" — complete, cited,
+    // every assumption listed — and that is what a person then read on a
+    // phone: a multi-section report with the one decision buried halfway down.
+    // The person needs a chat-length reply; the next run needs the record. The
+    // reply comes first and short; the record goes under `## Details`, which
+    // both apps fold away and `history_block` replays in full, so invariant
+    // 18's handoff loses nothing.
     s.push_str(
-        "Your FINAL MESSAGE is the result. It is captured automatically and written onto \
-         the task. Work runs report whether the result needs work, verification, or \
-         human review; review runs leave their verdict — nothing else you say \
-         survives this run.\n\n\
-         Write it as a HANDOFF, not a summary. Assume the reader is a fresh agent or a \
-         human with none of your context, working from the task alone.\n\n",
+        "Your FINAL MESSAGE is the result. It is captured automatically, shown to the \
+         person who asked (often on a phone), and replayed in full to the next run on this \
+         task. Work runs report whether the result needs work, verification, or human \
+         review; review runs leave their verdict — nothing else you say survives this \
+         run.\n\n\
+         Write it in TWO PARTS.\n\n\
+         THE REPLY, for the person. ",
     );
     s.push_str(opener);
     s.push_str(
-        "Then cover:\n\
-         - What you did, and what you found — with the sources, artifacts, observations, \
-         file paths or commands that matter, so nobody repeats the work.\n\
+        "Then at most five short bullets: what you found or changed, and what is left. \
+         Plain sentences — no tables, no headings, no lists of file paths in this part. If \
+         the person must decide something, ask it in ONE line here and put the choices in \
+         the report's `question` when the report asks for one. Stop there: every line \
+         above the details is one they have to read.\n\n\
+         THE DETAILS, for the next run. A line `## Details`, then everything someone \
+         without your context needs so nobody repeats the work:\n\
+         - What you did and found, with the sources, file paths and lines, and commands \
+         that matter.\n\
          - What you did NOT do, and why: out of scope, blocked, or you ran out of turns.\n\
          - The next concrete step, specific enough to act on.\n\
          - Every assumption you made, and anything you'd want to be wrong about.\n\
-         Say plainly if you couldn't finish. An honest partial handoff is worth more \
-         than a confident summary of an incomplete run.\n\n\
-         It renders as markdown in the app, so after the opening line use short \
-         sections, bullets or a table rather than one long paragraph, and put code, \
-         paths and commands in backticks (outside them `Vec<String>` shows as \"Vec\").\n",
+         The apps fold this section away, so be complete here and brief above. Say \
+         plainly if you couldn't finish — an honest partial result is worth more than a \
+         confident summary of an incomplete run.\n\n\
+         It renders as markdown: sections, bullets or a table are fine under Details, and \
+         code, paths and commands go in backticks (outside them `Vec<String>` shows as \
+         \"Vec\").\n",
     );
     // **The deliverable is where this would have shipped broken.** `investigating`
     // is true for every DEFAULT review — read-only is what arming one preselects
@@ -284,12 +300,12 @@ pub fn handoff_tail(task: &Task, has_tools: bool) -> String {
     // holding it pulls straight into fixing.
     match (reviewing, investigating) {
         (true, _) => s.push_str(
-            "\nThe VERDICT is the deliverable — not a better plan, and not the work. Write it \
-             as markdown: what the handoff got right, then each claim you found wrong or \
-             unverifiable with the evidence that settles it (the file and line you opened, the \
-             command you ran and what it printed), then what it missed. End with whether the \
-             next step it proposes is the one to take. If it is sound, say so in a sentence and \
-             stop — length is not the measure here.\n",
+            "\nThe VERDICT is the deliverable — not a better plan, and not the work. In the \
+             reply: the verdict, a bullet for each claim that changes it, and whether the \
+             next step it proposes is the one to take. Under Details: each claim you found \
+             wrong or unverifiable with the evidence that settles it (the file and line you \
+             opened, the command you ran and what it printed), then what it missed. If it is \
+             sound, say so in a sentence and stop — length is not the measure here.\n",
         ),
         (false, true) => s.push_str(
             "\nThis run has read-only access. Complete research, analysis, or planning when \

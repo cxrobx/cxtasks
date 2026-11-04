@@ -1061,7 +1061,7 @@ mod tests {
                     );
                 }
                 // The shared half — Codex asks for the same handoff Claude does.
-                assert!(p.contains("Write it as a HANDOFF"), "{shell}/{writes}");
+                assert!(p.contains("Write it in TWO PARTS"), "{shell}/{writes}");
             }
         }
     }

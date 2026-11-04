@@ -28,6 +28,13 @@ struct Report {
     /// its commit style, and what must stay out of a public repo's history.
     #[serde(default)]
     commit: Option<String>,
+    /// A decision only the person can make, as a choice (`CONTRACT`). Read by
+    /// the apps off the stored line, never here: it decides nothing for the
+    /// runner, and a malformed one must not cost the report — so it is kept
+    /// as raw JSON and validated where it is shown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    question: Option<serde_json::Value>,
 }
 
 pub struct Assessment {
@@ -154,6 +161,13 @@ when the result is prepared but a required check remains, listing that check in 
 verified lists only what you actually checked (it may be empty for incomplete work). Each \
 list may contain at most 20 short strings. The opening sentence must match this disposition: \
 say what remains up front when the task is incomplete.\n\n\
+If the remaining work waits on a decision only the person can make, add \"question\" to \
+that JSON: {\"text\":\"Show Request on the home cards too?\",\"options\":[{\"label\":\"Yes\",\
+\"description\":\"Compact cards get the button\"},{\"label\":\"No\",\"description\":\"Keep them \
+action-free\"}]}. One question, 2 to 4 options, each label under 40 characters, the one you \
+recommend first. The app shows it as choices to tap, and the answer comes back to the next run. \
+Only for a real choice between options, never to ask permission for the work you were asked \
+to do.\n\n\
 If you changed files in a repo, also add \"commit\" to that JSON: a commit message in this \
 repo's style, under 2000 characters, following its rules for what may appear in history. \
 The runner commits finished work itself, only the files you changed and only on \
@@ -162,6 +176,18 @@ ready_for_review, so do not run git commit or git push unless the task asks for 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_rides_on_the_report_and_never_costs_it() {
+        let asked = "Needs one call from you.\nCXTASKS_RESULT: {\"status\":\"needs_action\",\"verified\":[],\
+\"remaining\":[\"Decide the home cards\"],\"question\":{\"text\":\"Home cards too?\",\
+\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"}]}}";
+        assert_eq!(assess(asked).status, NEEDS_ACTION, "a question is not an unknown field");
+        // A malformed question is the apps' problem to skip, not a broken report.
+        let odd = "Done.\nCXTASKS_RESULT: {\"status\":\"ready_for_review\",\"verified\":[\"ran it\"],\
+\"remaining\":[],\"question\":\"just a string\"}";
+        assert_eq!(assess(odd).status, READY);
+    }
 
     #[test]
     fn the_commit_message_comes_from_the_report_and_never_blocks_it() {

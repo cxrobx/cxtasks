@@ -264,7 +264,14 @@ independent certification of correctness.
     it.** The three halves of that sentence are three separate mechanisms, and
     the feature is worthless if any one of them is missing.
 
-    **Ask for a handoff, not a summary.** The background tail used to end "End
+    **Ask for a handoff, not a summary — in two parts** (since 2026-11-04). The
+    final message is a short REPLY for the person (one outcome sentence, at most
+    five bullets, any decision as the report's `question` with 2–4 options), then
+    `## Details` holding the full handoff below. Both apps fold Details and show
+    the question as choices (the phone's are tappable and reply on the task);
+    `history_block` replays the whole text, so the next run loses nothing. One
+    long handoff "for a fresh agent" was what a person read on a phone, with the
+    one decision buried mid-report. The background tail used to end "End
     with a short summary", which optimised the *one* artifact that has to carry
     everything the run learned. `providers::claude::handoff_tail` — shared
     verbatim by both providers, because what makes a good handoff has nothing to
@@ -937,11 +944,14 @@ The request is a ROW instead, and the machine it names opens it.
   session opened, a failure or refusal stamps `finished_at`. So the claim wins at
   the hub over the hub's own `requested`, and an older re-send can't put it back
   (`sync::apply::tests::a_claimed_session_request_wins_at_the_hub_…`).
-* **Latency, tap to tab:** the hub write is immediate; the mini sees it at its
-  next reconcile, which is the app's 5-minute timer, or the runner's backstop
-  (checked every 60 s, fires once the last attempt is 6 minutes old) when the app
-  isn't running; then up to one 20 s tick. Typically 1–5 minutes, worst case about
-  7. The outcome reaches the phone one more reconcile later.
+* **Latency, tap to tab:** the hub write is immediate; the mini's runner sees it
+  within one `sync::auto::quick_pass` tick (20 s), which probes the hub's queue
+  and reconciles when it holds work this replica hasn't pulled, then up to one
+  20 s runner tick. Typically under a minute. Run activity here is pushed within
+  ~15 s (a minute apart while a run is in flight), so the outcome reaches the
+  phone about as fast. A session request is a `task_runs` row, not a queued
+  task, so the queue probe doesn't see it: it still waits for the ordinary
+  cadence, up to about 7 minutes.
 * **What reads it.** `sweep_abandoned`, `heal_foreground_runs`, the concurrency
   counts and `cancel_run` all filter `status = 'running'` or `mode = 'background'`,
   so a request is invisible to them (pinned by

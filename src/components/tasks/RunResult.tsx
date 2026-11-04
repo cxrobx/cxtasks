@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from "react";
 import { Markdown } from "@/components/shared/Markdown";
-import { splitRunCompletion } from "@/lib/runCompletion";
+import { splitDetails, splitRunCompletion } from "@/lib/runCompletion";
 
 /**
  * The tall-by-default cap this box opens at, in px — what `max-h-56` was.
@@ -32,6 +32,9 @@ const MIN_HEIGHT = 40;
 export function RunResult({ children }: { children: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const { text, completion } = splitRunCompletion(children);
+  // The reply is what a person reads; the record under `## Details` is for
+  // the next run, so it starts folded.
+  const { reply, details } = splitDetails(text);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -58,7 +61,26 @@ export function RunResult({ children }: { children: string }) {
           </ul>
         </div>
       )}
-      <Markdown className="text-[11px]">{text}</Markdown>
+      {completion?.question && (
+        <div className="mb-2 rounded border border-accent/25 bg-accent/5 px-2 py-1.5 text-[11px]">
+          <p className="font-medium text-content">{completion.question.text}</p>
+          <ul className="mt-1 space-y-0.5 text-content-secondary">
+            {completion.question.options.map((o, index) => (
+              <li key={index}>
+                <span className="font-medium text-accent">{o.label}</span>
+                {o.description ? ` — ${o.description}` : ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <Markdown className="text-[11px]">{reply}</Markdown>
+      {details && (
+        <details className="mt-2 text-[11px]">
+          <summary className="cursor-pointer text-content-muted">Details</summary>
+          <Markdown className="mt-1 text-[11px]">{details}</Markdown>
+        </details>
+      )}
       {completion && completion.verified.length > 0 && (
         <details className="mt-2 text-[11px] text-content-secondary">
           <summary className="cursor-pointer text-content-muted">Evidence reported</summary>

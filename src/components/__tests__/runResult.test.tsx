@@ -63,6 +63,17 @@ describe("RunResult", () => {
     expect(container.textContent!.indexOf("Still needed")).toBeLessThan(container.textContent!.indexOf("Prepared the report"));
   });
 
+  it("drops the runner's run-on first line, folds Details and shows the question", () => {
+    const report = '{"status":"needs_action","verified":[],"remaining":["Decide the home cards"],' +
+      '"question":{"text":"Home cards too?","options":[{"label":"Yes","description":"Compact cards get it"},{"label":"No"}]}}';
+    const { container } = render(<RunResult>{`Needs action: Decide the home cards\n\nAdded it to the show page.\n\n## Details\nweb/src/app/show/[id]/page.tsx:90\nCXTASKS_RESULT: ${report}`}</RunResult>);
+    expect(container.textContent).not.toContain("Needs action:");
+    expect(screen.getByText("Home cards too?")).toBeInTheDocument();
+    expect(screen.getByText("Yes")).toBeInTheDocument();
+    expect(screen.getByText("Details")).toBeInTheDocument();
+    expect(container.querySelector("details")?.textContent).toContain("page.tsx:90");
+  });
+
   it("keeps existing handoffs readable and hides malformed protocol footers", () => {
     const { container, rerender } = render(<RunResult>Existing research handoff.</RunResult>);
     expect(container).toHaveTextContent("Existing research handoff.");

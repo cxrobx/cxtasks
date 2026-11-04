@@ -1971,8 +1971,8 @@ mod tests {
                 "has_tools={has_tools}: the tail must not name a tool the run doesn't have: {tail}"
             );
             assert!(
-                tail.contains("HANDOFF"),
-                "has_tools={has_tools}: every background tail asks for a handoff"
+                tail.contains("THE DETAILS, for the next run"),
+                "has_tools={has_tools}: every background tail asks for a handoff (the Details part)"
             );
         }
         assert!(
@@ -2065,7 +2065,8 @@ mod tests {
         // The handoff ask is the SHARED half — same words whoever is reading,
         // because what makes a good handoff has nothing to do with the agent.
         for p in [&claude, &codex] {
-            assert!(p.contains("Write it as a HANDOFF, not a summary"), "{p}");
+            assert!(p.contains("Write it in TWO PARTS"), "{p}");
+            assert!(p.contains("## Details"), "{p}");
             assert!(p.contains("The next concrete step"), "{p}");
         }
     }
