@@ -152,6 +152,31 @@ impl HttpPeer {
     }
 }
 
+impl HttpPeer {
+    /// The ids the hub has queued — the runner's cheap "is there new work for
+    /// anyone?" look (`auto::quick_pass`). One `list_tasks` over `/rpc`, a few
+    /// hundred bytes when the queue is empty, instead of a snapshot. Short
+    /// timeout: it runs every 20 s, and a slow hub should cost a skipped look,
+    /// not a stalled thread.
+    pub fn queued_task_ids(&self) -> Result<Vec<String>, AppError> {
+        let body = serde_json::json!({
+            "cmd": "list_tasks",
+            "args": { "filters": { "status": "queued", "include_subtasks": true, "limit": 200 } },
+        });
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .post(&format!("{}/rpc", self.base))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .send_json(body);
+        let rows: Vec<Value> = Self::finish(resp)?;
+        Ok(rows
+            .iter()
+            .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect())
+    }
+}
+
 impl Peer for HttpPeer {
     fn info(&self) -> Result<PeerInfo, AppError> {
         self.get("/sync/info")

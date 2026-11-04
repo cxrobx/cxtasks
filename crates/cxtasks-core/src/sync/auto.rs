@@ -86,6 +86,151 @@ pub fn backstop_pass(conn: &mut Connection) -> Result<Option<ReconcileReport>, A
     pass(conn)
 }
 
+// ── The quick pass: sooner than five minutes when someone is waiting ────────
+//
+// The five-minute cadence is right for keeping replicas in step and wrong for
+// the one thing a person watches live: a request sent from the phone. That
+// request reaches the hub at once, but this host only SAW it at its next pull
+// (up to five minutes), and once its run started, the phone saw "Queued" until
+// the next push (up to five more) — the Ask thread read as hung while the
+// work was already going (T1120, 2026-11-04).
+//
+// So the runner's sync thread ticks every [`QUICK_TICK_SECONDS`] and
+// reconciles early for exactly three reasons, each cheap to detect:
+// * a run on THIS host started or finished since the last attempt,
+// * a run on this host is in flight and the last attempt is a minute old (the
+//   phone streams its trace from the hub),
+// * the hub holds queued work this replica doesn't know about — one small
+//   `list_tasks` query, not a snapshot.
+// Everything else still waits for the ordinary cadence.
+
+/// How often the runner's sync thread looks.
+pub const QUICK_TICK_SECONDS: u64 = 20;
+/// Never two attempts closer than this, whatever the reason.
+pub const QUICK_GAP_SECONDS: i64 = 15;
+/// While a run is in flight here, push its trace this often.
+pub const IN_FLIGHT_EVERY_SECONDS: i64 = 60;
+/// A hub/replica mismatch that one reconcile didn't settle is not re-chased
+/// before the ordinary cadence: a disagreement that persists is a sync
+/// question, and a loop reconciling every 20 s would only hide it.
+const SAME_MISMATCH_SECONDS: u64 = INTERVAL_SECONDS;
+
+/// Why a quick pass reconciled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickReason {
+    /// Nothing else has tried for over a cadence (the old backstop).
+    Backstop,
+    /// A run here started or finished since the last attempt.
+    RunChanged,
+    /// A run here is in flight; its trace goes up once a minute.
+    RunInFlight,
+    /// The hub has queued work this replica hasn't pulled.
+    NewWork,
+}
+
+/// The decisions that need only this database, in priority order. The hub
+/// probe is the caller's, because it is the one that costs a round trip.
+pub fn local_reason(
+    conn: &Connection,
+    last_attempt: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<QuickReason> {
+    if backstop_due(last_attempt, now) {
+        return Some(QuickReason::Backstop);
+    }
+    let last = last_attempt?;
+    let age = seconds_since(last, now);
+    if age < QUICK_GAP_SECONDS {
+        return None;
+    }
+    let host = crate::host::host_id();
+    if run_changed_since(conn, &host, last) {
+        return Some(QuickReason::RunChanged);
+    }
+    if age >= IN_FLIGHT_EVERY_SECONDS && running_here(conn, &host) {
+        return Some(QuickReason::RunInFlight);
+    }
+    None
+}
+
+fn seconds_since(stamp: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
+    crate::tripwire::parse_stamp(stamp)
+        .map(|at| (now - at).num_seconds())
+        .unwrap_or(i64::MAX)
+}
+
+/// Both operands through `datetime()` — run stamps are SQLite's, the attempt
+/// stamp is ISO with a `Z` (invariant 1).
+fn run_changed_since(conn: &Connection, host: &str, since: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_runs WHERE host = ?1 AND \
+           (datetime(started_at) > datetime(?2) OR datetime(finished_at) > datetime(?2)))",
+        rusqlite::params![host, since],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn running_here(conn: &Connection, host: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_runs WHERE host = ?1 AND status = 'running')",
+        [host],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+/// Queued on the hub, not queued here.
+pub fn unseen_queued(conn: &Connection, hub_queued: &[String]) -> std::collections::BTreeSet<String> {
+    let mut local = std::collections::BTreeSet::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id FROM tasks WHERE status = 'queued'") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            local.extend(rows.flatten());
+        }
+    }
+    hub_queued.iter().filter(|id| !local.contains(*id)).cloned().collect()
+}
+
+static LAST_MISMATCH: std::sync::Mutex<Option<(std::collections::BTreeSet<String>, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// The runner's sync tick: reconcile now when a reason above holds, else do
+/// nothing. `Ok(None)` for unpaired / paused / canonical, as [`pass`].
+pub fn quick_pass(conn: &mut Connection) -> Result<Option<(QuickReason, ReconcileReport)>, AppError> {
+    if !state::enabled(conn) || state::is_canonical(conn) {
+        return Ok(None);
+    }
+    let Some(url) = state::peer_url(conn) else { return Ok(None) };
+    let (last, _) = last_attempt(conn);
+    let t = chrono::Utc::now();
+
+    let mut reason = local_reason(conn, last.as_deref(), t);
+    if reason.is_none() && last.as_deref().map_or(true, |l| seconds_since(l, t) >= QUICK_GAP_SECONDS) {
+        // A failed probe is a blip, not an attempt: it records nothing and
+        // the ordinary cadence still runs.
+        let hub = state::peer_token().and_then(|token| HttpPeer::new(&url, &token).queued_task_ids());
+        match hub {
+            Ok(ids) => {
+                let unseen = unseen_queued(conn, &ids);
+                if !unseen.is_empty() {
+                    let mut last = LAST_MISMATCH.lock().unwrap_or_else(|p| p.into_inner());
+                    let repeat = matches!(&*last, Some((set, at))
+                        if *set == unseen && at.elapsed().as_secs() < SAME_MISMATCH_SECONDS);
+                    if !repeat {
+                        *last = Some((unseen, std::time::Instant::now()));
+                        reason = Some(QuickReason::NewWork);
+                    }
+                }
+            }
+            Err(e) => log::debug!("sync: queue probe failed: {e}"),
+        }
+    }
+    match reason {
+        Some(why) => now(conn).map(|report| Some((why, report))),
+        None => Ok(None),
+    }
+}
+
 /// When a reconcile was last **attempted**, successful or not.
 ///
 /// Distinct from [`state::KEY_LAST_PULL_AT`], which only moves when a pull
@@ -170,6 +315,59 @@ mod tests {
         assert!(!backstop_due(Some(&ago(INTERVAL_SECONDS as i64)), now), "the app is on time");
         assert!(backstop_due(Some(&ago(BACKSTOP_AFTER_SECONDS)), now), "the app has gone");
         assert!(backstop_due(None, now), "nothing has ever tried");
+    }
+
+    /// Each quick reason fires on its own fact, and the gap holds them all.
+    #[test]
+    fn a_quick_pass_reconciles_for_run_activity_and_only_after_the_gap() {
+        use crate::db::{runs, tasks};
+        use crate::executor::BackgroundExecutor;
+        use crate::intent::BackgroundIntent;
+        let conn = test_conn();
+        let now = chrono::Utc::now();
+        let ago = |secs: i64| crate::recurrence::to_iso(now - chrono::Duration::seconds(secs));
+
+        // Quiet: nothing ran since an attempt 30 s ago.
+        assert_eq!(local_reason(&conn, Some(&ago(30)), now), None);
+
+        let task = tasks::create(&conn, &tasks::NewTask { title: "t".into(), ..Default::default() })
+            .unwrap()
+            .id;
+        let run = runs::start(&conn, &task, "background", None, BackgroundExecutor::Claude,
+                              BackgroundIntent::Work, None).unwrap();
+        // Started after an attempt 30 s ago: push it.
+        assert_eq!(local_reason(&conn, Some(&ago(30)), now), Some(QuickReason::RunChanged));
+        // ...but not within the gap.
+        assert_eq!(local_reason(&conn, Some(&ago(5)), now), None);
+        // Started before the attempt, still running: once a minute.
+        let after_start = crate::recurrence::to_iso(chrono::Utc::now() + chrono::Duration::seconds(2));
+        let later = now + chrono::Duration::seconds(40);
+        assert_eq!(local_reason(&conn, Some(&after_start), later), None, "in flight, under a minute");
+        let much_later = now + chrono::Duration::seconds(90);
+        assert_eq!(local_reason(&conn, Some(&after_start), much_later), Some(QuickReason::RunInFlight));
+        let _ = run;
+        // And the old backstop still wins when nothing has tried for a cadence.
+        assert_eq!(local_reason(&conn, Some(&ago(BACKSTOP_AFTER_SECONDS)), now), Some(QuickReason::Backstop));
+    }
+
+    #[test]
+    fn unseen_queued_is_the_hubs_queue_minus_ours() {
+        use crate::db::tasks;
+        let conn = test_conn();
+        let mine = tasks::create(&conn, &tasks::NewTask { title: "t".into(), ..Default::default() })
+            .unwrap()
+            .id;
+        conn.execute("UPDATE tasks SET status = 'queued' WHERE id = ?1", [&mine]).unwrap();
+        let unseen = unseen_queued(&conn, &[mine.clone(), "from-the-phone".into()]);
+        assert_eq!(unseen.into_iter().collect::<Vec<_>>(), vec!["from-the-phone".to_string()]);
+    }
+
+    /// The quick pass is as quiet as the timer on a host with no peer.
+    #[test]
+    fn a_quick_pass_never_touches_an_unpaired_host() {
+        let mut conn = test_conn();
+        assert!(quick_pass(&mut conn).unwrap().is_none());
+        assert_eq!(last_attempt(&conn), (None, None));
     }
 
     /// An unpaired machine stays quiet even when the clock says it's due.

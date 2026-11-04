@@ -310,8 +310,12 @@ fn main() -> anyhow::Result<()> {
     // reconcile can take minutes, and neither a Stop nor a tick waits for one.
     // Off for `--once` for the same reason, too.
     if !once {
+        // Every 20 s, but a full reconcile only for a reason
+        // (`auto::quick_pass`): the old backstop, run activity here, or work
+        // queued on the hub that this replica hasn't pulled — which is what
+        // makes a request from the phone start in seconds, not minutes.
         std::thread::spawn(|| loop {
-            std::thread::sleep(Duration::from_secs(60));
+            std::thread::sleep(Duration::from_secs(cxtasks_core::sync::auto::QUICK_TICK_SECONDS));
             let mut conn = match runner::open_db() {
                 Ok(c) => c,
                 Err(e) => {
@@ -319,11 +323,11 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
-            match cxtasks_core::sync::auto::backstop_pass(&mut conn) {
-                Ok(Some(_)) => log::info!("sync: reconciled with the hub (the app isn't doing it)"),
+            match cxtasks_core::sync::auto::quick_pass(&mut conn) {
+                Ok(Some((why, _))) => log::info!("sync: reconciled with the hub ({why:?})"),
                 Ok(None) => {}
                 // Recorded by `auto` for Settings and `sync-control.sh status`.
-                Err(e) => log::warn!("sync: backstop reconcile failed: {e}"),
+                Err(e) => log::warn!("sync: quick reconcile failed: {e}"),
             }
         });
     }

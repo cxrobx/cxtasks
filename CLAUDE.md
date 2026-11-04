@@ -428,7 +428,12 @@ replicas of it.** The mini is the default machine for unassigned work, code-edit
 runs included; the laptop and NAS run what names them (invariant 30). `cx-reconcile`
 moves commits between the two Macs, unpushed ones too. With the app closed the runner steps in
 (`auto::backstop_pass`, once the last attempt is over six minutes old), so a
-tripwire result reaches the hub whether or not anyone opened the app. Before that loop existed the Mac only reconciled when
+tripwire result reaches the hub whether or not anyone opened the app. The
+runner's sync thread is `auto::quick_pass` every 20 s: besides that backstop it
+reconciles at once when a run here starts or finishes (each minute while one is
+in flight) and when the hub holds queued work this replica hasn't pulled — one
+`list_tasks` probe, not a snapshot. That is what lets a phone request start in
+seconds and its answer reach the phone in seconds (T1120, 2026-11-04). Before that loop existed the Mac only reconciled when
 somebody pressed the Settings button, and the failure had no symptom: the live
 DB was found seven days behind, twice, with nothing erroring. Settings and
 `sync-control.sh status` now report the last **attempt** beside the last pull,
