@@ -30,3 +30,11 @@ anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 subtle = "2"
+
+# APNs (push.rs). HTTP/2 is mandatory there. TLS is rustls with the RING
+# provider, already in the graph through ureq, instead of reqwest's default
+# aws-lc-rs, which would add a C build to the NAS image for no gain.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
+base64 = "0.22"

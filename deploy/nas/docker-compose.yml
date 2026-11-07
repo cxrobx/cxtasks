@@ -23,6 +23,10 @@ services:
       CXTASKS_ROLE: canonical
       CXTASKS_TOKEN_FILE: /run/secrets/full-token
       CXTASKS_BOARD_TOKEN_FILE: /run/secrets/board-token
+      # Due reminders pushed to phones (push.rs). The team's APNs key, which
+      # deploy.sh installs; without the file the node simply does not push.
+      CXTASKS_APNS_KEY_FILE: /run/secrets/apns.p8
+      CXTASKS_APNS_KEY_ID: J66WN2FHV4
       RUST_LOG: info
 
     volumes:

@@ -8,6 +8,7 @@
 mod attachments;
 mod auth;
 mod config;
+mod push;
 mod rpc;
 mod sync;
 
@@ -20,11 +21,18 @@ use axum::Router;
 pub struct ServerState {
     pub db: Mutex<rusqlite::Connection>,
     pub config: config::Config,
+    /// `None` when this node has no APNs key — phones then keep their own
+    /// local reminders. See `push.rs`.
+    pub push: Option<Arc<push::Push>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // reqwest is built without a default TLS provider (see Cargo.toml), so the
+    // process-wide one is installed before any client exists.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let config = config::Config::from_env()?;
 
@@ -54,8 +62,25 @@ async fn main() -> Result<()> {
         if config.canonical { "canonical" } else { "local" },
     );
 
+    let push = push::Push::from_env(db_path.parent().unwrap_or(std::path::Path::new(".")));
+
+    // `cxtasks-server --push-check [development|production]`: ask Apple whether
+    // the key, team and topic are accepted, then exit. Reaches no phone.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--push-check") {
+        let Some(push) = push else {
+            anyhow::bail!("push is not configured (CXTASKS_APNS_KEY_FILE / CXTASKS_APNS_KEY_ID)");
+        };
+        let env = argv.get(2).map(String::as_str).unwrap_or("development");
+        println!("{env}: {}", push.check(env).await);
+        return Ok(());
+    }
+
     let bind = config.bind.clone();
-    let state = Arc::new(ServerState { db: Mutex::new(conn), config });
+    let state = Arc::new(ServerState { db: Mutex::new(conn), config, push: push.clone() });
+    if let Some(push) = push {
+        tokio::spawn(push::run(state.clone(), push));
+    }
 
     let app = Router::new()
         // Auth-OPTIONAL on purpose: a client has to be able to tell "sync is

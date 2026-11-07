@@ -52,6 +52,18 @@ ssh "$NAS" "
     fi
   done"
 
+say "installing the APNs key (push.rs) — copied file to file, never through this terminal"
+# One key serves every app on the team: the one PocketBuddy's backend and
+# CXStreaks already use. Override with CXTASKS_APNS_KEY_FILE. Missing is not
+# fatal: the node then simply does not push, and phones keep their own reminders.
+APNS_KEY_FILE="${CXTASKS_APNS_KEY_FILE:-$HOME/Projects/finance-app/backend/certs/AuthKey_J66WN2FHV4.p8}"
+if [ -s "$APNS_KEY_FILE" ]; then
+  ssh "$NAS" "umask 077; cat > $REMOTE_DIR/secrets/apns.p8 && chmod 600 $REMOTE_DIR/secrets/apns.p8" < "$APNS_KEY_FILE"
+  echo "  apns.p8 installed"
+else
+  echo "  no key at $APNS_KEY_FILE — push stays off"
+fi
+
 say "shipping the image (~40 MB, gzipped over the LAN)"
 docker save cxtasks-server:latest | gzip -1 | ssh "$NAS" "gunzip | $DOCKER load"
 

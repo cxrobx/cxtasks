@@ -31,6 +31,9 @@ pub struct Health {
     /// its own can explain a board that looks a few hours out of step, which is
     /// otherwise an unfalsifiable complaint.
     pub tz: String,
+    /// This node pushes due reminders through APNs. Additive: an older client
+    /// ignores it.
+    pub push: bool,
 }
 
 pub async fn health(State(state): State<Arc<ServerState>>) -> Json<Health> {
@@ -40,6 +43,7 @@ pub async fn health(State(state): State<Arc<ServerState>>) -> Json<Health> {
         schema_version: cxtasks_core::db::schema::CURRENT_VERSION,
         protocol_version: cxtasks_core::db::schema::SYNC_PROTOCOL_VERSION,
         tz: state.config.config_tz().to_string(),
+        push: state.push.is_some(),
     })
 }
 
@@ -88,6 +92,13 @@ pub async fn rpc(
                 .into_response()
         }
     };
+
+    // Push registration is this NODE's business, not a verb: a device token
+    // must never enter the synced database (see `push.rs`). Either scope may
+    // register — a phone holds the board token.
+    if call.cmd == "register_push_device" || call.cmd == "unregister_push_device" {
+        return push_registration(&state, &call).into_response();
+    }
 
     // Refuse host-local verbs HERE rather than letting the table do it, so the
     // status code carries the meaning too. Executing one would act on THIS
@@ -149,5 +160,27 @@ pub async fn rpc(
             };
             (status, Json(json!({ "err": e.to_string() }))).into_response()
         }
+    }
+}
+
+/// `register_push_device {token, environment, name?}` → `{push}`, where `push`
+/// says whether this node will push. A phone keeps its own local reminders
+/// unless it is `true`, so a node with no key never leaves a phone silent.
+/// `unregister_push_device {token}` forgets one.
+fn push_registration(state: &ServerState, call: &RpcRequest) -> (StatusCode, Json<Value>) {
+    let token = call.args.get("token").and_then(Value::as_str).unwrap_or_default();
+    let Some(push) = state.push.as_ref() else {
+        return (StatusCode::OK, Json(json!({ "ok": { "push": false } })));
+    };
+    let result = if call.cmd == "unregister_push_device" {
+        push.unregister(token)
+    } else {
+        let environment = call.args.get("environment").and_then(Value::as_str).unwrap_or_default();
+        let name = call.args.get("name").and_then(Value::as_str);
+        push.register(token, environment, name)
+    };
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": { "push": true } }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "err": format!("{e:#}") }))),
     }
 }

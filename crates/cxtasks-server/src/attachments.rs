@@ -225,6 +225,7 @@ mod tests {
                 tz: "UTC".into(),
                 canonical: true,
             },
+            push: None,
         }
     }
 
