@@ -964,6 +964,12 @@ pub struct CxTasksMcp {
     /// The `clientInfo.name` the MCP client gave at `initialize` — how a
     /// Codex session that was not started by the runner still signs as Codex.
     client_name: Arc<std::sync::Mutex<Option<String>>>,
+    /// Whether [`AGENT_ENV`] may override the client name. True for a stdio
+    /// process, which serves exactly one agent and so can be told which one.
+    /// False for an HTTP session (T640): that process serves every session on
+    /// the machine, so a per-process declaration would sign Codex's comments
+    /// as Claude or the reverse. There, `clientInfo.name` alone decides.
+    honor_agent_env: bool,
 }
 
 impl CxTasksMcp {
@@ -975,7 +981,11 @@ impl CxTasksMcp {
     /// `codex-mcp-client`), and anything unrecognised is Claude, the
     /// foreground agent.
     fn author(&self) -> &'static str {
-        let declared = std::env::var(AGENT_ENV).ok();
+        let declared = if self.honor_agent_env {
+            std::env::var(AGENT_ENV).ok()
+        } else {
+            None
+        };
         let client = self.client_name.lock().ok().and_then(|g| g.clone());
         author_for(declared.as_deref(), client.as_deref())
     }
@@ -1895,7 +1905,22 @@ impl CxTasksMcp {
             mode,
             claimed: Arc::new(AtomicBool::new(false)),
             client_name: Arc::new(std::sync::Mutex::new(None)),
+            honor_agent_env: true,
         }
+    }
+
+    /// A fresh server for ONE streamable-HTTP session (T640).
+    ///
+    /// Always [`McpMode::Interactive`]: unattended runs bring their own stdio
+    /// server through `--strict-mcp-config`, and `mcp::http` refuses to start
+    /// when either mode env var is set. Called by the session factory, so every
+    /// session gets its own `client_name` and `claimed` — `#[derive(Clone)]`
+    /// shares those Arcs, which is why the factory must never clone one
+    /// template instance.
+    pub fn for_http_session(db_path: String) -> Self {
+        let mut s = Self::with_mode(db_path, McpMode::Interactive);
+        s.honor_agent_env = false;
+        s
     }
 
     #[tool(

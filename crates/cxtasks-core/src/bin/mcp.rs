@@ -1,6 +1,8 @@
 //! CXTasks MCP server — stdio transport for Claude CLI integration.
 //!
-//! Usage: `cxtasks-mcp` (argless stdio server — takes no flags)
+//! Usage: `cxtasks-mcp` (argless stdio server — the default)
+//!        `cxtasks-mcp --http <port>` (streamable HTTP at http://127.0.0.1:<port>/mcp,
+//!        one shared process for every session — T640, see `mcp::http`)
 //! Register with: `claude mcp add --scope user cxtasks /abs/path/to/cxtasks-mcp`
 //!
 //! ⚠️ Once registered, this binary is LIVE infrastructure, not build output.
@@ -57,6 +59,21 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Could not open DB for migrations: {}", e),
     }
 
+    if let Some(port) = http_port()? {
+        // Shared HTTP server: always interactive, never reaped (under launchd
+        // getppid() is 1 from the start), identity per session.
+        cxtasks_core::mcp::http::refuse_unattended_env().map_err(anyhow::Error::msg)?;
+        let listener = cxtasks_core::mcp::http::bind(port)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port}: {e}"))?;
+        return cxtasks_core::mcp::http::serve(
+            db_path.to_string_lossy().to_string(),
+            listener,
+            shutdown_signal(),
+        )
+        .await;
+    }
+
     let server = CxTasksMcp::new(db_path.to_string_lossy().to_string());
 
     // Self-reap so abandoned processes don't accumulate (see fn docs below).
@@ -70,6 +87,42 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("MCP server running");
     service.waiting().await?;
     Ok(())
+}
+
+/// `--http <port>` → `Some(port)`. Any other arguments are ignored, as they
+/// always were, so the stdio path is unchanged by this flag existing.
+fn http_port() -> anyhow::Result<Option<u16>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(i) = args.iter().position(|a| a == "--http") else {
+        return Ok(None);
+    };
+    let port = args
+        .get(i + 1)
+        .ok_or_else(|| anyhow::anyhow!("--http needs a port, e.g. --http 18702"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--http: {port:?} is not a port number"))?;
+    Ok(Some(port))
+}
+
+/// Resolves on SIGINT or SIGTERM (what launchd sends on unload).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    tracing::info!("cxtasks-mcp: shutting down HTTP server");
 }
 
 /// Background self-reaper so abandoned `cxtasks-mcp` processes don't pile up.
