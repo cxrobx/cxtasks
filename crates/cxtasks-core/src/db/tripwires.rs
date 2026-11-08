@@ -384,11 +384,25 @@ pub fn record(
                     params![task_id],
                 )?;
                 let evidence = if note.is_empty() { "(no output)" } else { note.as_str() };
+                // An `agent:` check's lease IS its run id (`runs::start_check`),
+                // and that run row holds the check's whole final message. The
+                // note above keeps NOTE_CHARS of it, so say where the rest is —
+                // a report longer than a sentence is otherwise unreachable from
+                // a session, which only sees this comment.
+                let report = if crate::db::runs::get(conn, lease_id)?
+                    .is_some_and(|r| r.task_id == task_id)
+                {
+                    format!(
+                        "\n\nFull report: get_task with run_id \"{lease_id}\", or this run in the task's activity."
+                    )
+                } else {
+                    String::new()
+                };
                 crate::db::comments::add(
                     conn,
                     task_id,
                     crate::db::comments::AUTHOR_TRIPWIRE,
-                    &format!("Tripwire tripped · {spec}\n\n{evidence}"),
+                    &format!("Tripwire tripped · {spec}\n\n{evidence}{report}"),
                 )?;
                 let completed = OnTrip::from_db(task.tripwire_on_trip.as_deref()) == OnTrip::Complete;
                 if completed {
@@ -938,6 +952,35 @@ mod tests {
         assert_eq!(after.status, "todo", "a trip reopens a done monitor");
         assert!(after.completed_at.is_none());
         assert_eq!(after.tripwire_state.as_deref(), Some("tripped"));
+    }
+
+    /// An agent check's trip names the run that holds its full report; a
+    /// script's trip, whose lease is not a run, says nothing of the kind.
+    #[test]
+    fn an_agent_trip_points_at_its_run_and_a_script_trip_does_not() {
+        let mut conn = test_conn();
+        let m = monitor(&conn);
+        let run = crate::db::runs::start_check(
+            &mut conn,
+            &m.id,
+            m.tripwire.as_deref().unwrap(),
+            4,
+            crate::executor::BackgroundExecutor::Claude,
+            10,
+        )
+        .unwrap()
+        .expect("the check starts and takes the lease");
+        let r = record(&conn, &m.id, &run.id, &Outcome::Tripped("5 proposals".into())).unwrap();
+        assert!(matches!(r.transition, Some(Transition::Tripped { .. })));
+        let comments = crate::db::comments::for_task(&conn, &m.id).unwrap();
+        let body = &comments.last().unwrap().body;
+        assert!(body.contains("5 proposals"), "{body}");
+        assert!(body.contains(&format!("run_id \"{}\"", run.id)), "{body}");
+
+        let s = armed(&conn, Some(60));
+        trip(&conn, &s, "not-a-run");
+        let comments = crate::db::comments::for_task(&conn, &s.id).unwrap();
+        assert!(!comments.last().unwrap().body.contains("Full report"));
     }
 
     /// A monitor that is done and quiet stays done — a not-yet moves nothing.

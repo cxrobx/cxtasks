@@ -151,6 +151,8 @@ OUT=$(q "SELECT tripwire_state || '|' || status || '|' || COALESCE(tripwire_trip
 expect "the task surfaced, still open" "tripped|inbox|20"
 OUT=$(q "SELECT author || ': ' || body FROM task_comments WHERE task_id='sim-agent';")
 expect "with the evidence as a comment under the tripwire author" "line 2 says v2.0.0 shipped"
+TRIP_RUN=$(q "SELECT id FROM task_runs WHERE intent='check' ORDER BY rowid DESC LIMIT 1;")
+expect "and the comment names the run that holds the full report" "run_id \"$TRIP_RUN\""
 OUT=$(q "SELECT COUNT(*) FROM task_runs WHERE intent='check' AND status='succeeded';")
 expect "two check runs on the task's history" "2"
 OUT=$(q "SELECT COUNT(*) FROM tripwire_runtime WHERE lease_id IS NOT NULL;")

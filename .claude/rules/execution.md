@@ -1164,6 +1164,13 @@ LANE, never read off a row (invariant 19):
   `VERDICT:` line wins (a model reasoning aloud writes the word on the way to
   its conclusion); markdown dressing is tolerated; `EVIDENCE:` is the note.
   Any non-`succeeded` status, no verdict line, or `UNSURE` is an error.
+  The note keeps `NOTE_CHARS` (500); the run row keeps the whole final
+  message. So a TRIP comment on an agent check ends with `Full report:
+  get_task with run_id "<run id>"`: `db::tripwires::record` recognises
+  the lease as a run of this task (the lease IS the run id) and names it.
+  `get_task { run_id }` returns one run's whole result (bounded by
+  `RUN_REPORT_CHARS`, 40,000), only for a run of that task. A check's own
+  `get_task` has it too, so a standing check can read its last report.
 * **The model** is the task's own override when its executor is Claude
   (that is how "haiku for this tripwire" is spelled), else the global Claude
   default.

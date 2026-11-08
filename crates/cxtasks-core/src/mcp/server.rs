@@ -330,6 +330,25 @@ pub struct GetTaskParams {
     pub task_id: String,
 }
 
+/// `get_task`'s own parameters. Kept apart from [`GetTaskParams`], which
+/// `archive_task` and `unarchive_task` share, so `run_id` doesn't appear on
+/// tools where it would mean nothing.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetTaskDetailParams {
+    #[schemars(description = "Task reference: either the UUID or the short T-number as printed by list_tasks / file_task (e.g. 'T42' — case-insensitive).")]
+    pub task_id: String,
+    #[schemars(description = "Optional. A run of this task whose FULL final message you want (a tripwire check's report, a handoff), instead of the task detail. The detail shows each run's first 400 characters and names the run_id when there is more; a tripwire trip comment names it too.")]
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+/// How much of one run's final message `get_task { run_id }` returns. Asked for
+/// by name, one run at a time, so it is far above the 400-character preview;
+/// still bounded, because `get_task` is a background tool and lands in
+/// unattended runs' context.
+const RUN_REPORT_CHARS: usize = 40_000;
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateTaskParams {
@@ -1585,7 +1604,36 @@ fn format_detail(
             if let Some(text) = r.result_text.as_deref().filter(|t| !t.trim().is_empty()) {
                 let preview: String = text.chars().take(400).collect();
                 s.push_str(&format!("    result: {preview}\n"));
+                if text.chars().count() > 400 {
+                    s.push_str(&format!("    (continues — get_task with run_id \"{}\" for all of it)\n", r.id));
+                }
             }
+        }
+    }
+    s
+}
+
+/// One run's whole final message, for `get_task { run_id }`.
+fn format_run_report(task: &db::tasks::Task, run: &db::runs::TaskRun) -> String {
+    let title = task.short_id.map(|n| format!("T{n} · {}", task.title)).unwrap_or_else(|| task.title.clone());
+    let mut s = format!(
+        "Run {} of {title}\n  {} {} started {}{}\n\n",
+        run.id,
+        run.mode,
+        run.status,
+        run.started_at,
+        run.finished_at.as_deref().map(|f| format!(", finished {f}")).unwrap_or_default()
+    );
+    match run.result_text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => s.push_str("(this run left no final message)\n"),
+        Some(text) if text.chars().count() > RUN_REPORT_CHARS => {
+            let head: String = text.chars().take(RUN_REPORT_CHARS).collect();
+            s.push_str(&head);
+            s.push_str(&format!("\n[…cut at {RUN_REPORT_CHARS} characters; the rest is on the run in the app…]\n"));
+        }
+        Some(text) => {
+            s.push_str(text);
+            s.push('\n');
         }
     }
     s
@@ -2293,11 +2341,11 @@ impl CxTasksMcp {
 
     #[tool(
         name = "get_task",
-        description = "Read one task in full: notes, seed prompt, execution context, subtasks and run history."
+        description = "Read one task in full: notes, seed prompt, execution context, subtasks and run history. Pass `run_id` to read one run's whole final message instead (a tripwire check's report, a handoff)."
     )]
     async fn get_task(
         &self,
-        Parameters(params): Parameters<GetTaskParams>,
+        Parameters(params): Parameters<GetTaskDetailParams>,
     ) -> Result<CallToolResult, McpError> {
         let task_id = self.resolve_task_id(&params.task_id)?;
         let conn = self.open_db()?;
@@ -2306,6 +2354,18 @@ impl CxTasksMcp {
             .ok_or_else(|| {
                 McpError::invalid_params(format!("task {} not found", params.task_id), None)
             })?;
+        if let Some(run_id) = params.run_id.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            let run = db::runs::get(&conn, run_id)
+                .map_err(|e| McpError::internal_error(format!("{e}"), None))?
+                .filter(|r| r.task_id == task.id)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("run {run_id} is not a run of task {}", params.task_id),
+                        None,
+                    )
+                })?;
+            return Self::text(format_run_report(&task, &run));
+        }
         let runs = db::runs::list_for_task(&conn, &task.id).unwrap_or_default();
         let children = db::tasks::list_children(&conn, &task.id).unwrap_or_default();
         let tripwire_rt = if task.tripwire.is_some() {
@@ -5500,6 +5560,56 @@ mod tests {
         assert!(detail.contains("patched the backoff"));
     }
 
+    /// A long run result is previewed in the detail with a pointer, and
+    /// `run_id` returns all of it — but only for a run of THIS task.
+    #[tokio::test]
+    async fn get_task_run_id_returns_the_whole_report_of_its_own_runs_only() {
+        let (dir, db) = test_db("mcp-get-task-run-id");
+        let report = format!("{}\nVERDICT: TRIPPED\nEVIDENCE: 5 proposals", "p".repeat(3_000));
+        let (t, other, run_id) = {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let t = create(&conn, &NewTask { title: "dream".into(), ..Default::default() }).unwrap();
+            let other = create(&conn, &NewTask { title: "other".into(), ..Default::default() }).unwrap();
+            let run = db::runs::start(&conn, &t.id, "background", None, crate::executor::BackgroundExecutor::Claude, crate::intent::BackgroundIntent::Work, None).unwrap();
+            db::runs::finish(
+                &conn,
+                &run.id,
+                &db::runs::RunOutcome {
+                    status: "succeeded".into(),
+                    result_text: Some(report.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (t, other, run.id)
+        };
+        let server = CxTasksMcp::with_mode(db.to_string_lossy().to_string(), McpMode::Interactive);
+
+        let detail = format!(
+            "{:?}",
+            server
+                .get_task(Parameters(GetTaskDetailParams { run_id: None, task_id: t.id.clone() }))
+                .await
+                .unwrap()
+                .content
+        );
+        assert!(detail.contains(&format!("run_id \\\"{run_id}\\\"")), "{detail}");
+        assert!(!detail.contains("5 proposals"), "the detail stays a preview");
+
+        let full = server
+            .get_task(Parameters(GetTaskDetailParams { run_id: Some(run_id.clone()), task_id: t.id.clone() }))
+            .await
+            .unwrap();
+        let full = format!("{:?}", full.content);
+        assert!(full.contains("EVIDENCE: 5 proposals"), "{full}");
+
+        let wrong = server
+            .get_task(Parameters(GetTaskDetailParams { run_id: Some(run_id), task_id: other.id.clone() }))
+            .await;
+        assert!(wrong.is_err(), "a run id never reads across tasks");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── the comment channel: bounded on read AND on write ─────────────────
 
     fn comment_params(task_id: &str, body: &str) -> CommentTaskParams {
@@ -5536,7 +5646,7 @@ mod tests {
 
         let server = CxTasksMcp::with_mode(db.to_string_lossy().to_string(), McpMode::Interactive);
         let out = server
-            .get_task(Parameters(GetTaskParams { task_id: t.id.clone() }))
+            .get_task(Parameters(GetTaskDetailParams { run_id: None, task_id: t.id.clone() }))
             .await
             .unwrap();
         let text = format!("{:?}", out.content);
@@ -5765,13 +5875,13 @@ mod tests {
             .unwrap();
 
         let older_detail = server
-            .get_task(Parameters(GetTaskParams {
+            .get_task(Parameters(GetTaskDetailParams { run_id: None,
                 task_id: old.id.clone(),
             }))
             .await
             .unwrap();
         let newer_detail = server
-            .get_task(Parameters(GetTaskParams {
+            .get_task(Parameters(GetTaskDetailParams { run_id: None,
                 task_id: replacement.id.clone(),
             }))
             .await
