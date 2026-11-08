@@ -74,6 +74,12 @@ else
   echo "runner LaunchAgent not loaded — skipped"
 fi
 
+# The mini's shared `cxtasks-mcp --http` server keeps the old binary until restarted (T640).
+if launchctl print "gui/$(id -u)/com.cx.mcp.cxtasks" >/dev/null 2>&1; then
+  step "Restarting the shared MCP server on the new binary"
+  launchctl kickstart -k "gui/$(id -u)/com.cx.mcp.cxtasks"
+fi
+
 if (( OPEN )); then
   step "Relaunching CXTasks"
   open -a "$DEST"

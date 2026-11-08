@@ -122,7 +122,9 @@ touch ~/Library/Application\ Support/com.cxtasks.app/CANCEL_<run_id>
 
 **`/ship` (or `scripts/ship.sh` from a shell) does all of this** and fails on
 every check below; the steps are kept here so the script has something to be
-checked against.
+checked against. Where the shared HTTP MCP LaunchAgent `com.cx.mcp.cxtasks` is
+loaded (the mini), it also kickstarts it so every session picks up the new
+`cxtasks-mcp`; elsewhere that step is skipped silently.
 
 The extra steps are about the **SIGNATURE**, not about copying files:
 
