@@ -622,6 +622,96 @@ mod tests {
         assert_eq!(sweep::run(&tx).unwrap(), 0);
     }
 
+    /// **A replica must not abandon another host's run on a heartbeat it only
+    /// saw through an old pull** — the 2026-11-08 incident (T641-T649).
+    ///
+    /// The mini ran eight read-only runs; each finished normally about four
+    /// minutes in and recorded its outcome and tokens. The LAPTOP pulls every
+    /// five minutes or so, so its copy of each row still said `running` with
+    /// the heartbeat the hub had at its last pull. Its runner judged that copy
+    /// against the wall clock, found the heartbeat five minutes old, and wrote
+    /// `abandoned` with `finished_at = now`. That stamp is newer than anything
+    /// the owner wrote, so the hub took it (invariant 32, working as designed),
+    /// and the mini's next pull replaced its finished row with the laptop's
+    /// guess: no result, zero tokens.
+    ///
+    /// Modelled here as it happened: the replica pulled while the owner's run
+    /// was healthy, the owner then finished at the hub, and the replica's sweep
+    /// runs before its next pull.
+    #[test]
+    fn a_replica_never_abandons_a_foreign_run_on_a_heartbeat_from_an_old_pull() {
+        let mut laptop = local();
+        let hub = TwinPeer::new();
+        let stale = crate::db::runs::HEARTBEAT_STALE_MINUTES;
+
+        // On the hub: the mini's run, healthy as of the laptop's pull below.
+        let run_id = {
+            let db = hub.db.borrow();
+            let t = tasks::create(&db, &NewTask { title: "read-only run".into(), ..Default::default() }).unwrap();
+            let run = crate::db::runs::start(
+                &db, &t.id, "background", None,
+                crate::executor::BackgroundExecutor::Claude,
+                crate::intent::BackgroundIntent::Work, None,
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE task_runs SET host = 'the-mini',
+                        started_at = datetime('now', ?2),
+                        heartbeat_at = datetime('now', ?3)
+                  WHERE id = ?1",
+                rusqlite::params![run.id, format!("-{} minutes", stale + 3), format!("-{} minutes", stale + 1)],
+            )
+            .unwrap();
+            run.id
+        };
+        reconcile(&mut laptop, &hub).unwrap();
+        // That pull happened half a minute after the run's last beat — the
+        // laptop's copy was fresh when it arrived.
+        crate::db::meta::set(
+            &laptop,
+            state::KEY_LAST_PULL_AT,
+            &crate::recurrence::to_iso(chrono::Utc::now() - chrono::Duration::seconds(stale * 60 + 30)),
+        )
+        .unwrap();
+
+        // The owner finishes, a minute ago, and the hub has it.
+        {
+            let db = hub.db.borrow();
+            db.execute(
+                "UPDATE task_runs SET status = 'ready_for_review', result_text = 'the full report',
+                        input_tokens = 1000, output_tokens = 2000, cache_read_tokens = 3000,
+                        finished_at = datetime('now', '-1 minutes')
+                  WHERE id = ?1",
+                [&run_id],
+            )
+            .unwrap();
+        }
+
+        // The laptop's runner ticks before its next pull.
+        let swept = crate::db::runs::sweep_abandoned(&laptop).unwrap();
+        reconcile(&mut laptop, &hub).unwrap();
+
+        let read = |db: &Connection| -> (String, Option<i64>, Option<String>) {
+            db.query_row(
+                "SELECT status, output_tokens, result_text FROM task_runs WHERE id = ?1",
+                [&run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        for (who, db) in [("hub", &*hub.db.borrow()), ("laptop after its pull", &laptop)] {
+            let (status, out, text) = read(db);
+            assert_eq!(status, "ready_for_review", "{who}: the owner's outcome must stand");
+            assert_eq!(out, Some(2000), "{who}: and so must its tokens (the daily cap reads them)");
+            assert_eq!(text.as_deref(), Some("the full report"), "{who}");
+        }
+        assert_eq!(
+            swept, 0,
+            "the laptop's copy was as fresh as its last pull, so it knows nothing \
+             that says the run is dead"
+        );
+    }
+
     /// A write the MCP made — never through the verb table — still reaches the
     /// peer, because the sweep runs first.
     #[test]

@@ -1383,6 +1383,33 @@ pub fn sweep_abandoned(conn: &Connection) -> Result<usize, AppError> {
     //      by hand. Cost of sweeping it: destroying a live run on a machine
     //      this one cannot see. That asymmetry decides it.
     let me = crate::host::host_id();
+    // Rule 2's clock is not the same for every row, and that is the fix for
+    // the 2026-11-08 incident (T641-T649).
+    //
+    // A heartbeat on MY row is written here, so "five minutes old" means five
+    // minutes of silence. A heartbeat on a FOREIGN row is only as recent as my
+    // last pull: a replica that pulls every five minutes sees every live run on
+    // another machine go "stale" between pulls. The laptop did exactly that
+    // and wrote `abandoned` over eight of the mini's runs, which had in fact
+    // finished and recorded their outcomes and tokens. Its `finished_at = now`
+    // was newer than anything the owner wrote, so the hub kept it (invariant
+    // 32 compares whole rows by their stamps, as it should) and the mini's next
+    // pull replaced its finished rows with the guess.
+    //
+    // So a foreign heartbeat is judged against the moment this replica last
+    // heard from the hub: stale only if the hub itself had seen no beat for
+    // `HEARTBEAT_STALE_MINUTES` at that pull. A replica asleep for an hour then
+    // judges from what it knew an hour ago, not from now. The canonical node
+    // IS the hub, so its copy is current and it keeps `now`; so does a host
+    // that has never pulled (sync off, or a seeded copy), which is the pre-fix
+    // rule and pushes nothing.
+    let foreign_ref: String = if crate::sync::state::is_canonical(conn) {
+        "now".to_string()
+    } else {
+        crate::db::meta::get(conn, crate::sync::state::KEY_LAST_PULL_AT)?
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "now".to_string())
+    };
     let n = conn.execute(
         "UPDATE task_runs
             SET status = ?1,
@@ -1401,9 +1428,15 @@ pub fn sweep_abandoned(conn: &Connection) -> Result<usize, AppError> {
                            'now',
                            '-' || (COALESCE(timeout_minutes, ?2) + ?3) || ' minutes'
                        ))
-               OR (heartbeat_at IS NOT NULL
+               OR ((host IS NULL OR host = ?4)
+                   AND heartbeat_at IS NOT NULL
                    AND datetime(heartbeat_at) < datetime(
                            'now', '-' || ?5 || ' minutes'
+                       ))
+               OR (host IS NOT NULL AND host <> ?4
+                   AND heartbeat_at IS NOT NULL
+                   AND datetime(heartbeat_at) < datetime(
+                           ?6, '-' || ?5 || ' minutes'
                        ))
             )",
         params![
@@ -1411,7 +1444,8 @@ pub fn sweep_abandoned(conn: &Connection) -> Result<usize, AppError> {
             global,
             ABANDON_GRACE_MINUTES,
             me,
-            HEARTBEAT_STALE_MINUTES
+            HEARTBEAT_STALE_MINUTES,
+            foreign_ref
         ],
     )?;
     if n > 0 {
@@ -2327,6 +2361,63 @@ mod tests {
             STATUS_ABANDONED,
             "a run that stopped beating is gone, whoever owned it"
         );
+    }
+
+    /// **A replica judges a foreign heartbeat against its last pull, not the
+    /// wall clock** — the 2026-11-08 incident, as the pair in one call.
+    ///
+    /// The replica last pulled six minutes ago. A foreign run that beat seven
+    /// minutes ago was beating a minute before that pull, so this host knows
+    /// nothing that says it died: spared. One that beat twelve minutes ago was
+    /// already silent for six at the pull: swept. And my own row is still
+    /// judged against now, because its heartbeat is written here.
+    #[test]
+    fn a_replica_judges_a_foreign_heartbeat_by_its_last_pull() {
+        let conn = test_conn();
+        crate::sync::state::set_enabled(&conn, true).unwrap();
+        crate::db::meta::set(
+            &conn,
+            crate::sync::state::KEY_LAST_PULL_AT,
+            &crate::recurrence::to_iso(chrono::Utc::now() - chrono::Duration::minutes(6)),
+        )
+        .unwrap();
+        let t = seed_task(&conn);
+        let mk = || start(&conn, &t, "background", None, BackgroundExecutor::Claude, BackgroundIntent::Work, None).unwrap();
+        let (seen_alive, seen_dead, mine) = (mk(), mk(), mk());
+        make_foreign(&conn, &seen_alive.id, Some(HEARTBEAT_STALE_MINUTES + 2));
+        make_foreign(&conn, &seen_dead.id, Some(HEARTBEAT_STALE_MINUTES + 7));
+        conn.execute(
+            "UPDATE task_runs SET heartbeat_at = datetime('now', ?2) WHERE id = ?1",
+            params![mine.id, format!("-{} minutes", HEARTBEAT_STALE_MINUTES + 1)],
+        )
+        .unwrap();
+
+        assert_eq!(sweep_abandoned(&conn).unwrap(), 2);
+        let status = |id: &str| get(&conn, id).unwrap().unwrap().status;
+        assert_eq!(status(&seen_alive.id), "running", "it was beating as of my last pull");
+        assert_eq!(status(&seen_dead.id), STATUS_ABANDONED, "silent at the hub before my pull");
+        assert_eq!(status(&mine.id), STATUS_ABANDONED, "my own heartbeat is local, so now is right");
+    }
+
+    /// The canonical node IS the hub: its copy of a foreign row is as fresh as
+    /// the owner's last push, so it keeps judging against now — even if a
+    /// stray `sync_last_pull_at` sits in its `app_meta`.
+    #[test]
+    fn the_canonical_node_judges_a_foreign_heartbeat_against_now() {
+        let conn = test_conn();
+        crate::sync::state::set_canonical(&conn, true).unwrap();
+        crate::db::meta::set(
+            &conn,
+            crate::sync::state::KEY_LAST_PULL_AT,
+            &crate::recurrence::to_iso(chrono::Utc::now() - chrono::Duration::hours(3)),
+        )
+        .unwrap();
+        let t = seed_task(&conn);
+        let run = start(&conn, &t, "background", None, BackgroundExecutor::Claude, BackgroundIntent::Work, None).unwrap();
+        make_foreign(&conn, &run.id, Some(HEARTBEAT_STALE_MINUTES + 1));
+
+        assert_eq!(sweep_abandoned(&conn).unwrap(), 1);
+        assert_eq!(get(&conn, &run.id).unwrap().unwrap().status, STATUS_ABANDONED);
     }
 
     /// The gate counts MY slots, not the world's.

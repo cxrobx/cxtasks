@@ -855,6 +855,41 @@ Test the **pair**, never the half: one sweep call must spare a fresh-heartbeat
 foreign run *and* reclaim a stale one. "The live one survived" also passes
 against a sweep that reclaims nothing.
 
+**Rule 2 judges a FOREIGN heartbeat against this replica's last pull, not the
+wall clock** (2026-11-08). A heartbeat on my own row is written here, so five
+minutes old means five minutes of silence. A heartbeat on another host's row is
+only as recent as my last pull (`sync_last_pull_at`), and a replica pulls every
+five minutes or so — so against `now`, every live run on another machine went
+"stale" between pulls. The laptop did exactly that to eight of the mini's runs
+(T641-T649): each had finished and recorded its outcome and tokens, the laptop's
+copy still said `running`, and it wrote `abandoned` with `finished_at = now`.
+That stamp was newer than anything the owner wrote, so the hub kept it —
+invariant 32 working as designed — and the mini's next pull replaced its
+finished rows with the guess: no result, zero tokens, ~100M tokens missing from
+the daily cap. The `tasks` rows survived (`in_review`) because they are other
+rows. So a foreign row is stale only if the hub itself had seen no beat for
+`HEARTBEAT_STALE_MINUTES` at my last pull; a replica asleep for an hour judges
+from what it knew an hour ago. The canonical node IS the hub and keeps `now`,
+and so does a host that has never pulled (sync off, a seeded copy), which pushes
+nothing. Pinned by `a_replica_judges_a_foreign_heartbeat_by_its_last_pull` (the
+pair, plus my own row still judged by now) and end to end by
+`sync::reconcile::tests::a_replica_never_abandons_a_foreign_run_on_a_heartbeat_from_an_old_pull`.
+
+Why the fix is in the sweep and not in sync: the pull and the push both did the
+right thing with the rows they were given. Refusing the hub's `abandoned` on a
+row this host owns would need a per-field rule (keep my status, take its cancel
+request), which is the field-level merge the roadmap rejects; dating the sweep's
+`finished_at` back to the last heartbeat would put the write below the sync
+sweep's watermark, so it would never travel and would flap on every pull
+(gotcha #36's shape). Still open: a replica that legitimately sweeps (the owner
+really was silent to the hub for five minutes, say a partition) stamps `now`, so
+an outcome the owner records offline and pushes later with an earlier
+`finished_at` loses at the hub. That needs a five-minute partition during a run.
+
+**Every Mac must run this build for it to hold.** The bug is in the SWEEPER, so
+shipping the mini alone stops the mini abandoning the laptop's runs and does
+nothing about the laptop abandoning the mini's.
+
 **`count_running_background` counts THIS host's rows.** It feeds `runner::gate`,
 whose question is "do I have a free slot", and a slot is a local process.
 Counting globally would put every other host permanently at `max_concurrent` the
