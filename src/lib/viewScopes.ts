@@ -49,7 +49,7 @@ const SCOPES: Record<ListView | "node", Scope> = {
     locked: [
       {
         label: "Unfiled & undated",
-        hint: "No project, no section and no due date — give it a home or a date and it leaves, and Open still lists it. Held work, in-flight work and decisions live elsewhere",
+        hint: "No project, no section and no due date — give it a home or a date and it leaves, and Open still lists it. Held work, in-flight work, decisions and monitors live elsewhere",
       },
     ],
     defaults: [NOT_DONE],
@@ -57,7 +57,7 @@ const SCOPES: Record<ListView | "node", Scope> = {
   today: {
     locked: [
       {
-        label: "Due by today, in progress, or a decision",
+        label: "Due by today, in progress, a decision, or a fired monitor",
         hint: "Overdue included; deferred and armed tripwires excluded until their date or condition",
       },
     ],
@@ -83,6 +83,17 @@ const SCOPES: Record<ListView | "node", Scope> = {
   },
   in_review: {
     locked: [{ label: "In review", hint: "Work produced and waiting on you to accept it" }],
+    defaults: [],
+  },
+  // No NOT_DONE default: a handled monitor is done AND still being checked, so
+  // hiding done rows would hide most of the list.
+  monitors: {
+    locked: [
+      {
+        label: "Standing checks",
+        hint: "Every monitor tripwire, fired ones first. Complete a fired one to mark it handled and re-arm it; archive it to retire it",
+      },
+    ],
     defaults: [],
   },
   // No locked chip: "all open work" is what the absence of a view predicate

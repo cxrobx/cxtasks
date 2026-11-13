@@ -510,6 +510,7 @@ const SCOPE_TITLES: Record<string, string> = {
   today: "Today",
   waiting: "Waiting",
   in_review: "In Review",
+  monitors: "Monitors",
   open: "Open",
   all: "All Open",
   done: "Done",

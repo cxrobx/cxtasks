@@ -300,7 +300,7 @@ pub struct UpsertSectionParams {
 #[serde(deny_unknown_fields)]
 pub struct ListTasksParams {
     #[schemars(
-        description = "Which view: 'inbox' (what is left to file: open, no project, no section, no due date, not held — giving a task a project, a section or a due date takes it out), 'today' (due or overdue, plus open decisions — held tasks hidden until released), 'waiting' (the one 'not yet' list: held back by a start date, an armed tripwire, an open blocker or a written blocked reason; oldest first), 'open' (actionable RIGHT NOW: open and not held — the app's main list, and a future DUE date does not hide a task from it), 'all' (default: every open task, held ones included), 'in_review', or 'done'. A task 'missing' from today/open is HELD — it's in 'waiting' and 'all'. 'upcoming' is accepted as a legacy spelling of 'waiting'; that view was retired."
+        description = "Which view: 'inbox' (what is left to file: open, no project, no section, no due date, not held — giving a task a project, a section or a due date takes it out), 'today' (due or overdue, plus open decisions — held tasks hidden until released), 'waiting' (the one 'not yet' list: held back by a start date, an armed tripwire, an open blocker or a written blocked reason; oldest first), 'open' (actionable RIGHT NOW: open and not held — the app's main list, and a future DUE date does not hide a task from it), 'all' (default: every open task, held ones included), 'in_review', 'done', or 'monitors' (every standing tripwire, done ones included, fired ones first — a monitor is never in 'inbox'; a fired one is also in 'today'). A task 'missing' from today/open is HELD — it's in 'waiting' and 'all'. 'upcoming' is accepted as a legacy spelling of 'waiting'; that view was retired."
     )]
     pub view: Option<String>,
     #[schemars(
@@ -1164,9 +1164,10 @@ fn parse_view(raw: Option<&str>) -> Result<db::tasks::View, McpError> {
         // an older copy of the plugin would otherwise start erroring.
         "in_review" | "needs_review" | "review" => View::InReview,
         "done" | "completed" => View::Done,
+        "monitors" | "monitor" => View::Monitors,
         other => {
             return Err(McpError::invalid_params(
-                format!("unknown view '{other}' (expected inbox|today|waiting|open|all|in_review|done)"),
+                format!("unknown view '{other}' (expected inbox|today|waiting|open|all|in_review|done|monitors)"),
                 None,
             ))
         }
@@ -2310,7 +2311,7 @@ impl CxTasksMcp {
 
     #[tool(
         name = "list_tasks",
-        description = "List tasks from a CXTasks view: inbox, today (due or overdue, plus any open `decision` for Chris; held tasks stay hidden until released), waiting (the one 'not yet' list — held back by a start date, an armed tripwire, an open blocker or a written blocked reason; oldest first), open (actionable right now — everything not held, future deadlines included), all (every open task, held ones included), in_review, or done. Optionally filter by project or status."
+        description = "List tasks from a CXTasks view: inbox, today (due or overdue, plus any open `decision` for Chris; held tasks stay hidden until released), waiting (the one 'not yet' list — held back by a start date, an armed tripwire, an open blocker or a written blocked reason; oldest first), open (actionable right now — everything not held, future deadlines included), all (every open task, held ones included), in_review, done, or monitors (every standing tripwire; fired ones are also on today, and none are ever on inbox). Optionally filter by project or status."
     )]
     async fn list_tasks(
         &self,

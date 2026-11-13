@@ -432,7 +432,10 @@ pub fn filtered(conn: &Connection, spec: &FilterSpec) -> Result<Vec<Task>, AppEr
     let sort = spec.sort.unwrap_or_default();
     let hidden_view = spec.view.is_some_and(|v| v.is_hidden_view());
     let mut order: Vec<String> = Vec::new();
-    if !hidden_view && sort.key == SortKey::Default {
+    // Not in Monitors either: its whole order is "fired first", and a quiet
+    // monitor that happens to sit in a section would otherwise outrank every
+    // fired one (seen on the real board: T619 above eight tripped checks).
+    if !hidden_view && spec.view != Some(View::Monitors) && sort.key == SortKey::Default {
         order.push(crate::db::tasks::SECTION_ORDER.to_string());
     }
     if !matches!(
@@ -1069,6 +1072,7 @@ mod tests {
         for view in [
             View::Inbox, View::Today, View::Waiting, View::Open,
             View::All, View::InReview, View::Done, View::Trash, View::Archive,
+            View::Monitors,
         ] {
             let via_list = list(&conn, &ListFilters { view: Some(view), ..Default::default() }).unwrap();
             let spec = FilterSpec {

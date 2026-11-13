@@ -316,6 +316,7 @@ const VIEW_TITLES: Record<string, string> = {
   today: "Today",
   waiting: "Waiting",
   in_review: "In Review",
+  monitors: "Monitors",
   open: "Open",
   // Kept although no sidebar row selects it anymore — `listView` still maps
   // the GSD drill-down onto "all", and a title has to exist for that state.

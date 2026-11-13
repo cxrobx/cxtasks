@@ -381,6 +381,7 @@ const EMPTY_COUNTS: ViewCounts = {
   today: 0,
   waiting: 0,
   in_review: 0,
+  monitors: 0,
 };
 
 /**

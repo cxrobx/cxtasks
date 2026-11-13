@@ -648,6 +648,9 @@ export type ViewName =
    * split; project drill-downs and the GSD board query it. */
   | "all"
   | "in_review"
+  /** Every standing tripwire (a monitor), done ones included, fired ones
+   * first. Monitors are never in the Inbox; a fired one is also on Today. */
+  | "monitors"
   | "done"
   | "trash"
   | "archive";
@@ -977,6 +980,9 @@ export interface ViewCounts {
   upcoming?: number;
   waiting: number;
   in_review: number;
+  /** Monitors that have FIRED (tripped or errored), not the view's length.
+   * Optional: a backend that predates the Monitors view doesn't send it. */
+  monitors?: number;
 }
 
 export interface BudgetSettings {

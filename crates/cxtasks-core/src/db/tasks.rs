@@ -928,6 +928,14 @@ pub enum View {
     Trash,
     /// Deliberately set aside. Never purged, always restorable.
     Archive,
+    /// Every STANDING tripwire ([`MONITOR_SQL`]) on the board, done ones
+    /// included, because a handled monitor is still being checked. Its own
+    /// view because a monitor is standing infrastructure, not a todo: a fired
+    /// one asks "read the report and decide", every day or every week, and
+    /// mixed into the Inbox it taught Chris to skim past both kinds. Fired
+    /// rows (tripped or errored) float to the top by the shared armed-sinks
+    /// rule; the badge counts only those (see [`ViewCounts::monitors`]).
+    Monitors,
 }
 
 impl View {
@@ -1033,6 +1041,19 @@ pub const DEFERRED_SQL: &str =
 /// NEGATED (`waiting: false`, and now `exclude_waiting`), and `NULL = 'armed'`
 /// is NULL, so a task with no tripwire would vanish from "not waiting".
 pub const TRIPWIRE_ARMED: &str = "COALESCE(tripwire_state, '') = 'armed'";
+
+/// **A monitor**: a STANDING tripwire (`tripwire_on_trip = 'monitor'`), the
+/// SQL twin of [`Task::is_monitor`]. Never NULL, so it is safe negated.
+pub const MONITOR_SQL: &str =
+    "(tripwire IS NOT NULL AND COALESCE(tripwire_on_trip, '') = 'monitor')";
+
+/// **A fired monitor**: one whose check tripped or broke, waiting on Chris to
+/// read it. Today lists these; the Monitors badge counts them. `error` counts
+/// for the same reason it surfaces a task at all (invariant 26): a check that
+/// cannot run must not stay out of sight.
+pub const FIRED_MONITOR_SQL: &str = "(tripwire IS NOT NULL \
+     AND COALESCE(tripwire_on_trip, '') = 'monitor' \
+     AND COALESCE(tripwire_state, '') IN ('tripped', 'error'))";
 
 /// The BLOCKER half: held by a written reason or by an open dependency. Both,
 /// because both draw the row's blocked badge — a "Blocked" filter that matched
@@ -1161,6 +1182,9 @@ pub(crate) fn view_where(view: View) -> Vec<String> {
             // PROJECT's section, or at one sync has not delivered yet, has no
             // home anyone can see, and hiding it from the Inbox would lose it.
             parts.push(UNFILED_SQL.into());
+            // …and a MONITOR is never left to file: it is standing
+            // infrastructure with its own view. A fired one goes to Today.
+            parts.push(format!("NOT {MONITOR_SQL}"));
         }
         View::Today => {
             // Not held — deferred, armed, or blocked…
@@ -1169,14 +1193,17 @@ pub(crate) fn view_where(view: View) -> Vec<String> {
             // already actively in flight.
             // …or a decision awaiting Chris (`DECISION_TAG`): undated, but
             // "today" in the sense that matters — nothing else can move it.
+            // …or a monitor that fired: its report is waiting on him now.
             parts.push(format!(
                 "((due_at IS NOT NULL AND datetime(due_at,'localtime') < {TOMORROW_LOCAL})
                   OR status IN ('in_progress','queued','in_review')
-                  OR {})",
+                  OR {}
+                  OR {FIRED_MONITOR_SQL})",
                 is_decision_sql()
             ));
         }
         View::Waiting => parts.push(waiting_sql()),
+        View::Monitors => parts.push(MONITOR_SQL.into()),
         // Not held. Same shared predicate the board counts with — and
         // deliberately no date gate, so a deadline is visible before the day
         // it falls due.
@@ -1208,7 +1235,7 @@ pub(crate) fn view_where(view: View) -> Vec<String> {
 pub(crate) fn view_owns_status(view: View) -> bool {
     matches!(
         view,
-        View::Done | View::InReview | View::Trash | View::Archive
+        View::Done | View::InReview | View::Trash | View::Archive | View::Monitors
     )
 }
 
@@ -1392,6 +1419,11 @@ pub struct ViewCounts {
     /// A subset of `today`, so `today - overdue` is what's due later today.
     /// New in 2026-11; a client that predates it ignores the key.
     pub overdue: i64,
+    /// Monitors that have FIRED (tripped or errored) — what needs reading, not
+    /// the Monitors view's length, which is mostly quiet armed checks. New in
+    /// 2026-11; a client that predates it ignores the key.
+    #[serde(default)]
+    pub monitors: i64,
 }
 
 pub fn view_counts(conn: &Connection) -> Result<ViewCounts, AppError> {
@@ -1436,6 +1468,14 @@ pub fn view_counts(conn: &Connection) -> Result<ViewCounts, AppError> {
         upcoming: waiting,
         waiting,
         in_review: count(View::InReview)?,
+        monitors: rows(View::Monitors)?
+            .iter()
+            .filter(|t| {
+                t.is_monitor()
+                    && t.tripwire_state.as_deref().map(TripwireState::from_db)
+                        .is_some_and(|s| s != TripwireState::Armed)
+            })
+            .count() as i64,
     })
 }
 
@@ -5273,6 +5313,72 @@ mod tests {
         let open = titles_in(View::Open);
         assert!(open.contains(&"filed in a project".to_string()));
         assert!(open.contains(&"filed in a view section".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod monitor_view_tests {
+    //! A monitor is standing infrastructure, not a todo: it never sits in the
+    //! Inbox, a fired one is on Today, and the Monitors view lists every one.
+
+    use super::*;
+    use crate::db::schema::test_conn;
+
+    fn monitor(conn: &Connection, title: &str, state: &str, status: &str) -> Task {
+        let t = create(conn, &NewTask { title: title.into(), ..Default::default() }).unwrap();
+        conn.execute(
+            "UPDATE tasks SET tripwire = 'script:x', tripwire_on_trip = 'monitor', \
+             tripwire_state = ?2, status = ?3 WHERE id = ?1",
+            params![t.id, state, status],
+        )
+        .unwrap();
+        get(conn, &t.id).unwrap().unwrap()
+    }
+
+    fn titles(conn: &Connection, v: View) -> Vec<String> {
+        let mut t: Vec<String> = list(conn, &ListFilters { view: Some(v), ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        t.sort();
+        t
+    }
+
+    #[test]
+    fn monitors_leave_the_inbox_fired_ones_go_to_today_and_all_have_a_view() {
+        let conn = test_conn();
+        create(&conn, &NewTask { title: "loose todo".into(), ..Default::default() }).unwrap();
+        monitor(&conn, "fired", "tripped", "todo");
+        monitor(&conn, "broken", "error", "todo");
+        let quiet = monitor(&conn, "quiet", "armed", "todo");
+        monitor(&conn, "handled", "armed", "done");
+        // A section must not lift a quiet monitor above the fired ones.
+        let personal = crate::db::projects::create_section(&conn, None, "Personal").unwrap();
+        crate::db::projects::move_task_to_section(&conn, &quiet.id, Some(&personal.id)).unwrap();
+        // A one-time tripwire that tripped is ordinary surfaced work, not a monitor.
+        let one_shot = create(&conn, &NewTask { title: "one-shot".into(), ..Default::default() }).unwrap();
+        conn.execute(
+            "UPDATE tasks SET tripwire = 'script:x', tripwire_state = 'tripped' WHERE id = ?1",
+            params![one_shot.id],
+        )
+        .unwrap();
+
+        assert_eq!(titles(&conn, View::Inbox), vec!["loose todo", "one-shot"]);
+        assert_eq!(titles(&conn, View::Today), vec!["broken", "fired"]);
+        assert_eq!(titles(&conn, View::Monitors), vec!["broken", "fired", "handled", "quiet"]);
+
+        // Fired first: the armed-sinks rule orders the view without a special case.
+        let order: Vec<String> = list(&conn, &ListFilters { view: Some(View::Monitors), ..Default::default() })
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert!(order[..2].iter().all(|t| t == "fired" || t == "broken"), "{order:?}");
+
+        let counts = view_counts(&conn).unwrap();
+        assert_eq!(counts.monitors, 2, "badge = fired monitors, not the view's length");
+        assert_eq!(counts.inbox, 2);
     }
 }
 

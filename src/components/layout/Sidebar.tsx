@@ -16,6 +16,7 @@ import {
   ListTodo,
   Palette,
   Pencil,
+  RefreshCw,
   Sun,
   Plus,
   RotateCcw,
@@ -77,7 +78,7 @@ type ViewRow = {
    * for the inbox you file into, amber for the day, sand for waiting, green for
    * done, grey for put away. */
   hue: Hue;
-  countKey?: "inbox" | "today" | "waiting" | "in_review";
+  countKey?: "inbox" | "today" | "waiting" | "in_review" | "monitors";
   /**
    * Other views this row stays lit for, because they are reached from *inside*
    * it rather than from the sidebar.
@@ -110,6 +111,10 @@ const VIEWS: ViewRow[] = [
   // Oldest first, because age is what this list exists to show.
   { key: "waiting", label: "Waiting", icon: Hourglass, hue: "sand", countKey: "waiting" },
   { key: "in_review", label: "In Review", icon: Wand2, hue: "purple", countKey: "in_review" },
+  // Standing checks. Their own row because a monitor is infrastructure, not
+  // a todo — mixed into the Inbox, a recurring report taught you to skim past
+  // both. The badge counts FIRED monitors only; a fired one is also on Today.
+  { key: "monitors", label: "Monitors", icon: RefreshCw, hue: "orange", countKey: "monitors" },
   // "Open" is everything not HELD. A future due date is a deadline, not a
   // start date, so dated work belongs here from the day it is filed — hiding
   // it until the morning it falls due is how a deadline becomes a surprise.
@@ -597,7 +602,7 @@ export function Sidebar() {
     }
   ) {
     const Icon = v.icon;
-    const count = v.countKey ? counts[v.countKey] : 0;
+    const count = v.countKey ? (counts[v.countKey] ?? 0) : 0;
     const selected =
       (view === v.key || (v.covers?.includes(view) ?? false)) && !activeProject;
     return (
