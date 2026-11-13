@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::tasks::{self, Task, CLOSED_STATUSES, DEFER_PASSED, LIVE};
 use crate::error::AppError;
-use crate::tripwire::{self, OnTrip, Outcome, OutcomeKind};
+use crate::tripwire::{self, OnTrip, Outcome, OutcomeKind, TripwireState};
 
 /// One row of `tripwire_runtime`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +176,27 @@ pub fn runtime_map(conn: &Connection) -> Result<HashMap<String, Runtime>, AppErr
 /// runner keeps checking while it is done.
 const OPEN_OR_MONITOR: &str = "tripwire_on_trip = 'monitor'";
 
+/// A tripped monitor that keeps being checked so it can CLEAR ITSELF: any
+/// tripped monitor not tagged [`tasks::STICKY_TAG`]. Written over the alias
+/// `tasks` because the sticky predicate is correlated on that name.
+fn rechecks_while_tripped_sql() -> String {
+    format!(
+        "(tasks.tripwire_on_trip = 'monitor' AND tasks.tripwire_state = 'tripped' AND NOT {})",
+        tasks::is_sticky_sql()
+    )
+}
+
+/// The Rust twin of [`rechecks_while_tripped_sql`], for `record`'s re-read.
+fn rechecks_while_tripped(conn: &Connection, task: &Task) -> Result<bool, AppError> {
+    if !task.is_monitor()
+        || task.tripwire_state.as_deref().map(TripwireState::from_db) != Some(TripwireState::Tripped)
+    {
+        return Ok(false);
+    }
+    let sql = format!("SELECT NOT {} FROM tasks WHERE id = ?1", tasks::is_sticky_sql());
+    Ok(conn.query_row(&sql, params![task.id], |r| r.get::<_, bool>(0))?)
+}
+
 /// The lease predicate: nobody holds one, or the one held has expired.
 const LEASE_FREE: &str = "(r.lease_id IS NULL OR datetime(r.lease_expires_at) < datetime('now'))";
 
@@ -189,16 +210,17 @@ const LEASE_FREE: &str = "(r.lease_id IS NULL OR datetime(r.lease_expires_at) < 
 pub fn list_due(conn: &Connection, limit: usize) -> Result<Vec<(Task, Runtime)>, AppError> {
     let closed = tasks::closed_list();
     let sql = format!(
-        "SELECT t.id, r.task_id IS NOT NULL
-           FROM tasks t
-           LEFT JOIN tripwire_runtime r ON r.task_id = t.id
+        "SELECT tasks.id, r.task_id IS NOT NULL
+           FROM tasks
+           LEFT JOIN tripwire_runtime r ON r.task_id = tasks.id
           WHERE {LIVE}
-            AND (t.status NOT IN ({closed}) OR t.{OPEN_OR_MONITOR})
-            AND t.tripwire IS NOT NULL
-            AND t.tripwire_state = 'armed'
+            AND (tasks.status NOT IN ({closed}) OR tasks.{OPEN_OR_MONITOR})
+            AND tasks.tripwire IS NOT NULL
+            AND (tasks.tripwire_state = 'armed' OR {rechecks})
             AND {DEFER_PASSED}
             AND (r.task_id IS NULL OR {LEASE_FREE})
-          ORDER BY (r.requested_at IS NULL) ASC, COALESCE(r.checked_at, '') ASC, t.created_at ASC"
+          ORDER BY (r.requested_at IS NULL) ASC, COALESCE(r.checked_at, '') ASC, tasks.created_at ASC",
+        rechecks = rechecks_while_tripped_sql(),
     );
     let mut stmt = conn.prepare(&sql)?;
     let candidates: Vec<(String, bool)> = stmt
@@ -339,10 +361,13 @@ pub fn record(
         };
         let closed = CLOSED_STATUSES.contains(&task.status.as_str());
         let monitor = task.is_monitor();
+        // A tripped, non-sticky monitor is re-checked so it can clear itself.
+        // Its attempt is still ours; what it may do is narrower (below).
+        let rechecking = rechecks_while_tripped(conn, &task)?;
         let still_ours = task.deleted_at.is_none()
             && task.archived_at.is_none()
             && (!closed || monitor)
-            && task.tripwire_armed()
+            && (task.tripwire_armed() || rechecking)
             && task.tripwire.as_deref() == rt.lease_spec.as_deref();
         if !still_ours {
             return discarded(conn);
@@ -375,6 +400,42 @@ pub fn record(
 
         let spec = task.tripwire.clone().unwrap_or_default();
         let transition = match kind {
+            // Still true on a re-check: stay tripped, quietly. No banner, and a
+            // comment only when the finding itself changed, so a monitor that
+            // stays true for a month doesn't post thirty identical notes.
+            OutcomeKind::Tripped if rechecking => {
+                if rt.last_note.as_deref().unwrap_or("") != note {
+                    let evidence = if note.is_empty() { "(no output)" } else { note.as_str() };
+                    crate::db::comments::add(
+                        conn,
+                        task_id,
+                        crate::db::comments::AUTHOR_TRIPWIRE,
+                        &format!("Still tripped, finding updated · {spec}\n\n{evidence}"),
+                    )?;
+                }
+                None
+            }
+            // False on a re-check: the problem went away by itself. Back to
+            // armed, which takes it off Today, and say so in the log.
+            OutcomeKind::NotYet if rechecking => {
+                conn.execute(
+                    "UPDATE tasks
+                        SET tripwire_state = 'armed', tripwire_tripped_at = NULL,
+                            updated_at = datetime('now')
+                      WHERE id = ?1",
+                    params![task_id],
+                )?;
+                crate::db::comments::add(
+                    conn,
+                    task_id,
+                    crate::db::comments::AUTHOR_TRIPWIRE,
+                    &format!(
+                        "Cleared on its own · {spec}\n\nThe check came back false, so this \
+                         monitor is watching again and is off Today."
+                    ),
+                )?;
+                None
+            }
             OutcomeKind::Tripped => {
                 conn.execute(
                     "UPDATE tasks
@@ -981,6 +1042,74 @@ mod tests {
         trip(&conn, &s, "not-a-run");
         let comments = crate::db::comments::for_task(&conn, &s.id).unwrap();
         assert!(!comments.last().unwrap().body.contains("Full report"));
+    }
+
+    /// A tripped monitor keeps being checked: still true stays tripped with no
+    /// banner (and no comment unless the finding changed); false clears it.
+    #[test]
+    fn a_tripped_monitor_rechecks_and_clears_itself_when_the_check_goes_false() {
+        let conn = test_conn();
+        let m = monitor(&conn);
+        trip(&conn, &m, "l1");
+        let comments = || crate::db::comments::for_task(&conn, &m.id).unwrap().len();
+        let before = comments();
+
+        // Re-checked although tripped. Make it due now rather than in a week.
+        request_check(&conn, &m.id).unwrap();
+        assert_eq!(list_due(&conn, 10).unwrap().len(), 1, "a tripped monitor is still checked");
+
+        // Same finding: silent.
+        let r = trip(&conn, &m, "l2");
+        assert!(!r.discarded && r.transition.is_none(), "{r:?}");
+        assert_eq!(comments(), before, "an unchanged finding posts nothing");
+        assert_eq!(tasks::get(&conn, &m.id).unwrap().unwrap().tripwire_state.as_deref(), Some("tripped"));
+
+        // Changed finding: one note, still no banner.
+        request_check(&conn, &m.id).unwrap();
+        assert!(claimed(&conn, &m, "l3"));
+        let r = record(&conn, &m.id, "l3", &Outcome::Tripped("1 broken path".into())).unwrap();
+        assert!(r.transition.is_none());
+        assert_eq!(comments(), before + 1);
+
+        // False: cleared, off Today, and said so.
+        request_check(&conn, &m.id).unwrap();
+        assert!(claimed(&conn, &m, "l4"));
+        let r = record(&conn, &m.id, "l4", &Outcome::NotYet(String::new())).unwrap();
+        assert!(!r.discarded);
+        let after = tasks::get(&conn, &m.id).unwrap().unwrap();
+        assert!(after.tripwire_armed(), "a false re-check re-arms");
+        assert!(after.tripwire_tripped_at.is_none());
+        let log = crate::db::comments::for_task(&conn, &m.id).unwrap();
+        assert!(log.last().unwrap().body.starts_with("Cleared on its own"));
+        let today = tasks::list(&conn, &tasks::ListFilters { view: Some(tasks::View::Today), ..Default::default() }).unwrap();
+        assert!(today.iter().all(|t| t.id != m.id), "a cleared monitor leaves Today");
+    }
+
+    /// A `sticky` monitor is an EVENT check: it stays tripped, unchecked, until
+    /// Chris completes it, exactly as every monitor did before.
+    #[test]
+    fn a_sticky_monitor_stays_tripped_until_completed() {
+        let conn = test_conn();
+        let m = monitor(&conn);
+        crate::db::tags::set_for_task(&conn, &m.id, &["sticky".to_string()]).unwrap();
+        trip(&conn, &m, "l1");
+        request_check(&conn, &m.id).unwrap();
+        assert!(list_due(&conn, 10).unwrap().is_empty(), "a sticky tripped monitor is not re-checked");
+        // Even a stray attempt can't clear it.
+        assert!(claimed(&conn, &m, "l2"));
+        let r = record(&conn, &m.id, "l2", &Outcome::NotYet(String::new())).unwrap();
+        assert!(r.discarded);
+        assert_eq!(tasks::get(&conn, &m.id).unwrap().unwrap().tripwire_state.as_deref(), Some("tripped"));
+    }
+
+    /// A one-time tripwire that tripped is not re-checked: only monitors are.
+    #[test]
+    fn a_tripped_one_shot_is_not_rechecked() {
+        let conn = test_conn();
+        let t = armed(&conn, Some(60));
+        trip(&conn, &t, "l1");
+        request_check(&conn, &t.id).unwrap();
+        assert!(list_due(&conn, 10).unwrap().is_empty());
     }
 
     /// A monitor that is done and quiet stays done — a not-yet moves nothing.

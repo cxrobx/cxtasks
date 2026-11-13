@@ -184,7 +184,7 @@ pub struct FileTaskParams {
     )]
     pub tripwire_check_every: Option<String>,
     #[schemars(
-        description = "What a trip does: 'surface' (default) puts the task back on the board with the evidence for a human to read; 'complete' ALSO marks it done at once so anything blocked_by it is released — which means nobody reads the evidence first. Use 'complete' only for a pure gate task whose whole job is to wait for the condition. 'monitor' makes it a STANDING check that fires every time something breaks (a weekly audit, a budget watch): it surfaces like 'surface', but completing the task means 'handled' — the tripwire re-arms and is checked again on the runner's next tick, it keeps being checked while the task is done, and a trip reopens it. Archive the task (or clear the tripwire) to retire a monitor. A monitor can't also have a recurrence."
+        description = "What a trip does: 'surface' (default) puts the task back on the board with the evidence for a human to read; 'complete' ALSO marks it done at once so anything blocked_by it is released — which means nobody reads the evidence first. Use 'complete' only for a pure gate task whose whole job is to wait for the condition. 'monitor' makes it a STANDING check that fires every time something breaks (a weekly audit, a budget watch): it surfaces like 'surface', but completing the task means 'handled' — the tripwire re-arms and is checked again on the runner's next tick, it keeps being checked while the task is done, and a trip reopens it. Archive the task (or clear the tripwire) to retire a monitor. A TRIPPED monitor keeps being checked and clears itself when its check comes back false (a STATE check: disk, version, service). Tag it 'sticky' for an EVENT check (a new email, a nightly report) whose next check is false merely because nothing new happened — a sticky monitor stays tripped until completed. A monitor can't also have a recurrence."
     )]
     pub tripwire_on_trip: Option<String>,
 }
@@ -429,7 +429,7 @@ pub struct UpdateTaskParams {
     )]
     pub tripwire_check_every: Option<String>,
     #[schemars(
-        description = "'surface' (default), 'complete' — a trip also completes the task and releases what it blocks, unread — or 'monitor': a standing check. Completing a monitor means 'handled': it re-arms and is re-checked on the runner's next tick, it keeps being checked while done, and a trip reopens it. Archive it to retire it."
+        description = "'surface' (default), 'complete' — a trip also completes the task and releases what it blocks, unread — or 'monitor': a standing check. Completing a monitor means 'handled': it re-arms and is re-checked on the runner's next tick, it keeps being checked while done, and a trip reopens it. Archive it to retire it. A TRIPPED monitor keeps being checked and clears itself when its check comes back false (a STATE check: disk, version, service). Tag it 'sticky' for an EVENT check (a new email, a nightly report) whose next check is false merely because nothing new happened — a sticky monitor stays tripped until completed."
     )]
     pub tripwire_on_trip: Option<String>,
     #[schemars(
@@ -1467,6 +1467,10 @@ fn format_tripwire(
         s.push_str(
             "              monitor:    standing check — complete_task = handled (re-arms, re-checks \
              on the next tick); archive to retire it\n",
+        );
+        s.push_str(
+            "              clears:     on its own when a re-check comes back false, unless tagged \
+             'sticky' (an event check, which stays tripped until completed)\n",
         );
     }
     Some(s)

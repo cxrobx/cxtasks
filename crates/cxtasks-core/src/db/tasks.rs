@@ -985,6 +985,25 @@ pub const TRIPWIRE_NOT_ARMED: &str = "(tripwire_state IS NULL OR tripwire_state 
 /// both runner claim paths skip it, and the background queue refuses it.
 pub const DECISION_TAG: &str = "decision";
 
+/// The tag that keeps a fired MONITOR fired until Chris completes it. Same
+/// convention as [`DECISION_TAG`]: a tag, not a column (invariant 29).
+///
+/// Without it a tripped monitor keeps being checked and clears itself the
+/// first time its check comes back false — right for a STATE check (disk
+/// space, a version, a service running), where false means "fixed". Wrong for
+/// an EVENT check (a new email, a nightly report), where the next check is
+/// false because nothing NEW happened, and clearing would hide the finding
+/// before anyone read it. Those carry this tag.
+pub const STICKY_TAG: &str = "sticky";
+
+/// Row-side predicate: the task carries [`STICKY_TAG`].
+pub fn is_sticky_sql() -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM task_tags cxs_tt JOIN tags cxs_g ON cxs_g.id = cxs_tt.tag_id
+                 WHERE cxs_tt.task_id = tasks.id AND cxs_g.name = '{STICKY_TAG}' COLLATE NOCASE)"
+    )
+}
+
 /// Row-side predicate: the task carries [`DECISION_TAG`].
 pub fn is_decision_sql() -> String {
     format!(
