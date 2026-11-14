@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, ClipboardPaste, GitMerge, ImagePlus, Send, Trash2, User, X, Zap } from "lucide-react";
+import { Bot, ChevronRight, ClipboardPaste, GitMerge, ImagePlus, Send, Trash2, User, X, Zap } from "lucide-react";
 import { api } from "@/lib/tauri";
 import { useImagePaste } from "@/hooks/useImagePaste";
 import { cn } from "@/lib/utils";
@@ -42,21 +42,85 @@ export function TaskActivity({ task, runs }: { task: Task; runs: TaskRun[] }) {
   const comments = useTaskStore((s) => s.comments);
   const entries = activityEntries(comments, runs);
   const latestWork = runs.find((run) => run.intent === "work" && run.finished_at)?.id;
+  // What Chris opened or shut by hand. Everything else follows the rule in
+  // `entryOpen`, which is derived per render because runs and comments arrive
+  // after the pane mounts (the reason `DetailTabs` derives its default tab).
+  const [toggled, setToggled] = useState<Record<string, boolean>>({});
   return (
     <section className="flex flex-col gap-3">
       <CommentComposer task={task} />
       {entries.length > 0 && (
         <ul className="flex flex-col gap-3">
-          {entries.map((e) =>
-            e.kind === "run" ? (
-              <RunEntry key={`r-${e.run.id}`} run={e.run} task={task} latestWork={latestWork} />
+          {entries.map((e, index) => {
+            const key = e.kind === "run" ? `r-${e.run.id}` : `c-${e.comment.id}`;
+            const open = toggled[key] ?? entryOpen(e, index, latestWork);
+            if (!open) {
+              return (
+                <FoldedEntry key={key} entry={e} onOpen={() => setToggled((t) => ({ ...t, [key]: true }))} />
+              );
+            }
+            return e.kind === "run" ? (
+              <RunEntry key={key} run={e.run} task={task} latestWork={latestWork} />
             ) : (
-              <CommentEntry key={`c-${e.comment.id}`} comment={e.comment} />
-            )
-          )}
+              <CommentEntry key={key} comment={e.comment} />
+            );
+          })}
         </ul>
       )}
     </section>
+  );
+}
+
+/**
+ * Only the newest entry opens in full; older ones are one line each.
+ *
+ * The feed is read for where the task stands, and that is the top entry. With
+ * every entry open, a task with six agent comments was a few thousand
+ * characters to scroll past, and Chris had stopped reading any of them. Two
+ * entries never fold: a run that is still going (its Stop button lives in the
+ * entry) and the run that offers "Continue in Claude".
+ */
+function entryOpen(e: Entry, index: number, latestWork?: string): boolean {
+  if (index === 0) return true;
+  if (e.kind !== "run") return false;
+  return e.run.status === "running" || e.run.id === latestWork;
+}
+
+/** The first line of an entry, without its markdown marks. */
+export function firstLine(text: string | null | undefined): string {
+  const line = (text ?? "").split("\n").find((l) => l.trim().length > 0) ?? "";
+  return line
+    .trim()
+    .replace(/^(#{1,6}|[-*+>]|\d+\.)\s+/, "")
+    .replace(/^\[[ xX]\]\s+/, "")
+    .replace(/[*_`]/g, "");
+}
+
+function FoldedEntry({ entry: e, onOpen }: { entry: Entry; onOpen: () => void }) {
+  const run = e.kind === "run" ? e.run : null;
+  const agent = run !== null || (e.kind === "comment" && e.comment.author !== "me");
+  const who = run ? (run.intent === "review" ? "background review" : run.mode) : e.kind === "comment" ? e.comment.author : "";
+  const text = run ? firstLine(run.result_text) : e.kind === "comment" ? firstLine(e.comment.body) || "attachment" : "";
+  const at = run ? run.started_at : e.kind === "comment" ? e.comment.created_at : "";
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-expanded={false}
+        className="flex w-full items-center gap-2 rounded text-left text-[11px] text-content-muted hover:bg-content/6"
+      >
+        <Glyph agent={agent}>
+          <ChevronRight size={11} />
+        </Glyph>
+        <span className="shrink-0 font-medium text-content-secondary">{who}</span>
+        {run && <span className={cn("shrink-0", RUN_STATUS_CLASS[run.status])}>{RUN_STATUS_LABELS[run.status] ?? run.status}</span>}
+        <span className="min-w-0 flex-1 truncate">{text}</span>
+        <span className="shrink-0 text-[10.5px] text-content-faint">
+          <When at={at} />
+        </span>
+      </button>
+    </li>
   );
 }
 

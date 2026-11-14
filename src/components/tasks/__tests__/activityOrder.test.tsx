@@ -137,6 +137,42 @@ describe("activity ordering", () => {
   });
 });
 
+describe("folding older entries", () => {
+  beforeEach(() => {
+    useTaskStore.setState({ comments: [], attachments: [] });
+  });
+
+  it("opens only the newest entry and shows older ones as their first line", () => {
+    useTaskStore.setState({
+      comments: [
+        comment("c1", "## Old finding\n\nthe second paragraph of the old one", "2026-08-01 09:00:00.000"),
+        comment("c2", "newest line\n\nnewest detail", "2026-08-01 10:00:00.000"),
+      ],
+    });
+    render(<TaskActivity task={task} runs={[]} />);
+
+    expect(screen.getByText("newest detail")).toBeInTheDocument();
+    expect(screen.queryByText(/second paragraph/)).toBeNull();
+    // The folded line carries the first line without its heading marks.
+    const folded = screen.getByRole("button", { name: /Old finding/ });
+    expect(folded.textContent).not.toContain("#");
+
+    fireEvent.click(folded);
+    expect(screen.getByText(/second paragraph/)).toBeInTheDocument();
+    // Opening one does not shut the newest.
+    expect(screen.getByText("newest detail")).toBeInTheDocument();
+  });
+
+  it("never folds a run that is still going", () => {
+    useTaskStore.setState({
+      comments: [comment("c1", "a later comment", "2026-08-01 12:00:00.000")],
+    });
+    const going = { ...run("r1", "2026-08-01 10:00:00", ""), mode: "background", status: "running" } as TaskRun;
+    render(<TaskActivity task={task} runs={[going]} />);
+    expect(screen.getByRole("button", { name: /stop/i })).toBeInTheDocument();
+  });
+});
+
 describe("the composer", () => {
   it("offers Post only once there is something to post", () => {
     useTaskStore.setState({ comments: [], attachments: [] });

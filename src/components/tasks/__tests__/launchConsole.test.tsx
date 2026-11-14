@@ -148,9 +148,9 @@ describe("the launch console rail", () => {
   it("closes the editor when its own node is clicked again", () => {
     mount();
     fireEvent.click(node(/Brief/));
-    expect(screen.getByPlaceholderText(/What should the agent do first/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/What the agent needs/)).toBeInTheDocument();
     fireEvent.click(node(/Brief/));
-    expect(screen.queryByPlaceholderText(/What should the agent do first/)).toBeNull();
+    expect(screen.queryByPlaceholderText(/What the agent needs/)).toBeNull();
   });
 
   // The workspace is the only setting that can be genuinely unset, and the rail
@@ -192,7 +192,7 @@ describe("leaving an editor with unsaved text", () => {
   it("commits the brief when the console is collapsed", () => {
     mount();
     fireEvent.click(node(/Brief/));
-    fireEvent.change(screen.getByPlaceholderText(/What should the agent do first/), {
+    fireEvent.change(screen.getByPlaceholderText(/What the agent needs/), {
       target: { value: "start with the failing test" },
     });
     fireEvent.click(screen.getByTitle(/Collapse the launch console/));

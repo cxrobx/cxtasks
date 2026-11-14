@@ -55,12 +55,53 @@ use std::sync::Arc;
 /// splices it into the two field descriptions, and `concat!` takes no consts.
 macro_rules! notes_format {
     () => {
-        "Renders as markdown in the app, so write it to be scanned. Open with one line saying what this is or where it stands. Then structure: `##` headings, bullets, a table for comparisons, `- [ ]` steps (they render as checkboxes), `<details><summary>…</summary>` to fold long material. Paragraphs of two or three sentences, never one long block. Code, paths, commands and anything in angle brackets go in backticks; outside them `Vec<String>` renders as \"Vec\". Draw a diagram only when a picture carries the mechanism: inline SVG as in an Onyx artifact (`<svg viewBox>` with rect/path/line/text and a `<marker>` arrow), coloured with var(--clay), var(--slate), var(--oat), var(--white) and var(--gray-300) so it follows the light and dark themes. Scripts, style blocks, iframes and on* handlers are stripped. The reply ends with a RENDER CHECK line if anything won't show or reads as a wall."
+        "Chris reads these, and he stops reading long ones — so they hold only what HE needs. One line saying what this is and why it matters, then at most five short bullets: what he has to do or decide, and the one date or amount that matters. Over 500 characters is REFUSED. Everything an agent needs to do the work — files, commands, findings, what was ruled out, the done-check — goes in `prompt`, never here; progress and history go in comments. No headings, tables or diagrams. Renders as markdown: code, paths and anything in angle brackets go in backticks (outside them `Vec<String>` renders as \"Vec\"). The reply ends with a RENDER CHECK line if anything won't show."
     };
 }
 
+/// The longest title an agent may file. Guidance in the description is 60;
+/// the refusal sits above it so a title one word over is not bounced.
+pub const TITLE_MAX_CHARS: usize = 70;
+
+/// The longest notes an agent may file.
+///
+/// Measured on the real DB on 2026-11-14: 90 open tasks averaged 1,097
+/// characters of notes, 66 of them over 600, and Chris had stopped reading
+/// them. The wall check in `prose.rs` only warned, and an agent satisfies it by
+/// adding headings to the same amount of text. Notes are the human's layer;
+/// what an agent needs lives in `prompt`, which the pane keeps collapsed.
+///
+/// Enforced at the MCP handlers only, like [`COMMENT_MAX_CHARS`]: the app's
+/// own editor writes through `db::tasks` and Chris may type what he likes.
+pub const NOTES_MAX_CHARS: usize = 500;
+
+/// Refuse a title or notes over the limit, before anything is written.
+fn check_lengths(title: Option<&str>, notes: Option<&str>, agent_field: &str) -> Result<(), McpError> {
+    let mut problems = Vec::new();
+    if let Some(n) = title.map(|t| t.trim().chars().count()).filter(|n| *n > TITLE_MAX_CHARS) {
+        problems.push(format!(
+            "the title is {n} characters; the limit is {TITLE_MAX_CHARS} (aim for under 60). \
+             Keep the action and its object, and move reasons, amounts and second clauses out"
+        ));
+    }
+    if let Some(n) = notes.map(|b| b.trim().chars().count()).filter(|n| *n > NOTES_MAX_CHARS) {
+        problems.push(format!(
+            "the notes are {n} characters; the limit is {NOTES_MAX_CHARS}. Notes are what Chris \
+             reads: one line on what this is, then at most five short bullets of what he has to \
+             do or decide. Move everything an agent needs into {agent_field}"
+        ));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(McpError::invalid_params(
+        format!("Too long, nothing was written:\n- {}", problems.join("\n- ")),
+        None,
+    ))
+}
+
 const FILE_TASK_BODY_DOC: &str = concat!(
-    "Optional longer notes: context, links, acceptance criteria. ",
+    "Optional notes for Chris. ",
     notes_format!()
 );
 
@@ -74,7 +115,7 @@ const UPDATE_TASK_BODY_DOC: &str = concat!(
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileTaskParams {
-    #[schemars(description = "Short imperative title, e.g. 'fix the intake webhook retry'")]
+    #[schemars(description = "Short imperative title Chris can scan: the action and its object, under 60 characters (over 70 is REFUSED), e.g. 'Fix the intake webhook retry'. No reasons, amounts, parentheses or a second clause after a dash — those go in the notes.")]
     pub title: String,
     #[schemars(
         required,
@@ -111,7 +152,7 @@ pub struct FileTaskParams {
     )]
     pub repo_path: Option<String>,
     #[schemars(
-        description = "SEED PROMPT — write this whenever repo_path is set. It is what a fresh agent reads when the task is picked up, and that agent has NONE of this conversation's context, so a bare title is not actionable. Include: the concrete files/symbols involved, the observable failure mode (exact error text if known), WHAT YOU ALREADY RULED OUT (highest-value part — it stops the next agent rediscovering it), what 'done' looks like as a checkable condition, and any constraints. Imperative, addressed to a competent stranger; never write 'as discussed above'. If the task is genuinely unscoped, say so and state that investigation is step one — an honestly vague prompt beats a falsely specific one."
+        description = "AGENT INSTRUCTIONS — write this whenever repo_path is set. Chris does not read it (the app keeps it folded), so everything too detailed for the notes belongs here, at whatever length the work needs. It is what a fresh agent reads when the task is picked up, and that agent has NONE of this conversation's context, so a bare title is not actionable. Include: the concrete files/symbols involved, the observable failure mode (exact error text if known), WHAT YOU ALREADY RULED OUT (highest-value part — it stops the next agent rediscovering it), what 'done' looks like as a checkable condition, and any constraints. Imperative, addressed to a competent stranger; never write 'as discussed above'. If the task is genuinely unscoped, say so and state that investigation is step one — an honestly vague prompt beats a falsely specific one."
     )]
     pub prompt: Option<String>,
     #[schemars(
@@ -382,7 +423,7 @@ pub struct UpdateTaskParams {
     pub recurrence: Option<String>,
     #[schemars(description = "Absolute repo path for execution context")]
     pub repo_path: Option<String>,
-    #[schemars(description = "Seed prompt for a dispatched session")]
+    #[schemars(description = "Replace the agent instructions: what a fresh agent needs to do the work (files, findings, what was ruled out, the done-check). Chris does not read this; it is where detail too long for `body` goes.")]
     pub prompt: Option<String>,
     #[schemars(description = "Allow unattended background execution")]
     pub bg_allowed: Option<bool>,
@@ -642,7 +683,7 @@ pub struct TagTaskParams {
 pub struct CommentTaskParams {
     #[schemars(description = "Task reference: either the UUID or the short T-number as printed by list_tasks / file_task (e.g. 'T42' — case-insensitive).")]
     pub task_id: String,
-    #[schemars(description = "The comment text. Capped at 2,000 characters — see `handoff` for anything longer. Renders as markdown: short paragraphs or bullets, never one long block; code, paths and anything in angle brackets go in backticks.")]
+    #[schemars(description = "The comment text, for Chris to scan: where it stands and what he needs to do, in a line or a few bullets. Capped at 600 characters — see `handoff` for anything longer. Renders as markdown; code, paths and anything in angle brackets go in backticks.")]
     pub body: String,
     #[schemars(
         description = "Set true when `body` is a full HANDOFF rather than a note — you are leaving the task mid-way and want the next session to pick up where you stopped. The full text is stored on a run row and replayed verbatim into the next dispatch (no length cap), while the log gets a one-line summary derived from your opening line. Foreground sessions only: in an unattended run the handoff is captured from your FINAL MESSAGE and this is refused."
@@ -663,9 +704,9 @@ pub struct CommentTaskParams {
 pub struct FileFollowupParams {
     #[schemars(description = "Reference of the task you are working on — the UUID or T-number from your prompt. The follow-up is a separate untriaged task linked to it.")]
     pub task_id: String,
-    #[schemars(description = "What needs doing, as an imperative one-liner. 'Add a retry to the intake webhook on 429', not 'webhook issue'.")]
+    #[schemars(description = "What needs doing, as an imperative one-liner under 60 characters (over 70 is refused). 'Add a retry to the intake webhook on 429', not 'webhook issue'.")]
     pub title: String,
-    #[schemars(description = "Why this is needed and what you already know: the files, the failure, what you ruled out. Written for an agent that will have none of your context. Renders as markdown: short paragraphs or bullets, with code and paths in backticks.")]
+    #[schemars(description = "Why this is needed and what you already know: the files, the failure, what you ruled out. Written for an agent that will have none of your context, and stored as the follow-up's agent instructions — Chris reads only the title, so make the title say what it is. Renders as markdown: short paragraphs or bullets, with code and paths in backticks.")]
     pub body: Option<String>,
     #[schemars(description = "0=highest .. 3=lowest. Defaults to 3 — you are proposing work, not scheduling it.")]
     pub priority: Option<i64>,
@@ -848,8 +889,9 @@ result or a comment.
 WRITING TO A TASK: every label get_task prints IS the field you write back
 (`body` under Notes, `due_at`, `defer_until`, `repo_path`, `prompt`, `status`).
 Deferral is the `defer_until` date, never a status. An unknown field is REFUSED
-and fails the whole call; the refusal lists the real names. How to format
-notes, comments and results is in those fields' own descriptions."#;
+and fails the whole call; the refusal lists the real names. Chris reads the
+title and notes, so keep them short (limits are in those fields' descriptions);
+what an agent needs goes in `prompt`."#;
 
 /// How much of a server's `instructions` Claude Code shows the model. Measured,
 /// not documented: this session's own system prompt cut the cxtasks text at
@@ -937,10 +979,9 @@ fn vet_tags(conn: &rusqlite::Connection, names: &[String], allow_new: bool) -> R
 /// replays at 1,200 chars, so those entries reached the next agent as six
 /// mid-sentence fragments — the bound held and the content did not.
 ///
-/// 2,000 is deliberately *above* that replay bound rather than equal to it: a
-/// chunky, legitimately-long note should be admitted whole even though a
-/// prompt will clip it, while the 2–4k dumps that motivated this are refused.
-/// The refusal names the channel those belong in instead — `handoff: true`, or
+/// It was 2,000 until 2026-11-14, set against that replay bound. It is 600 now
+/// for a different reader: Chris scans the log in the pane, and entries of a
+/// thousand characters were being skipped. The refusal names the channel those belong in instead — `handoff: true`, or
 /// `complete_task`'s `result` — so it is a redirection, not a wall.
 ///
 /// **Enforced at this handler only.** `db::comments::add` stays uncapped
@@ -949,7 +990,7 @@ fn vet_tags(conn: &rusqlite::Connection, names: &[String], allow_new: bool) -> R
 /// other already writes a derived ~200-char summary. A length policy in the
 /// data layer would be a policy about *storage*; this is a policy about what an
 /// agent is allowed to file, which is a property of the entry point.
-pub const COMMENT_MAX_CHARS: usize = 2_000;
+pub const COMMENT_MAX_CHARS: usize = 600;
 
 /// How many comments `get_task` renders, newest-first-then-oldest-first within
 /// the window.
@@ -959,11 +1000,11 @@ pub const COMMENT_MAX_CHARS: usize = 2_000;
 /// `take(5)` at 400 chars each. T32 alone returned 33k characters of comments.
 const DETAIL_COMMENTS: usize = 10;
 
-/// Per-comment character bound in `get_task`, deliberately **tied** to
+/// Per-comment character bound in `get_task`. Never below
 /// [`COMMENT_MAX_CHARS`]: a comment this server was willing to accept must
-/// render whole when it is read back. Set it lower and the tool truncates
-/// entries it just told the caller were fine.
-const DETAIL_COMMENT_CHARS: usize = COMMENT_MAX_CHARS;
+/// render whole when it is read back. It stays at the old 2,000 cap so the
+/// comments filed under that cap still read whole.
+const DETAIL_COMMENT_CHARS: usize = 2_000;
 
 #[derive(Clone)]
 pub struct CxTasksMcp {
@@ -1578,7 +1619,7 @@ fn format_detail(
         s.push_str(&format!("\nNotes (write as `body`):\n{body}\n"));
     }
     if let Some(p) = t.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
-        s.push_str(&format!("\nSeed prompt (write as `prompt`):\n{p}\n"));
+        s.push_str(&format!("\nAgent instructions (write as `prompt`):\n{p}\n"));
     }
     if !children.is_empty() {
         s.push_str("\nSubtasks:\n");
@@ -1978,7 +2019,7 @@ impl CxTasksMcp {
 
     #[tool(
         name = "file_task",
-        description = "File a todo into CXTasks so it survives this session. Two params carry almost all the value and only YOU can supply them: `repo_path` (your current working directory — the MCP server cannot see it) and `prompt` (a seed prompt for the agent that picks this up later, which will have none of this conversation's context). Write a real seed prompt whenever repo_path is set; without it the next session starts over instead of starting work. Everything else is optional, and a task with no repo_path is a perfectly good plain todo."
+        description = "File a todo into CXTasks so it survives this session. Two params carry almost all the value and only YOU can supply them: `repo_path` (your current working directory — the MCP server cannot see it) and `prompt` (the instructions for the agent that picks this up later, which will have none of this conversation's context). Write real instructions whenever repo_path is set; without it the next session starts over instead of starting work. Everything else is optional, and a task with no repo_path is a perfectly good plain todo."
     )]
     async fn file_task(
         &self,
@@ -2016,6 +2057,7 @@ impl CxTasksMcp {
             }
         };
         let self_initiated = why != WHY_CHRIS_ASKED;
+        check_lengths(Some(&params.title), params.body.as_deref(), "`prompt`")?;
 
         let run_on = match params.run_on.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) => {
@@ -2283,13 +2325,13 @@ impl CxTasksMcp {
                 ));
             }
         }
-        // A dispatchable task with no seed prompt is the common miss: it looks
+        // A dispatchable task with no agent instructions is the common miss: it looks
         // complete but the agent that picks it up gets only the title.
         if task.repo_path.is_some()
             && task.prompt.as_deref().map(str::trim).unwrap_or("").is_empty()
         {
             out.push_str(
-                "\nNote: no seed prompt was stored, so a future session will get only the \
+                "\nNote: no agent instructions were stored, so a future session will get only the \
                  title and notes. If you know the files, the failure mode, or what you already \
                  ruled out, call update_task with a `prompt` — that context is the difference \
                  between the next agent working and re-investigating.\n",
@@ -2346,7 +2388,7 @@ impl CxTasksMcp {
 
     #[tool(
         name = "get_task",
-        description = "Read one task in full: notes, seed prompt, execution context, subtasks and run history. Pass `run_id` to read one run's whole final message instead (a tripwire check's report, a handoff)."
+        description = "Read one task in full: notes, agent instructions, execution context, subtasks and run history. Pass `run_id` to read one run's whole final message instead (a tripwire check's report, a handoff)."
     )]
     async fn get_task(
         &self,
@@ -2484,6 +2526,9 @@ impl CxTasksMcp {
         &self,
         Parameters(params): Parameters<UpdateTaskParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Only what THIS call writes is measured: a status flip on a task with
+        // long notes from before the limit must still go through.
+        check_lengths(params.title.as_deref(), params.body.as_deref(), "`prompt`")?;
         let run_on = match params.run_on.as_deref().map(str::trim) {
             Some("") => Some(None),
             Some(name) => {
@@ -3344,7 +3389,7 @@ impl CxTasksMcp {
                  Your handoff is captured automatically from this run's FINAL MESSAGE — it is \
                  stored in full on the run and replayed to whoever picks this task up next, so \
                  put the detail there. Use this tool without `handoff` for notes as you go, \
-                 under 2,000 characters."
+                 under 600 characters."
                     .to_string(),
                 None,
             ));
@@ -3445,6 +3490,7 @@ impl CxTasksMcp {
         &self,
         Parameters(params): Parameters<FileFollowupParams>,
     ) -> Result<CallToolResult, McpError> {
+        check_lengths(Some(&params.title), None, "`body`")?;
         let parent_id = self.resolve_task_id(&params.task_id)?;
         let (parent, task) = {
             let mut conn = self.open_db()?;
@@ -3461,7 +3507,10 @@ impl CxTasksMcp {
 
             let new = db::tasks::NewTask {
                 title: params.title,
-                body: params.body,
+                // An agent wrote this for an agent, so it is the follow-up's
+                // instructions; notes stay empty for Chris to fill or not.
+                body: None,
+                prompt: params.body,
                 // Untriaged by definition — a machine-proposed task that arrived on
                 // the board as `todo` would be claiming a triage decision nobody made.
                 status: Some("inbox".into()),
@@ -3512,7 +3561,7 @@ impl CxTasksMcp {
             short_ref(&task).unwrap_or_else(|| task.id.clone()),
             short_ref(&parent).unwrap_or_else(|| parent.id.clone()),
             task.title,
-            task.body
+            task.prompt
                 .as_deref()
                 .map(|b| crate::prose::render_note(b, crate::prose::Channel::Followup))
                 .unwrap_or_default()
@@ -5175,11 +5224,8 @@ mod tests {
         assert!(reply.contains("update_task(body)"), "notes can be rewritten: {reply}");
         let id = id_of("dirty note");
 
-        // The original complaint: one long unbroken paragraph.
-        let mut wall = plain_filing("wall note", Some(WHY_CHRIS_ASKED));
-        wall.body = Some("This sentence keeps the paragraph going a while longer. ".repeat(14));
-        let reply = text_of(&server.file_task(Parameters(wall)).await.unwrap());
-        assert!(reply.contains("RENDER CHECK") && reply.contains("unbroken"), "{reply}");
+        // The original complaint, one long unbroken paragraph, is now refused
+        // outright (`an_agent_cannot_file_a_long_title_or_long_notes`).
 
         // update_task: only a body THIS call wrote is checked.
         let mut patch = update_params(&id);
@@ -5218,6 +5264,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Notes and titles are what Chris reads; an agent's detail goes in
+    /// `prompt`. A refusal writes nothing, and an edit that touches neither
+    /// field is never measured against text somebody else wrote.
+    #[tokio::test]
+    async fn an_agent_cannot_file_a_long_title_or_long_notes() {
+        let (dir, db) = test_db("mcp-lengths");
+        let server = CxTasksMcp::with_mode(db.to_string_lossy().to_string(), McpMode::Interactive);
+        let count = || -> i64 {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap()
+        };
+
+        let long_title = "x".repeat(TITLE_MAX_CHARS + 1);
+        let err = server
+            .file_task(Parameters(plain_filing(&long_title, Some(WHY_CHRIS_ASKED))))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("title") && err.message.contains("70"), "{}", err.message);
+
+        let mut wall = plain_filing("wall note", Some(WHY_CHRIS_ASKED));
+        wall.body = Some("y".repeat(NOTES_MAX_CHARS + 1));
+        let err = server.file_task(Parameters(wall)).await.unwrap_err();
+        assert!(err.message.contains("`prompt`") && err.message.contains("500"), "{}", err.message);
+        assert_eq!(count(), 0, "a refusal must write nothing");
+
+        // At the limit both go through, and a long `prompt` is welcome.
+        let mut ok = plain_filing(&"x".repeat(TITLE_MAX_CHARS), Some(WHY_CHRIS_ASKED));
+        ok.body = Some("y".repeat(NOTES_MAX_CHARS));
+        ok.prompt = Some("z".repeat(5_000));
+        server.file_task(Parameters(ok)).await.unwrap();
+        let id: String = {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("SELECT id FROM tasks", [], |r| r.get(0)).unwrap()
+        };
+
+        // A task holding long notes from before the limit can still be edited.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("UPDATE tasks SET body = ?1", [&"y".repeat(3_000)]).unwrap();
+        }
+        let mut patch = update_params(&id);
+        patch.priority = Some(1);
+        server.update_task(Parameters(patch)).await.unwrap();
+        let mut patch = update_params(&id);
+        patch.body = Some("y".repeat(NOTES_MAX_CHARS + 1));
+        assert!(server.update_task(Parameters(patch)).await.is_err());
+        let mut patch = update_params(&id);
+        patch.title = Some(long_title);
+        assert!(server.update_task(Parameters(patch)).await.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Gotcha #48: the client shows only the first 2,048 characters. A rule
     /// past that point is not a rule, however green the tests that read the
     /// server's side are.
@@ -5246,7 +5345,7 @@ mod tests {
             ("file_task.body", doc::<FileTaskParams>("body")),
             ("update_task.body", doc::<UpdateTaskParams>("body")),
         ] {
-            for needle in ["markdown", "backticks", "inline SVG", "var(--clay)", "RENDER CHECK", "never one long block"] {
+            for needle in ["markdown", "backticks", "500 characters", "REFUSED", "`prompt`", "RENDER CHECK"] {
                 assert!(text.contains(needle), "{name} is missing {needle:?}: {text}");
             }
         }

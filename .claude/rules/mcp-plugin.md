@@ -217,12 +217,11 @@ produces a second board. Named in the forbidden list of
 runner needs to file into a new project" can't quietly add it.
 
 **The comment channel is bounded on BOTH sides, and the write side is this
-handler's job alone.** `COMMENT_MAX_CHARS` (2,000) refuses an oversized
+handler's job alone.** `COMMENT_MAX_CHARS` (600; 2,000 until 2026-11-14) refuses an oversized
 `comment_task` body — loudly, writing nothing, naming the limit and the channel
-the text belongs in instead. It sits **above** `dispatch::history_block`'s
-1,200-char replay bound on purpose: a chunky legitimate note is admitted whole
-even though a prompt will clip it, while the 2–4k dumps that motivated this are
-turned away. The refusal branches on mode — an interactive session is pointed at
+the text belongs in instead. It now sits below `dispatch::history_block`'s
+1,200-char replay bound, so an accepted comment is replayed whole. The refusal
+branches on mode — an interactive session is pointed at
 `handoff: true` and `complete_task`'s `result`, a background run at its own
 FINAL MESSAGE, because advice it cannot act on is worse than none.
 
@@ -238,9 +237,9 @@ pulls too — one real task returned 33k characters of comments. It renders the
 newest `DETAIL_COMMENTS` (10), oldest-first *within* the window, with the
 omission line **first** (`history_block`'s shape; at the bottom it reads as a
 footnote to the last comment rather than a statement about the list).
-`DETAIL_COMMENT_CHARS` is **tied to `COMMENT_MAX_CHARS`** rather than being an
-independent number — a comment this server was willing to accept must render
-whole when read back, or the tool truncates entries it just called fine.
+`DETAIL_COMMENT_CHARS` is never below `COMMENT_MAX_CHARS` — a comment this
+server was willing to accept must render whole when read back. It stays at
+2,000 so comments filed under the old cap still read whole.
 
 `handoff: true` is invariant 18's territory — full text in `execution.md`. The
 plugin's version lives in `claude-plugin/.claude-plugin/plugin.json` and is not
@@ -269,13 +268,23 @@ The MCP is the only real path by which notes arrive — agents filing tasks,
 posting progress, closing them — so formatting is taught and checked HERE, not
 in the pane (2026-09-22). Three halves:
 
+- **Two readers, two fields (2026-11-14).** Chris reads the title and the
+  notes; an agent reads `prompt` ("Agent instructions" in the app and in
+  `get_task`). On that date 90 open tasks averaged 1,097 characters of notes
+  and he had stopped reading them, so `file_task`, `update_task` and
+  `file_followup` now REFUSE a title over `TITLE_MAX_CHARS` (70) or notes over
+  `NOTES_MAX_CHARS` (500), writing nothing and pointing the rest at `prompt`
+  (`check_lengths`). Only what the call itself writes is measured, and the app's
+  own editor is never limited. `file_followup` stores its `body` as the
+  follow-up's `prompt` and leaves notes empty. `COMMENT_MAX_CHARS` dropped from
+  2,000 to 600 for the same reader. Pinned by
+  `an_agent_cannot_file_a_long_title_or_long_notes`.
 - **HOW rides on the fields, never the server instructions.** `notes_format!()`
   (a macro expanding to one literal, so `concat!` can splice it) is the body of
-  `file_task.body` and `update_task.body`'s descriptions: an opening line, then
-  headings, bullets, tables, `- [ ]` steps and `<details>`; paragraphs of two
-  or three sentences; code and angle brackets in backticks; inline SVG in the
-  Onyx artifact markup, coloured with the kit's tokens (`var(--clay)` …), which
-  `.cx-prose` maps onto the app theme. `complete_task.result`,
+  `file_task.body` and `update_task.body`'s descriptions: who reads notes, the
+  one-line-plus-five-bullets shape, the 500-character refusal, that agent detail
+  goes in `prompt`, and code and angle brackets in backticks. Inline SVG still
+  renders but is no longer asked for. `complete_task.result`,
   `comment_task.body` and `file_followup.body` carry a two-clause version. The
   instructions only point at the fields — see gotcha #48 for why. Background
   runs get no instructions at all, so the same ask is also in the shared

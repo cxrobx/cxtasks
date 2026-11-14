@@ -363,7 +363,7 @@ const LAUNCH_NODES: { key: LaunchSetting; label: string; title: string }[] = [
   { key: "workspace", label: "Workspace", title: "Workspace" },
   { key: "runner", label: "Runner", title: "Runner" },
   { key: "capability", label: "Capability", title: "Access envelope" },
-  { key: "brief", label: "Brief", title: "Run brief" },
+  { key: "brief", label: "Brief", title: "Agent instructions" },
 ];
 
 /**
@@ -446,7 +446,7 @@ function ExecutionConsole({
     workspace: hasWorkspace ? repoName(repoPath) : "Not set",
     runner: task.bg_executor === "claude" ? "Claude" : "Codex",
     capability: access.label,
-    brief: prompt.trim() ? "Custom" : "Auto",
+    brief: prompt.trim() ? "Written" : "None",
   };
   const nodeIcon: Record<LaunchSetting, typeof Eye> = {
     workspace: FolderGit2,
@@ -607,13 +607,13 @@ function ExecutionConsole({
                       autoFocus
                       value={prompt}
                       rows={3}
-                      placeholder="What should the agent do first?"
+                      placeholder="What the agent needs: files, findings, what was ruled out, how to tell it is done"
                       onChange={(event) => onPromptChange(event.target.value)}
                       onBlur={onPromptCommit}
                       className="w-full resize-y bg-transparent text-[12px] leading-relaxed text-content placeholder:text-content-faint focus:outline-none"
                     />
                     <div className="mt-2 border-t border-border-subtle pt-2 text-[10px] text-content-faint">
-                      {prompt.trim() ? "Custom seed prompt" : "Using task context"}
+                      {prompt.trim() ? "Agent instructions · only the agent reads these" : "None yet · the agent gets the title and notes"}
                     </div>
                   </div>
                 )}

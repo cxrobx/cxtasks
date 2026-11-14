@@ -67,6 +67,10 @@ full text in `macos-native.md`).
   source's own position as the tiebreak; `db::comments::for_task` stays
   chronological for the agent-facing readers (the old `TaskComments` comment,
   kept on `TaskActivity`).
+  **(5) Only the newest Activity entry opens in full** (2026-11-14); older
+  ones are one line (author, first line, age) that opens on click. A running
+  run and the run offering "Continue in Claude" never fold. The default is
+  derived per render (`entryOpen`), for (2)'s reason.
   **(4) `TaskLinks` pickers are `Combobox`, never `<select>`** (gotcha #6). A
   pick is recognised by the field's text EXACTLY matching an option
   (`T188 · title`), since `Combobox` only sets the value; typing part of a

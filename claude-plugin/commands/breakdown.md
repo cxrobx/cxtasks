@@ -45,7 +45,7 @@ Print the plan and stop. Show:
 - **The phases**, in order. Give a phase a target date **only if the user gave you
   a timeline.** Don't invent one; an invented milestone date is indistinguishable
   from a real commitment a week later.
-- **The tasks**, grouped under their phase, each with its title, its seed prompt,
+- **The tasks**, grouped under their phase, each with its title, its agent instructions,
   its acceptance condition, and what it's blocked by.
 
 Every task must clear three bars:
@@ -88,7 +88,10 @@ In this order:
    `why: "chris-asked"` — correct here because Chris typed this command and
    confirmed the plan, and never anything else in this file. Set
    `blocked_by` to the ids returned by the earlier `file_task` calls; T-numbers
-   (`T42`) work anywhere a task id is expected.
+   (`T42`) work anywhere a task id is expected. Chris reads `title` and `body`,
+   so keep them short: a title under 60 characters, and a `body` of one line
+   plus at most five bullets (over 70 and 500 characters they are refused).
+   The acceptance condition and everything else an agent needs go in `prompt`.
 
    **Dates: the phase's timeline lives on the section, not on every task.**
    `target_date` on the section is the milestone — do not copy it onto each

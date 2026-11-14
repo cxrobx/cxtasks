@@ -1,5 +1,5 @@
 ---
-description: File a task into CXTasks from this session, with repo context and a ready-to-work seed prompt
+description: File a short task into CXTasks from this session, with repo context and agent instructions
 ---
 
 File what the user just described as a CXTasks task: `$ARGUMENTS`
@@ -20,12 +20,24 @@ about this codebase (an errand, a call to make) — then omit it deliberately.
 (There is a second, much rarer exception — a `detached` task, step 9 — but it is
 for work that has no codebase, never for work whose repo you didn't look up.)
 
-## 2. Write a real `prompt` — this is the important part
+## 2. Two readers, two fields
 
-**Always write one when `repo_path` is set.** The seed prompt is what a fresh
-agent reads when the task is picked up, and it has none of this conversation's
-context. "Fix the webhook retry" is not enough to act on. A good seed prompt
-means the next session starts working instead of starting over.
+**Chris reads the title and the notes (`body`). An agent reads `prompt`.** Keep
+them apart, because long notes are notes he stops reading:
+
+- `title`: the action and its object, under 60 characters. No reasons, amounts,
+  parentheses or second clause. Over 70 is refused.
+- `body`: one line on what this is and why it matters, then at most five short
+  bullets of what Chris has to do or decide. No headings, tables or history.
+  Over 500 characters is refused. For a plain errand, leave it empty.
+- `prompt`: everything else, at whatever length the work needs.
+
+## 3. Write real agent instructions in `prompt`
+
+**Always write them when `repo_path` is set.** They are what a fresh agent reads
+when the task is picked up, and it has none of this conversation's context.
+"Fix the webhook retry" is not enough to act on. Good instructions mean the
+next session starts working instead of starting over.
 
 Include whatever of these you actually know — don't pad it with guesses:
 
@@ -65,8 +77,9 @@ vague prompt that pretends to be specific is worse than no prompt.
    directory isn't registered and you know where the work belongs. If the reply
    says the task was filed into a project you didn't expect, that's the stored
    mapping being right and the folder name being misleading — don't "correct" it.
-2. Write a short imperative `title` — "fix the intake webhook retry", not "the
-   webhook is broken".
+2. Write a short imperative `title` — "Fix the intake webhook retry", not "the
+   webhook is broken" — and, only if Chris needs more than the title, a `body`
+   within the limits above.
 3. Write the `prompt` per above.
 4. Add `tags` for cross-cutting labels if any apply (`billable`,
    `waiting-on-someone`, `quick-win`). Use `project` for where the work lives.
@@ -129,7 +142,7 @@ vague prompt that pretends to be specific is worse than no prompt.
     correct here because Chris typed this command — the filing is his ask, not
     your initiative — and it is never anything else in this file. (`why` is
     required; a self-initiated filing elsewhere answers "why not now?" instead.)
-11. Print one line back: the title, the project, and whether a seed prompt and
+11. Print one line back: the title, the project, and whether agent instructions and
     execution context were attached. If the task is background-enabled, say
     which agent it will run under. Don't dump the whole tool output.
 

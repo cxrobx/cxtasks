@@ -362,7 +362,7 @@ independent certification of correctness.
       escape hatch the refusal points at, and capping both would make the advice
       circular.
 
-    The write-side cap itself (`mcp::server::COMMENT_MAX_CHARS`, 2,000) is the
+    The write-side cap itself (`mcp::server::COMMENT_MAX_CHARS`, 600) is the
     MCP rules file's territory.
 
     **Replay it into the next dispatch.** `dispatch::history_block` puts recent
