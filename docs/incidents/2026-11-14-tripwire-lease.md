@@ -65,3 +65,56 @@ throwaway databases, with fake executors where needed; no paid check calls.
 Adversarial review caught the initial warning visibility and scan-starvation
 gaps; both were fixed and encoded before release. Final validation and host
 installation evidence are recorded in the release follow-up.
+
+## Release evidence — November 15, 2026
+
+Source commit: `5556b51` (clean tree at each build). No origin push was made.
+The laptop's clean `ac930cc` checkout was fast-forwarded using a local Git
+bundle; its signed build ran in its own logged-in Aqua session. Its temporary
+build LaunchAgent was unloaded afterward, with the non-secret log retained at
+`/tmp/cxtasks-tripwire-laptop-build.log` and its previous app bundle retained
+at `/tmp/CXTasks-before-tripwire-5556b51.app`.
+
+Validation: 1,066 Rust workspace tests passed (two existing ignored tests),
+549 UI tests passed across 48 files, TypeScript passed, the Linux all-targets
+compile check passed, and both `agent-check-sim.sh` and `two-host-sim.sh` passed.
+The agent simulation's two stale `inbox` assertions were updated to the `todo`
+vocabulary already established in `ac930cc`; an accepted-result receipt
+assertion was added. No assertion was removed to hide a failure. Validation
+used throwaway databases and fake executors, not paid check calls.
+
+Final review also caught warning visibility leaking into `/next` admission.
+The strict armed gate was restored there, including project-board next-work
+selection (which calls the same function), and a regression now proves a
+warned gate is visible without becoming executable work.
+
+Installed protection:
+
+| Host | Updated components | Verification |
+| --- | --- | --- |
+| Mac mini | app, runner, MCP; runner and shared HTTP MCP restarted | `scripts/ship.sh`, runner health `ok`; installed bundle matched build, strict signature verification and `flags=0x0(none)`; launchd paths point into `/Applications/CXTasks.app` |
+| Laptop | app, runner, MCP; app relaunched and runner restarted | local Aqua `scripts/ship.sh`, `LAPTOP_TRIPWIRE_SUCCESS=5556b51`, exit 0, runner health `ok`; installed binaries matched its own signed build; `flags=0x0(none)` |
+| NAS | runner and its sibling MCP; canonical server | repository deploy scripts, runner health `ok`, live server `/health` answered over tailnet with schema 30/protocol 1/push enabled; LAN exposure check refused; running binaries matched built image bytes |
+
+SHA-256 receipt prefixes (each installed binary was compared against its own
+build, rather than comparing separately signed Macs to each other):
+
+| Host | App | Runner | MCP | Server |
+| --- | --- | --- | --- | --- |
+| Mini | `60d4dba2d5be628a` | `9b66bd87dd41c5e8` | `e045df51a983c8df` | — |
+| Laptop | `4f7919d80761ea54` | `585b81c8188a6a34` | `66e463e6ee7364d3` | — |
+| NAS | — | `8f835b657769a6ac` | `dac38d553d18722f` | `0e7a0d5ef72986c6` |
+
+No separate mini server LaunchAgent was loaded. Existing stdio MCP sessions
+keep their already-running executable until reopened; the mini's shared HTTP
+MCP was restarted. No live model check was triggered to validate the release.
+No new cross-machine production task was created as a test: behavioral
+acceptance is the synthetic two-replica harness plus the deployed binary and
+health checks.
+
+The live T651 row was read before and after installation: still `todo`,
+`tripped`, with the original `2026-11-15 06:32:27` trip timestamp. It was not
+completed, rearmed or used for testing, and its proposals were not applied.
+The separate review-consumption mitigation was left intact. The shared
+operating-model hunt list also gained the observer-overwrites-executor class
+and its executable checks.
