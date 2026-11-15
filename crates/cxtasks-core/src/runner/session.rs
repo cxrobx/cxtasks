@@ -387,7 +387,7 @@ mod tests {
         let row = runs::get(&f.conn, &run).unwrap().unwrap();
         assert_eq!(row.status, "failed");
         assert!(row.result_text.unwrap().contains("Herdr isn't running"));
-        assert_eq!(db::tasks::get(&f.conn, &task).unwrap().unwrap().status, "inbox", "work didn't start");
+        assert_eq!(db::tasks::get(&f.conn, &task).unwrap().unwrap().status, "todo", "work didn't start");
 
         let open = |_: &Task| -> Result<PathBuf, String> {
             *calls.borrow_mut() += 1;

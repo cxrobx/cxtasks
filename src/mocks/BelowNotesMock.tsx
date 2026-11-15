@@ -107,7 +107,7 @@ function samples(): Record<SampleKey, MockTask> {
     bare: {
       ref: "T211",
       title: "Coach panel: empty state when a unit has no lessons yet",
-      status: "inbox",
+      status: "todo",
       priority: 2,
       project: "TeacherHero",
       body: "The coach panel renders a blank card when the unit is new. Say what to do next instead — \"Add a week to start planning\" — and link the action.",

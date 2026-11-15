@@ -1944,7 +1944,7 @@ mod tests {
 
         assert_eq!(status_of(&conn, "a"), "todo", "next must become todo");
         assert_eq!(status_of(&conn, "b"), "in_review");
-        assert_eq!(status_of(&conn, "d"), "inbox", "untouched status changed");
+        assert_eq!(status_of(&conn, "d"), "todo", "inbox left the axis 2026-11-14 and heals like the rest");
         assert_eq!(status_of(&conn, "e"), "done");
 
         initialize(&conn).expect("idempotent re-init");

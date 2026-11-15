@@ -136,7 +136,7 @@ pub struct FileTaskParams {
     )]
     pub due_at: Option<String>,
     #[schemars(
-        description = "START date — the task moves to Waiting and is hidden from the actionable views (Open, Inbox, Today, next_task and the background queue) until this ISO-8601 UTC instant, then reappears automatically. This is how CXTasks says 'planned / snoozed / start later': a DATE, not a status — the task keeps todo/inbox while it waits, and there is no 'planned' status to look for. Independent of due_at ('starts Monday, due Friday' = defer_until Monday + due_at Friday). Omit unless the user asked to defer — a deadline alone is due_at, and a deadline alone hides nothing."
+        description = "START date — the task moves to Waiting and is hidden from the actionable views (Open, Inbox, Today, next_task and the background queue) until this ISO-8601 UTC instant, then reappears automatically. This is how CXTasks says 'planned / snoozed / start later': a DATE, not a status — the task keeps its status while it waits, and there is no 'planned' status to look for. Independent of due_at ('starts Monday, due Friday' = defer_until Monday + due_at Friday). Omit unless the user asked to defer — a deadline alone is due_at, and a deadline alone hides nothing."
     )]
     pub defer_until: Option<String>,
     #[schemars(
@@ -181,7 +181,7 @@ pub struct FileTaskParams {
     )]
     pub bg_writes_allowed: Option<bool>,
     #[schemars(
-        description = "Initial status: inbox (default), todo, or in_progress. There is no 'blocked' status — a task waiting on something outside CXTasks is a normal todo with blocked_reason set (a HOLD, like defer_until), which keeps it out of Open/Today/next_task and in Waiting until the reason is cleared. 'queued' is refused here: file the task first, then queue it with update_task(status='queued'), which runs the background-run guards. There is no 'planned'/'someday' status — a task that starts later is a normal todo with defer_until set."
+        description = "Initial status: todo (default) or in_progress. There is no 'inbox' status — untriaged is derived: a task with no project, section or due date is in the Inbox view. There is no 'blocked' status — a task waiting on something outside CXTasks is a normal todo with blocked_reason set (a HOLD, like defer_until), which keeps it out of Open/Today/next_task and in Waiting until the reason is cleared. 'queued' is refused here: file the task first, then queue it with update_task(status='queued'), which runs the background-run guards. There is no 'planned'/'someday' status — a task that starts later is a normal todo with defer_until set."
     )]
     pub status: Option<String>,
     #[schemars(
@@ -349,7 +349,7 @@ pub struct ListTasksParams {
     )]
     pub project: Option<String>,
     #[schemars(
-        description = "Restrict to one status: inbox|todo|blocked|queued|in_progress|in_review|done. 'queued' is set by the background runner, not by hand."
+        description = "Restrict to one status: todo|queued|in_progress|in_review|done. 'queued' is set by the background runner, not by hand."
     )]
     pub status: Option<String>,
     #[schemars(
@@ -401,7 +401,7 @@ pub struct UpdateTaskParams {
     )]
     pub body: Option<String>,
     #[schemars(
-        description = "New status: inbox|todo|in_progress|in_review|done — or 'queued' to hand the task to the background runner. 'queued' is not a plain field write: it runs the same guards as the app's queue action (repo path required, an armed review needs a finished run to read, the agent's CLI must be installed and logged in), sets bg_allowed in the same write, and reports whether the runner is actually on. Prefer complete_task for finishing work — it also handles recurrence. There is no 'blocked' status: to mark a task waiting on something, set blocked_reason (a hold) and leave the status alone. To drop a task, call archive_task — there is no 'cancelled'."
+        description = "New status: todo|in_progress|in_review|done — or 'queued' to hand the task to the background runner. 'queued' is not a plain field write: it runs the same guards as the app's queue action (repo path required, an armed review needs a finished run to read, the agent's CLI must be installed and logged in), sets bg_allowed in the same write, and reports whether the runner is actually on. Prefer complete_task for finishing work — it also handles recurrence. There is no 'blocked' status: to mark a task waiting on something, set blocked_reason (a hold) and leave the status alone. To drop a task, call archive_task — there is no 'cancelled'."
     )]
     pub status: Option<String>,
     #[schemars(
@@ -532,7 +532,7 @@ pub struct SearchTasksParams {
     )]
     pub projects: Option<Vec<String>>,
     #[schemars(
-        description = "Match ANY of these statuses: inbox, todo, blocked, queued, in_progress, in_review, done"
+        description = "Match ANY of these statuses: todo, queued, in_progress, in_review, done"
     )]
     pub statuses: Option<Vec<String>>,
     #[schemars(description = "Match ANY of these priorities. 0 is HIGHEST, 3 is lowest.")]
@@ -3511,9 +3511,10 @@ impl CxTasksMcp {
                 // instructions; notes stay empty for Chris to fill or not.
                 body: None,
                 prompt: params.body,
-                // Untriaged by definition — a machine-proposed task that arrived on
-                // the board as `todo` would be claiming a triage decision nobody made.
-                status: Some("inbox".into()),
+                // Open work. "Untriaged" is not a status (2026-11-14): with no
+                // project, section or date this lands in the Inbox VIEW, which is
+                // what makes it read as a proposal awaiting a home.
+                status: Some("todo".into()),
                 priority: params.priority,
                 // Inherited, not asked for. The follow-up belongs to the same work
                 // as its parent, and letting an unattended run name a project is how
@@ -4124,8 +4125,8 @@ mod tests {
         assert!(!kid.bg_writes_allowed);
         assert!(!kid.bg_shell_allowed);
         assert_eq!(
-            kid.status, "inbox",
-            "machine-proposed work arrives untriaged"
+            kid.status, "todo",
+            "machine-proposed work arrives as open work"
         );
         // Inherited rather than asked for: letting an unattended run name a
         // project is how you manufacture a phantom one (invariant 17).
@@ -4417,7 +4418,7 @@ mod tests {
 
         let conn = rusqlite::Connection::open(&db).unwrap();
         let after = db::tasks::get(&conn, &t.id).unwrap().unwrap();
-        assert_eq!(after.status, "inbox", "a refused queue must not move the status");
+        assert_eq!(after.status, "todo", "a refused queue must not move the status");
         assert!(!after.bg_allowed, "a refused queue must not opt the task in");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -4462,7 +4463,7 @@ mod tests {
                 let msg = format!("{e:?}");
                 assert!(msg.contains("claude"), "only a missing CLI may refuse here: {msg}");
                 assert!(msg.contains("field edits were applied"), "{msg}");
-                assert_eq!(after.status, "inbox");
+                assert_eq!(after.status, "todo");
                 assert!(!after.bg_allowed);
             }
         }
@@ -5378,7 +5379,7 @@ mod tests {
         let line = format_line(&t);
         assert!(line.contains("do the thing"));
         assert!(line.contains(&t.id), "id must be printed: {line}");
-        assert!(line.contains("[inbox]"));
+        assert!(line.contains("[todo]"));
         // Both references, for two different audiences: the T-number is what a
         // human says out loud, the UUID is what follow-up tool calls have always
         // used. Dropping either breaks one of them.

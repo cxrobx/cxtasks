@@ -364,10 +364,31 @@ Never compare either form byte-wise.
     triage (`inbox`), scheduling (`next`), the background runner (`queued`,
     `needs_review`), and dependencies (`blocked`) — so a task could genuinely be
     untriaged AND ready AND queued at once, which is exactly why those three read
-    as interchangeable. The six that remain (`inbox` · `todo` · `queued` ·
+    as interchangeable. The five that remain (`todo` · `queued` ·
     `in_progress` · `in_review` · `done`) sit on one axis, and each has a
     one-line definition in `STATUS_HINTS` — **a status you cannot define in a
     sentence is one that will be used for whatever is nearby.**
+
+    **`inbox` left the axis too (2026-11-14), and with no schema bump.**
+    "Untriaged" was already derived — `View::Inbox` is "no project, no
+    section, no due date, not held", deliberately not `status = 'inbox'` —
+    and nothing else read the stored value, so it was a label set by
+    whichever default the creating path had: 68 of 104 open tasks wore it,
+    52 of those already had a project, and the P0/P1 count matched `todo`'s
+    exactly. No column moved, so the migration is `heal_legacy_statuses`
+    alone (every `initialize`, the v12 shape) rather than a version gate,
+    which would have made sync refuse until the NAS caught up. Three more
+    routes cover the skew: `normalize_status` folds an `"inbox"` argument
+    from an old client, `row_to_task` normalizes on READ so a pull from a
+    not-yet-healed peer never prints a status the UI can't name, and the
+    iOS `TaskStatus` decodes it as `.todo`. The v1 column `DEFAULT 'inbox'`
+    stays (SQLite cannot alter a default); every Rust insert passes a
+    status, and the heal catches a raw one. Jev capture's inbox/todo
+    choice went with it — that question was "is this vague", which
+    `needs_clarification` / `too_vague` already ask; `CaptureAssessment.
+    status` stays on the wire as a constant `todo` because a shipped iOS
+    build decodes it as required. **A commitment or triage signal, if one
+    is ever wanted, is a hold or a date, never a status.**
 
     **`blocked` is a HOLD, not a status (v27).** v12 kept it on the axis
     "because it is real" and had nowhere else to put it — which left one hold

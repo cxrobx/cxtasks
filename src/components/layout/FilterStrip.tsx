@@ -55,7 +55,6 @@ import type {
  * reasons that only apply to writes.
  */
 const FILTER_STATUSES: TaskStatus[] = [
-  "inbox",
   "todo",
   "queued",
   "in_progress",

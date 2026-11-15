@@ -33,7 +33,7 @@ const TASK = {
   id: "t1",
   title: "coach panel empty state",
   body: null,
-  status: "inbox",
+  status: "todo",
   blocked_reason: null,
   priority: 2,
   project: null,

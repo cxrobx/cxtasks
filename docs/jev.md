@@ -11,8 +11,9 @@ permissions. It never enters SQLite, sync snapshots, or task prompts.
 
 When enabled, the individual switches provide:
 
-- **Capture suggestions:** project, priority, inbox/actionable state, and known
-  tags. Explicit `#project`, `!priority`, due-date syntax, and the selected
+- **Capture suggestions:** project, priority, and known tags (the inbox/actionable
+  question was retired 2026-11-14 with the `inbox` status; vagueness is
+  `too_vague`). Explicit `#project`, `!priority`, due-date syntax, and the selected
   project always win. Answered by the **capture engine** (below), not
   necessarily Jev.
 - **Pre-dispatch check:** checks outcome clarity, context, unresolved user
@@ -61,7 +62,7 @@ route files it. `CaptureAssessment.engine` says who answered.
 **Per-question degradation, both engines.** A `"type":"refusal"` answer (11 of
 274 Decisions calls had one), a missing answer, a choice outside the offered
 keys or a probability outside 0–1 is *no judgment* for that one question: no
-project, P3 (the create default), `inbox`, no tag, not vague. The rest of the
+project, P3 (the create default), no tag, not vague. The rest of the
 assessment stands.
 
 **Bars are per engine** (`jev::JEV_BARS`, `jev::DECISIONS_BARS`), tuned on half

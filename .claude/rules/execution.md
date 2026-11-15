@@ -416,8 +416,8 @@ independent certification of correctness.
     * **`file_followup` forces `bg_allowed = false` in code, not by default.**
       A follow-up that could itself run unattended closes the loop — the runner
       drains it, that run files more, forever. It also inherits project and repo
-      rather than naming them (invariant 17) and lands as a separate `inbox`
-      task with a `relates_to` link to its source, so a human can see and triage
+      rather than naming them (invariant 17) and lands as a separate unfiled
+      `todo` (so in the Inbox view) with a `relates_to` link to its source, so a human can see and triage
       every one in the main list. The task and link commit together. Out-of-scope
       work must not be hidden under, or archived with, the completed investigation.
     * **Codex gets the same reduced MCP without a global registration.** Its

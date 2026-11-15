@@ -881,7 +881,7 @@ mod tests {
         let r = record(&conn, &t.id, "l1", &Outcome::Tripped(String::new())).unwrap();
         assert!(matches!(r.transition, Some(Transition::Tripped { completed: false, .. })));
         let after = tasks::get(&conn, &t.id).unwrap().unwrap();
-        assert_eq!(after.status, "inbox");
+        assert_eq!(after.status, "todo");
         assert_eq!(after.tripwire_state.as_deref(), Some("tripped"));
         assert!(!after.tripwire_armed());
         let log = crate::db::comments::for_task(&conn, &t.id).unwrap();
@@ -912,7 +912,7 @@ mod tests {
 
         let after = tasks::get(&conn, &t.id).unwrap().unwrap();
         assert!(after.tripwire_armed(), "state rolled back");
-        assert_eq!(after.status, "inbox", "completion rolled back");
+        assert_eq!(after.status, "todo", "completion rolled back");
         assert!(crate::db::comments::for_task(&conn, &t.id).unwrap().is_empty(), "comment rolled back");
         let rt = for_task(&conn, &t.id).unwrap().unwrap();
         assert_eq!(rt.lease_id.as_deref(), Some("l1"), "the lease is still held, to expire");
@@ -996,7 +996,7 @@ mod tests {
 
         let r = trip(&conn, &m, "l1");
         assert!(matches!(r.transition, Some(Transition::Tripped { completed: false, .. })));
-        assert_eq!(tasks::get(&conn, &m.id).unwrap().unwrap().status, "inbox");
+        assert_eq!(tasks::get(&conn, &m.id).unwrap().unwrap().status, "todo");
 
         let done = tasks::complete(&conn, &m.id).unwrap();
         assert_eq!(done.status, "done");

@@ -19,7 +19,7 @@ function task(overrides: Partial<Task> = {}): Task {
     id: "t1",
     title: "task",
     body: null,
-    status: "inbox",
+    status: "todo",
     blocked_reason: null,
     priority: 2,
     project: null,
@@ -111,9 +111,9 @@ beforeEach(() => {
 });
 
 describe("what the strip shows", () => {
-  it("an untriaged task costs two chips and a +", () => {
+  it("a bare task costs two chips and a +", () => {
     mount(task());
-    expect(chipNames()).toEqual(["Status: Inbox", "Priority: P2"]);
+    expect(chipNames()).toEqual(["Status: To do", "Priority: P2"]);
     expect(screen.getByRole("button", { name: "Add a property" })).toBeInTheDocument();
   });
 
@@ -211,8 +211,10 @@ describe("the status menu", () => {
   it("carries each status's one-line definition, where you choose it", async () => {
     mount(task());
     openMenu(chip(/^Status:/));
-    expect(await screen.findByText("Captured, not yet triaged.")).toBeInTheDocument();
-    expect(screen.getByText("Triaged and actionable now.")).toBeInTheDocument();
+    expect(await screen.findByText("Open, not started.")).toBeInTheDocument();
+    expect(screen.getByText("Being worked — by you or an agent.")).toBeInTheDocument();
+    // `inbox` is not a status: untriaged is the Inbox view, never a pick.
+    expect(screen.queryByRole("menuitemradio", { name: /Inbox/ })).toBeNull();
     // `queued` is the runner's claim key and is never offered by hand.
     expect(screen.queryByRole("menuitemradio", { name: /Queued/ })).toBeNull();
   });
@@ -220,8 +222,8 @@ describe("the status menu", () => {
   it("a pick writes the status", async () => {
     mount(task());
     openMenu(chip(/^Status:/));
-    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^To do/ }));
-    expect(patch).toHaveBeenCalledWith("t1", { status: "todo" });
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^In progress/ }));
+    expect(patch).toHaveBeenCalledWith("t1", { status: "in_progress" });
   });
 });
 
@@ -290,7 +292,7 @@ describe("tags", () => {
     mount(task(), { tags: ["billable", "@sam"] });
     const chips = screen.getAllByTestId("tag-chip").map((c) => c.textContent);
     expect(chips).toEqual(["#billable", "@sam"]);
-    expect(chipNames()).toEqual(["Status: Inbox", "Priority: P2"]);
+    expect(chipNames()).toEqual(["Status: To do", "Priority: P2"]);
   });
 
   it("the x removes one", () => {

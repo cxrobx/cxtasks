@@ -233,10 +233,12 @@ export const BG_MODELS = [
  * scheduling, `queued` about the background runner, so a task could be all
  * three at once. `blocked` was worse — it meant two unrelated things *on screen
  * simultaneously*, since the row badge comes from `task_deps` while the status
- * came from the runner refusing a preflight.
+ * came from the runner refusing a preflight. `inbox` left on 2026-11-14:
+ * "untriaged" is the Inbox VIEW's derived predicate (no home, no date), and
+ * nothing read the stored value. The server folds any `inbox` it still sees
+ * to `todo` on read.
  */
 export const TASK_STATUSES = [
-  "inbox",
   "todo",
   "queued",
   "in_progress",
@@ -256,7 +258,6 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
  * `db::tasks::USER_STATUSES`, which is what actually enforces it.
  */
 export const USER_STATUSES: TaskStatus[] = [
-  "inbox",
   "todo",
   "in_progress",
   "in_review",
@@ -580,7 +581,8 @@ export interface JevSaveSettings extends JevSettings {
 export interface CaptureAssessment {
   project: string | null;
   priority: number;
-  status: "inbox" | "todo";
+  /** Always `todo` since `inbox` left the status axis; vagueness is `too_vague`. */
+  status: "todo";
   tags: string[];
   needs_clarification: number;
   confidence: number;

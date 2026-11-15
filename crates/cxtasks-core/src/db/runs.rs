@@ -2057,7 +2057,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].run.id, live.id);
         assert_eq!(rows[0].task_title, "t");
-        assert_eq!(rows[0].task_status, "inbox");
+        assert_eq!(rows[0].task_status, "todo");
     }
 
     /// Every joined column, checked in one call — the guard on the alias.
@@ -2098,7 +2098,7 @@ mod tests {
         assert_eq!(row.run.id, run.id, "run columns still read by index");
         assert_eq!(row.task_title, "distinct title");
         assert_eq!(row.task_project.as_deref(), Some("distinct project"));
-        assert_eq!(row.task_status, "inbox");
+        assert_eq!(row.task_status, "todo");
         assert_eq!(
             row.task_short_id, t.short_id,
             "a shift onto short_id reads as None, which looks legitimate"

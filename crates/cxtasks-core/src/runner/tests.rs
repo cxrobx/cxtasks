@@ -1403,7 +1403,7 @@ fn a_recorded_check_is_the_lease_counts_in_both_budgets_and_leaves_no_history() 
     assert_eq!(rt.lease_id.as_deref(), Some(run.id.as_str()), "the run id IS the lease");
     // No task status change: the task is still armed and hidden.
     let t = db::tasks::get(&conn, &task.id).unwrap().unwrap();
-    assert_eq!(t.status, "inbox");
+    assert_eq!(t.status, "todo");
     assert!(t.tripwire_armed());
 
     // One in flight per host — and it holds a concurrency slot.

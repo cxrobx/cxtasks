@@ -65,7 +65,7 @@ const TASKS: MockTask[] = [
   { t: 29, title: "Renew Developer ID certificate", project: "ops", priority: 1, status: "todo", due: "Tomorrow", dueAt: inHours(26), tags: ["quick-win"], picked: true },
   { t: 44, title: "Backfill Spotify follower snapshots", project: "artist-advisory", priority: 2, status: "queued", repo: "~/Projects/artisttracker", agent: "queued", picked: true },
   { t: 35, title: "Draft Learning Hub kickoff email", project: "globex", priority: 2, status: "done", due: "Fri" },
-  { t: 47, title: "Fix light-theme select popup contrast", project: "cxtasks", priority: 3, status: "inbox", repo: "~/Projects/cxtasks" },
+  { t: 47, title: "Fix light-theme select popup contrast", project: "cxtasks", priority: 3, status: "todo", repo: "~/Projects/cxtasks" },
 ];
 
 const PROJECTS = [

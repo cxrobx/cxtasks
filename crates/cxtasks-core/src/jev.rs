@@ -86,6 +86,10 @@ pub struct CaptureRequest {
 pub struct CaptureAssessment {
     pub project: Option<String>,
     pub priority: i64,
+    /// Always `todo` since 2026-11-14, when `inbox` left the status axis.
+    /// Kept on the wire because a shipped iOS build decodes it as required;
+    /// "is this vague" is `needs_clarification` / `too_vague`, which was
+    /// always what the old inbox/todo choice was asking.
     pub status: String,
     pub tags: Vec<String>,
     pub needs_clarification: f64,
@@ -383,15 +387,13 @@ pub struct CaptureBars {
     /// A project pick below this confidence is no pick.
     pub project: f64,
     pub tag: f64,
-    /// `todo` needs a clarification probability BELOW this.
-    pub todo_clarify: f64,
     /// At or above this, the brief is too vague to hand an unattended agent.
     pub too_vague: f64,
 }
 
 /// Jev's bars, unchanged.
 ///
-/// `too_vague` began at 0.65, borrowed from `todo_clarify`. Measured against the
+/// `too_vague` began at 0.65, borrowed from the retired `todo_clarify` bar. Measured against the
 /// live model on 2026-09-20 that is far too low for THIS question — Jev rates
 /// ordinary, perfectly actionable requests as quite vague:
 ///
@@ -405,7 +407,7 @@ pub struct CaptureBars {
 /// Only genuine non-briefs separate, so the bar sits above them. The cost of
 /// being wrong is one advisory line: nothing refuses on it.
 pub const JEV_BARS: CaptureBars =
-    CaptureBars { project: 0.55, tag: 0.72, todo_clarify: 0.65, too_vague: 0.90 };
+    CaptureBars { project: 0.55, tag: 0.72, too_vague: 0.90 };
 
 /// Decisions' bars, tuned 2026-10-06 on half of 270 labeled tasks and checked
 /// on the other half (split by a hash of the task id).
@@ -424,9 +426,8 @@ pub const JEV_BARS: CaptureBars =
 ///   would catch the first catches the actionable ones too, so the advisory is
 ///   not raised from it at all rather than raised at random. Held out it
 ///   flags 0%, as Jev's 0.90 does; Jev, the fallback, still flags at its bar.
-/// - `todo_clarify` keeps Jev's 0.65; it was not retuned.
 pub const DECISIONS_BARS: CaptureBars =
-    CaptureBars { project: 0.70, tag: 0.96, todo_clarify: 0.65, too_vague: f64::INFINITY };
+    CaptureBars { project: 0.70, tag: 0.96, too_vague: f64::INFINITY };
 
 impl CaptureEngine {
     pub fn bars(self) -> CaptureBars {
@@ -441,8 +442,6 @@ const PROJECT_INSTRUCTIONS: &str =
     "Which existing project best fits this task? Choose none when the fit is unclear.";
 const PRIORITY_INSTRUCTIONS: &str =
     "Choose the task priority. P0 is urgent and important; P3 is ordinary backlog work.";
-const STATUS_INSTRUCTIONS: &str =
-    "Is this only captured for later triage or is it already actionable?";
 const CLARIFY_INSTRUCTIONS: &str =
     "The task is too ambiguous to act on without asking a clarifying question.";
 
@@ -451,7 +450,7 @@ fn tag_instructions(tag: &str) -> String {
 }
 
 /// The choice sets, keyed exactly as both engines are asked them.
-fn capture_choices(request: &CaptureRequest) -> [(&'static str, &'static str, Map<String, Value>); 3] {
+fn capture_choices(request: &CaptureRequest) -> [(&'static str, &'static str, Map<String, Value>); 2] {
     let mut project = Map::new();
     project.insert("none".into(), json!("No listed project clearly applies"));
     for (i, p) in request.projects.iter().take(40).enumerate() {
@@ -464,11 +463,6 @@ fn capture_choices(request: &CaptureRequest) -> [(&'static str, &'static str, Ma
             "priority",
             PRIORITY_INSTRUCTIONS,
             as_map(json!({"p0":"Immediate critical work","p1":"High priority","p2":"Normal planned work","p3":"Low priority or backlog"})),
-        ),
-        (
-            "status",
-            STATUS_INSTRUCTIONS,
-            as_map(json!({"inbox":"Needs later triage","todo":"Actionable now"})),
         ),
     ]
 }
@@ -520,7 +514,6 @@ fn decisions_capture_questions(request: &CaptureRequest) -> Value {
 struct CaptureAnswers {
     project: Option<(String, f64)>,
     priority: Option<(String, f64)>,
-    status: Option<(String, f64)>,
     needs_clarification: Option<f64>,
     tags: Vec<Option<f64>>,
 }
@@ -542,11 +535,10 @@ fn probability(answer: Option<&Value>, field: &str) -> Option<f64> {
 /// Jev answers are an object keyed by question; a noul carries `noul`.
 fn parse_jev_capture(response: &Value, request: &CaptureRequest) -> Result<CaptureAnswers, AppError> {
     let a = answers(response)?;
-    let [project, priority, status] = capture_choices(request);
+    let [project, priority] = capture_choices(request);
     Ok(CaptureAnswers {
         project: choice_of(a.get(project.0), &project.2),
         priority: choice_of(a.get(priority.0), &priority.2),
-        status: choice_of(a.get(status.0), &status.2),
         needs_clarification: probability(a.get("needs_clarification"), "noul"),
         tags: capture_tags(request)
             .map(|(i, _)| probability(a.get(&format!("tag_{i}")), "noul"))
@@ -570,11 +562,10 @@ fn parse_decisions_capture(
         .filter_map(|a| Some((a.get("name")?.as_str()?, a)))
         .collect();
     let get = |name: &str| by_name.get(name).copied();
-    let [project, priority, status] = capture_choices(request);
+    let [project, priority] = capture_choices(request);
     Ok(CaptureAnswers {
         project: choice_of(get(project.0), &project.2),
         priority: choice_of(get(priority.0), &priority.2),
-        status: choice_of(get(status.0), &status.2),
         needs_clarification: probability(get("needs_clarification"), "probability"),
         tags: capture_tags(request)
             .map(|(i, _)| probability(get(&format!("tag_{i}")), "probability"))
@@ -584,7 +575,7 @@ fn parse_decisions_capture(
 
 /// Read answers against an engine's bars. Every "no judgment" lands on the
 /// value code would have chosen alone: no project, P3 (the create default),
-/// `inbox`, no tag, not vague.
+/// no tag, not vague.
 fn read_capture(
     request: &CaptureRequest,
     answers: &CaptureAnswers,
@@ -602,15 +593,12 @@ fn read_capture(
         .as_ref()
         .and_then(|(key, _)| key.strip_prefix('p')?.parse().ok())
         .unwrap_or(db::tasks::PRIORITY_LOWEST);
-    // An unanswered clarification question cannot vouch for `todo`.
-    let clear = answers.needs_clarification.is_some_and(|p| p < bars.todo_clarify);
-    let todo = answers.status.as_ref().is_some_and(|(key, _)| key == "todo") && clear;
     let tags = capture_tags(request)
         .filter(|(i, _)| answers.tags.get(*i).copied().flatten().is_some_and(|p| p >= bars.tag))
         .map(|(_, tag)| tag.clone())
         .collect();
     let needs_clarification = answers.needs_clarification.unwrap_or(0.0);
-    let confidence = [&answers.project, &answers.priority, &answers.status]
+    let confidence = [&answers.project, &answers.priority]
         .into_iter()
         .flatten()
         .map(|(_, c)| *c)
@@ -619,7 +607,7 @@ fn read_capture(
     CaptureAssessment {
         project,
         priority,
-        status: if todo { "todo" } else { "inbox" }.into(),
+        status: "todo".into(),
         tags,
         needs_clarification,
         confidence,
@@ -1008,7 +996,6 @@ mod tests {
         let response = json!({"answers":[
             {"type":"choice","name":"project","choice":"p0","confidence":0.9},
             {"type":"refusal","name":"priority"},
-            {"type":"choice","name":"status","choice":"todo","confidence":0.8},
             {"type":"predicate","name":"needs_clarification","probability":0.1},
             {"type":"predicate","name":"tag_0","probability":0.99},
             {"type":"refusal","name":"tag_1"}
@@ -1021,7 +1008,7 @@ mod tests {
         assert_eq!(a.priority, db::tasks::PRIORITY_LOWEST, "no judgment = the create default");
         assert_eq!(a.status, "todo");
         assert_eq!(a.tags, vec!["seo".to_string()]);
-        assert_eq!(a.confidence, 0.8, "a refused question does not drag confidence to 0");
+        assert_eq!(a.confidence, 0.9, "a refused question does not drag confidence to 0");
         assert_eq!(a.engine, Some(CaptureEngine::Decisions));
     }
 
@@ -1031,14 +1018,12 @@ mod tests {
         let response = json!({"answers":[
             {"type":"choice","name":"project","choice":"p7","confidence":0.99},
             {"type":"choice","name":"priority"},
-            {"type":"choice","name":"status","choice":"todo","confidence":0.9},
             {"type":"predicate","name":"needs_clarification","probability":"high"},
             {"type":"predicate","name":"tag_0","probability":1.7}
         ]});
         let a = read_capture(&r, &parse_decisions_capture(&response, &r).unwrap(), CaptureEngine::Decisions);
         assert_eq!(a.project, None, "a key outside the offered set is no pick");
         assert_eq!(a.priority, db::tasks::PRIORITY_LOWEST);
-        assert_eq!(a.status, "inbox", "an unanswered clarification cannot vouch for todo");
         assert!(a.tags.is_empty() && !a.too_vague);
         assert!(parse_decisions_capture(&json!({"error":"x"}), &r).is_err(), "no answers at all is a failure, so the caller falls back");
     }
@@ -1048,7 +1033,6 @@ mod tests {
         let r = request();
         let response = json!({"answers":{
             "project":{"type":"choice","choice":"p1","confidence":0.6},
-            "status":{"type":"choice","choice":"todo","confidence":0.7},
             "needs_clarification":{"type":"noul","noul":0.2},
             "tag_1":{"type":"noul","noul":0.75}
         }});
@@ -1065,7 +1049,6 @@ mod tests {
         let answers = CaptureAnswers {
             project: Some(("p0".into(), 0.6)),
             priority: Some(("p2".into(), 0.9)),
-            status: Some(("inbox".into(), 0.9)),
             needs_clarification: Some(0.95),
             tags: vec![Some(0.8), None],
         };

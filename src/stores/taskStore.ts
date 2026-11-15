@@ -1620,7 +1620,6 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         ...parsedFields,
         ...(!explicitProject && suggestion?.project ? { project: suggestion.project } : {}),
         ...(!explicitPriority && suggestion ? { priority: suggestion.priority } : {}),
-        ...(suggestion ? { status: suggestion.status } : {}),
       };
       const task = await api.tasks.create(fields);
       // People typed as `@name` become tags — a second write, because tags

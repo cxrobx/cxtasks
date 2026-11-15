@@ -366,7 +366,6 @@ export function describeTripwire(
 }
 
 export const STATUS_LABELS: Record<TaskStatus, string> = {
-  inbox: "Inbox",
   todo: "To do",
   queued: "Queued",
   in_progress: "In progress",
@@ -380,8 +379,7 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
  * in a sentence gets used for whatever is nearby.
  */
 export const STATUS_HINTS: Record<TaskStatus, string> = {
-  inbox: "Captured, not yet triaged.",
-  todo: "Triaged and actionable now.",
+  todo: "Open, not started.",
   queued: "Handed to the background runner.",
   in_progress: "Being worked — by you or an agent.",
   in_review: "Produced, waiting on you to accept it.",

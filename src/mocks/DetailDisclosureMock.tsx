@@ -106,7 +106,7 @@ function samples(): Record<SampleKey, MockTask> {
     sparse: {
       ref: "T202",
       title: "Play the embed once in the Courses Plus learner view on the storefront",
-      status: "inbox",
+      status: "todo",
       priority: 2,
       project: null,
       section: null,
@@ -148,7 +148,7 @@ function samples(): Record<SampleKey, MockTask> {
     condition: {
       ref: "T205",
       title: "Read teacherhero.org Search Console: did the 9 “Discovered” pages get crawled?",
-      status: "inbox",
+      status: "todo",
       priority: 2,
       project: "TeacherHero",
       section: "Backlog",
@@ -202,7 +202,7 @@ function describeRepeat(rule: string | null): string | null {
 }
 
 function statusArticle(s: TaskStatus) {
-  return s === "inbox" || s === "in_progress" || s === "in_review" ? "An" : "A";
+  return s === "in_progress" || s === "in_review" ? "An" : "A";
 }
 
 /* ── shared state ────────────────────────────────────────────── */

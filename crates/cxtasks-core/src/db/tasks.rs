@@ -27,8 +27,7 @@ pub const PRIORITY_LOWEST: i64 = 3;
 /// **One axis: how far along is this work.** See [`crate::db::schema`]'s v12
 /// migration for why the old eight weren't mutually exclusive and what each of
 /// these means.
-pub const STATUSES: [&str; 6] = [
-    "inbox",
+pub const STATUSES: [&str; 5] = [
     "todo",
     "queued",
     "in_progress",
@@ -43,8 +42,7 @@ pub const STATUSES: [&str; 6] = [
 /// checks [`crate::commands::dispatch`] runs first. It stays a real status
 /// because it is the runner's atomic claim key (invariant 15) — it is just not a
 /// thing you pick.
-pub const USER_STATUSES: [&str; 5] = [
-    "inbox",
+pub const USER_STATUSES: [&str; 4] = [
     "todo",
     "in_progress",
     "in_review",
@@ -82,6 +80,12 @@ pub fn normalize_status(raw: &str) -> Option<&'static str> {
         // a reason; the reason is what it meant, and the status underneath is
         // open work.
         "blocked" => Some("todo"),
+        // 2026-11-14: `inbox` is not a status. "Untriaged" is DERIVED — the
+        // Inbox view is "no home, no date" — and nothing read the stored
+        // value, so 68 of 104 open tasks wore it while 52 of those already
+        // had a project. A pre-2026-11-14 client (the iOS app, an old plugin
+        // copy) still sends it; it meant open work, which is `todo`.
+        "inbox" => Some("todo"),
         _ => None,
     }
 }
@@ -135,6 +139,11 @@ pub fn heal_legacy_statuses(conn: &Connection) -> Result<(), AppError> {
         -- v27: a pre-v27 writer's `blocked` keeps its reason (that binary
         -- required one), so the hold survives and only the axis is corrected.
         UPDATE tasks SET status = 'todo'      WHERE status = 'blocked';
+        -- 2026-11-14: `inbox` left the axis (see `normalize_status`). No
+        -- version gate, because there is no column to add: this heal IS the
+        -- migration, and it keeps converging rows a stale writer still files
+        -- as `inbox` (the v1 column DEFAULT among them).
+        UPDATE tasks SET status = 'todo'      WHERE status = 'inbox';
         "#,
     )?;
     Ok(())
@@ -411,7 +420,13 @@ pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         id: row.get(0)?,
         title: row.get(1)?,
         body: row.get(2)?,
-        status: row.get(3)?,
+        // Normalized on READ as well as healed on open: a pull from a peer
+        // still on the old vocabulary lands `inbox` rows between heals, and
+        // no surface may print a status it can't name.
+        status: {
+            let raw: String = row.get(3)?;
+            normalize_status(&raw).map(str::to_string).unwrap_or(raw)
+        },
         priority: row.get(4)?,
         project: row.get(5)?,
         due_at: row.get(6)?,
@@ -683,7 +698,7 @@ pub fn create(conn: &Connection, new: &NewTask) -> Result<Task, AppError> {
     if title.is_empty() {
         return Err(AppError::Validation("title must not be empty".into()));
     }
-    let raw_status = new.status.as_deref().unwrap_or("inbox");
+    let raw_status = new.status.as_deref().unwrap_or("todo");
     let status = normalize_status(raw_status).ok_or_else(|| invalid_status(raw_status))?;
     validate_run_budget(new.bg_timeout_minutes, new.bg_run_token_cap)?;
     let blocked_reason = new
@@ -3598,6 +3613,38 @@ mod tests {
         assert_eq!(normalize_status("nonsense"), None);
     }
 
+    /// `inbox` left the axis on 2026-11-14 ("untriaged" is the Inbox VIEW's
+    /// derived predicate). Every route it can still arrive by — a stale
+    /// client's argument, a stale writer's row, a peer's pull read before the
+    /// next heal, the v1 column DEFAULT — must land on `todo`, and a new task
+    /// must default there.
+    #[test]
+    fn inbox_is_not_a_status_and_every_route_lands_on_todo() {
+        assert!(!STATUSES.contains(&"inbox"));
+        assert_eq!(normalize_status("inbox"), Some("todo"));
+        assert_eq!(normalize_status("Inbox"), Some("todo"));
+
+        let conn = test_conn();
+        let fresh = seed(&conn, "no status given");
+        assert_eq!(fresh.status, "todo", "the create default");
+        let sent = create(
+            &conn,
+            &NewTask { title: "old client".into(), status: Some("inbox".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(sent.status, "todo");
+
+        // A stale writer, and the column DEFAULT a raw INSERT still gets.
+        conn.execute("UPDATE tasks SET status = 'inbox' WHERE id = ?1", [&fresh.id]).unwrap();
+        conn.execute("INSERT INTO tasks (id, title) VALUES ('raw', 'raw insert')", []).unwrap();
+        assert_eq!(get(&conn, &fresh.id).unwrap().unwrap().status, "todo", "normalized on read");
+        heal_legacy_statuses(&conn).unwrap();
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE status = 'inbox'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 0, "healed in storage, not only on read");
+    }
+
     /// `cancelled` maps to nothing on purpose. `done` would claim the work
     /// finished and `todo` would silently put it back on the board, so the
     /// caller is told where it went instead of being quietly given one of them.
@@ -4382,10 +4429,10 @@ mod tests {
     }
 
     #[test]
-    fn create_defaults_to_inbox_and_no_execution_context() {
+    fn create_defaults_to_todo_and_no_execution_context() {
         let conn = test_conn();
         let t = seed(&conn, "buy strings");
-        assert_eq!(t.status, "inbox");
+        assert_eq!(t.status, "todo");
         assert_eq!(
             t.priority, PRIORITY_LOWEST,
             "a captured task must default to the LOWEST priority — with P0 = highest, \

@@ -498,7 +498,7 @@ mod tests {
         insert(&conn, 3, "todo", Some("2026-11-07T02:00:00.000Z"), false); // long overdue
         insert(&conn, 4, "done", Some("2026-11-07T03:20:00.000Z"), false); // closed
         insert(&conn, 5, "todo", Some("2026-11-07T03:20:00.000Z"), true); // archived
-        insert(&conn, 6, "inbox", None, false); // no date
+        insert(&conn, 6, "todo", None, false); // no date
         insert(&conn, 7, "in_review", Some("2026-11-07T03:21:00.000Z"), false); // due exactly now
         let due = due_tasks(&conn, at("2026-11-07T03:21:00.000Z")).unwrap();
         let refs: Vec<_> = due.iter().map(|t| t.reference.as_str()).collect();

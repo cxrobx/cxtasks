@@ -31,7 +31,7 @@ beforeEach(() => {
 it.each([0, 1, 2, 3])("preserves explicit project and !%i priority against enrichment", async (priority) => {
   await useTaskStore.getState().quickAdd(`Ship #Chosen !${priority}`, suggestion);
   expect(api.tasks.create).toHaveBeenCalledExactlyOnceWith({
-    title: "Ship", project: "Chosen", priority, due_at: null, status: "todo",
+    title: "Ship", project: "Chosen", priority, due_at: null,
   });
 });
 
@@ -39,14 +39,14 @@ it("preserves the active project against enrichment", async () => {
   useTaskStore.setState({ activeProject: "Chosen" });
   await useTaskStore.getState().quickAdd("Ship", suggestion);
   expect(api.tasks.create).toHaveBeenCalledExactlyOnceWith({
-    title: "Ship", project: "Chosen", priority: 3, due_at: null, status: "todo",
+    title: "Ship", project: "Chosen", priority: 3, due_at: null,
   });
 });
 
 it("still enriches project and priority when neither is explicit", async () => {
   await useTaskStore.getState().quickAdd("Ship", { ...suggestion, priority: 1 });
   expect(api.tasks.create).toHaveBeenCalledExactlyOnceWith({
-    title: "Ship", project: "Suggested", priority: 1, due_at: null, status: "todo",
+    title: "Ship", project: "Suggested", priority: 1, due_at: null,
   });
 });
 

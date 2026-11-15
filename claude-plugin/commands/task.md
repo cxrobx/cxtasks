@@ -94,7 +94,7 @@ vague prompt that pretends to be specific is worse than no prompt.
      "don't start until Monday", "snooze this". The task moves to Waiting and
      hides from the actionable views (Open, Today, Inbox, `next_task`) until
      that instant, then reappears on its own. There is **no "planned" status**
-     — deferral *is* this date; the task keeps `todo`/`inbox` while it waits.
+     — deferral *is* this date; the task keeps its status while it waits.
    - Both together is normal and correct: "start Monday, due Friday" =
      `defer_until` Monday + `due_at` Friday.
 
