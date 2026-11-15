@@ -348,6 +348,10 @@ pub struct Task {
     pub tripwire_state: Option<String>,
     /// When the check last came back true. Bookkeeping, one-time.
     pub tripwire_tripped_at: Option<String>,
+    /// Derived from an independent health observation for this exact runtime
+    /// episode. Never stored on tasks; a real answer/reset expires it.
+    #[serde(default)]
+    pub tripwire_health_warning: bool,
 }
 
 impl Task {
@@ -396,16 +400,31 @@ impl Task {
     }
 }
 
+// One identity for the persisted observation and its visibility. JSON array
+// encoding agrees with serde_json for these string/null fields (tested through
+// the real warning writer). No new schema or sync protocol is needed.
+macro_rules! health_warning_sql {
+    () => {
+        "EXISTS (SELECT 1 FROM tripwire_runtime cxh_r JOIN task_comments cxh_c
+         ON cxh_c.id = 'tripwire-health:' || json_array(tasks.id, tasks.tripwire, tasks.run_on,
+             cxh_r.checked_at, cxh_r.requested_at,
+             CASE WHEN cxh_r.checked_at IS NULL AND cxh_r.requested_at IS NULL THEN cxh_r.updated_at ELSE NULL END)
+         WHERE cxh_r.task_id = tasks.id)"
+    };
+}
+
+pub const HEALTH_WARNING_SQL: &str = health_warning_sql!();
+
 /// **Index-positional, paired with [`row_to_task`].** A new column goes on the
 /// END of both lists — inserting one in the middle silently shifts every
 /// `row.get(n)` after it onto the wrong field.
-pub(crate) const COLUMNS: &str = "id, title, body, status, priority, project, due_at, defer_until, \
+pub(crate) const COLUMNS: &str = concat!("id, title, body, status, priority, project, due_at, defer_until, \
      recurrence, parent_id, sort_order, created_at, updated_at, completed_at, \
      repo_path, prompt, bg_allowed, bg_writes_allowed, reminded_at, model, section_id, \
      deleted_at, archived_at, short_id, bg_shell_allowed, bg_executor, bg_codex_allowed, \
      blocked_reason, bg_intent, bg_timeout_minutes, bg_run_token_cap, bg_remote_allowed, \
      bg_mcp_servers, tripwire, tripwire_every_minutes, tripwire_on_trip, tripwire_state, \
-     tripwire_tripped_at, run_on";
+     tripwire_tripped_at, run_on, ", health_warning_sql!(), " AS tripwire_health_warning");
 
 pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
     // Index 16 is the RAW `bg_allowed` column — Claude's gate alone — and index
@@ -461,6 +480,7 @@ pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         tripwire_state: row.get(36)?,
         tripwire_tripped_at: row.get(37)?,
         run_on: row.get(38)?,
+        tripwire_health_warning: row.get(39)?,
     })
 }
 
@@ -1050,7 +1070,7 @@ pub fn not_decision_sql() -> String {
 /// would vanish from "not waiting". The test for the false direction found it.
 pub fn waiting_sql() -> String {
     format!(
-        "({} OR {TRIPWIRE_ARMED} OR {})",
+        "({} OR ({TRIPWIRE_ARMED} AND NOT {HEALTH_WARNING_SQL}) OR {})",
         DEFERRED_SQL,
         blocked_sql()
     )
@@ -1131,7 +1151,7 @@ pub const NOT_DEFERRED: &str = "((defer_until IS NULL OR datetime(defer_until) <
 /// hold: a task you cannot start does not belong in the list of things to start.
 pub fn not_held_sql() -> String {
     format!(
-        "({NOT_DEFERRED} AND blocked_reason IS NULL AND NOT {})",
+        "(({NOT_DEFERRED} OR ({DEFER_PASSED} AND {HEALTH_WARNING_SQL})) AND blocked_reason IS NULL AND NOT {})",
         dep_blocked_sql()
     )
 }
@@ -1161,7 +1181,7 @@ pub fn actionable_sql() -> String {
 /// something to chase, not something planned. It kept its own name because the
 /// board's `planned_count` field is decoded non-optionally by the iOS client.
 pub fn planned_sql() -> String {
-    format!("({DEFERRED_SQL} OR {TRIPWIRE_ARMED})")
+    format!("({DEFERRED_SQL} OR ({TRIPWIRE_ARMED} AND NOT {HEALTH_WARNING_SQL}))")
 }
 
 pub(crate) fn closed_list() -> String {
@@ -1232,7 +1252,8 @@ pub(crate) fn view_where(view: View) -> Vec<String> {
                 "((due_at IS NOT NULL AND datetime(due_at,'localtime') < {TOMORROW_LOCAL})
                   OR status IN ('in_progress','queued','in_review')
                   OR {}
-                  OR {FIRED_MONITOR_SQL})",
+                  OR {FIRED_MONITOR_SQL}
+                  OR {HEALTH_WARNING_SQL})",
                 is_decision_sql()
             ));
         }
@@ -1340,7 +1361,8 @@ pub fn next_task(conn: &Connection, project: Option<&str>) -> Result<Option<Task
     // A held task — blocked by a dependency, by a written reason, by a date or
     // a tripwire — is not actionable, so handing it back as "what to work on"
     // is actively wrong: you'd start it and immediately discover you can't.
-    // All four live in `not_held_sql`, the same predicate Open carries.
+    // Open also surfaces independent health warnings, so retain the strict
+    // armed gate here: showing a broken watcher is not permission to do work.
     //
     // `in_review` is the same wrongness from the other end: the work is DONE
     // and waiting on a human, so a picker handed one either redoes finished
@@ -1354,6 +1376,7 @@ pub fn next_task(conn: &Connection, project: Option<&str>) -> Result<Option<Task
            AND status NOT IN ({closed})
            AND status <> 'in_review'
            AND parent_id IS NULL
+           AND {TRIPWIRE_NOT_ARMED}
            AND {}
            AND {}
            AND {}",

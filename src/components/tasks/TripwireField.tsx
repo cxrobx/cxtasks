@@ -336,6 +336,10 @@ function TripwireStatus({
           ? "Check failed — fix the script, then complete it to re-arm"
           : "Check failed — fix the script and re-arm"}
       </span>
+    ) : task.tripwire_health_warning ? (
+      <span className="font-medium text-warning">
+        Machine not checking — check Run on and the latest health warning in Activity
+      </span>
     ) : isMonitor(task) ? (
       <span className="flex items-center gap-1 font-medium text-accent" data-testid="monitor-state">
         <RefreshCw size={10} />

@@ -26,8 +26,9 @@
 //!
 //! The lease expiry is the ONE reclaim rule. A runner that crashes after the
 //! claim leaves nothing recorded and the request untouched; the lease expires
-//! and the next tick re-runs it. Two runner processes cannot both run one
-//! attempt, because the CAS admits one. A late result from a reclaimed attempt
+//! and the next tick re-runs it. Two processes sharing one SQLite DB cannot both run one
+//! attempt. This is NOT a distributed lock; foreign health diagnostics never
+//! claim or write this row. A late result from a reclaimed attempt
 //! is dropped by `record`'s own CAS.
 //!
 //! # Reset, never deleted
@@ -123,7 +124,7 @@ pub fn reset_runtime(conn: &Connection, task_id: &str) -> Result<(), AppError> {
             SET requested_at = NULL, lease_id = NULL, lease_host = NULL, lease_spec = NULL,
                 lease_request_at = NULL, lease_expires_at = NULL, checked_at = NULL,
                 last_outcome = NULL, last_note = NULL, failures = 0,
-                updated_at = datetime('now')
+                updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
           WHERE task_id = ?1",
         params![task_id],
     )?;
@@ -270,8 +271,48 @@ pub fn claim(
                 lease_expires_at = datetime('now', '+' || ?5 || ' minutes'),
                 updated_at = datetime('now')
           WHERE task_id = ?1
-            AND (lease_id IS NULL OR datetime(lease_expires_at) < datetime('now'))",
+            AND (lease_id IS NULL OR datetime(lease_expires_at) < datetime('now'))
+            AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = ?1
+                        AND t.tripwire = ?4 AND (t.run_on IS NULL OR t.run_on = ?3))",
         params![task_id, lease_id, host, spec, expires_minutes],
+    )?;
+    Ok(n == 1)
+}
+
+/// Inactivity starts at the latest real answer or request. A reset has neither,
+/// so its own timestamp starts a fresh clock, never the task's creation date.
+/// Claims may refresh a never-checked clock too: activity is evidence of life.
+pub fn inactive_since(rt: &Runtime) -> Option<chrono::DateTime<chrono::Utc>> {
+    let checked = rt.checked_at.as_deref().and_then(tripwire::parse_stamp);
+    let requested = rt.requested_at.as_deref().and_then(tripwire::parse_stamp);
+    checked.into_iter().chain(requested).max()
+        .or_else(|| tripwire::parse_stamp(&rt.updated_at))
+}
+
+/// A bystander's observation, not a check. Append-only comments already sync
+/// independently of the owner. The deterministic key bounds this to one warning
+/// per spec/assignment/inactivity episode across reporters, including offline ones.
+/// Never change tasks or runtime here: a stale observation must not invalidate
+/// an owner's live attempt, consume a request, or impose failure backoff.
+pub fn warn_inactive(
+    conn: &Connection,
+    task: &Task,
+    runtime: &Runtime,
+    note: &str,
+) -> Result<bool, AppError> {
+    // Keep this tuple byte-identical to tasks::health_warning_sql!: using the
+    // observation's inputs, rather than its arrival time, expires stale warnings
+    // even when a foreign machine posts one after the owner's real answer.
+    let key = serde_json::to_string(&(
+        &task.id, &task.tripwire, &task.run_on, &runtime.checked_at, &runtime.requested_at,
+        if runtime.checked_at.is_none() && runtime.requested_at.is_none() { Some(&runtime.updated_at) } else { None },
+    )).map_err(|e| AppError::General(e.to_string()))?;
+    let id = format!("tripwire-health:{key}");
+    let n = conn.execute(
+        "INSERT INTO task_comments (id, task_id, author, body)
+         VALUES (?1, ?2, 'tripwire', ?3) ON CONFLICT(id) DO NOTHING",
+        params![id, task.id, format!("Tripwire health warning (observation, not a check) · {}\n\n{note}",
+            task.tripwire.as_deref().unwrap_or("?"))],
     )?;
     Ok(n == 1)
 }
@@ -336,8 +377,42 @@ pub fn record(
     lease_id: &str,
     outcome: &Outcome,
 ) -> Result<Recorded, AppError> {
+    record_with_run(conn, task_id, lease_id, outcome, None)
+}
+
+/// Settle acceptance and the agent's run in one transaction. A discarded result
+/// keeps its report and token usage but is never advertised as succeeded.
+pub fn record_check(
+    conn: &Connection,
+    task_id: &str,
+    run_id: &str,
+    outcome: &Outcome,
+    run_outcome: &crate::db::runs::RunOutcome,
+) -> Result<Recorded, AppError> {
+    record_with_run(conn, task_id, run_id, outcome, Some(run_outcome))
+}
+
+fn record_with_run(
+    conn: &Connection,
+    task_id: &str,
+    lease_id: &str,
+    outcome: &Outcome,
+    run_outcome: Option<&crate::db::runs::RunOutcome>,
+) -> Result<Recorded, AppError> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<Recorded, AppError> {
+        if run_outcome.is_some() {
+            let run = crate::db::runs::get(conn, lease_id)?
+                .filter(|r| r.task_id == task_id && r.intent == crate::intent::BackgroundIntent::Check)
+                .ok_or_else(|| AppError::Validation("not this task's check run".into()))?;
+            if run.status != "running" {
+                let disposition = run.result_text.as_deref().unwrap_or("");
+                if run.status != "discarded" && !disposition.starts_with("Tripwire result: accepted.") {
+                    return Err(AppError::Validation("check run ended without accepting a result".into()));
+                }
+                return Ok(Recorded { discarded: run.status == "discarded", transition: None, failures: 0 });
+            }
+        }
         let discarded = |conn: &Connection| -> Result<Recorded, AppError> {
             conn.execute(
                 "UPDATE tripwire_runtime
@@ -364,11 +439,16 @@ pub fn record(
         // A tripped, non-sticky monitor is re-checked so it can clear itself.
         // Its attempt is still ours; what it may do is narrower (below).
         let rechecking = rechecks_while_tripped(conn, &task)?;
-        let still_ours = task.deleted_at.is_none()
+        let cancelled: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_runs WHERE id=?1 AND cancel_requested_at IS NOT NULL)",
+            params![lease_id], |r| r.get(0),
+        )?;
+        let still_ours = !cancelled && task.deleted_at.is_none()
             && task.archived_at.is_none()
             && (!closed || monitor)
             && (task.tripwire_armed() || rechecking)
-            && task.tripwire.as_deref() == rt.lease_spec.as_deref();
+            && task.tripwire.as_deref() == rt.lease_spec.as_deref()
+            && task.run_on.as_deref().is_none_or(|id| Some(id) == rt.lease_host.as_deref());
         if !still_ours {
             return discarded(conn);
         }
@@ -516,6 +596,21 @@ pub fn record(
         Ok(Recorded { discarded: false, transition, failures })
     })();
 
+    let result = result.and_then(|recorded| {
+        if let Some(outcome) = run_outcome {
+            let mut settled = outcome.clone();
+            let disposition = if recorded.discarded { "discarded (task changed or lease lost)" } else { "accepted" };
+            if recorded.discarded {
+                settled.status = "discarded".into();
+            }
+            settled.result_text = Some(format!(
+                "Tripwire result: {disposition}.\n\n{}",
+                outcome.result_text.as_deref().unwrap_or("")
+            ));
+            crate::db::runs::finish(conn, lease_id, &settled)?;
+        }
+        Ok(recorded)
+    });
     match result {
         Ok(v) => {
             conn.execute_batch("COMMIT")?;

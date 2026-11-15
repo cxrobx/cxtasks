@@ -100,10 +100,9 @@ pub enum Check {
     Unsupported(String),
 }
 
-/// How many due tripwires a lane looks through to find its own. Every spec
-/// shares `list_due`, so a limit applied there would let a board of scripts
-/// hide the one agent check, or ten scripts held elsewhere hide this host's.
-const DUE_SCAN: usize = 200;
+// Do not cap candidates before filtering ownership/kind: permanently due
+// foreign tasks would starve executable work behind the cap. list_due already
+// reads the candidate IDs; only execution is capped per tick.
 
 /// One leased attempt, carrying everything needed to run it without the DB.
 #[derive(Debug, Clone)]
@@ -123,26 +122,19 @@ pub struct Claimed {
 /// `dir` is this host's scripts folder: a script not in it is skipped the same
 /// way, unless nobody has checked it for long enough to say so.
 pub fn claim_due(conn: &Connection, dir: &Path, limit: usize) -> Result<Vec<Claimed>, AppError> {
-    let host = crate::host::host_id();
+    claim_due_on_host(conn, dir, limit, &crate::host::host_id())
+}
+
+fn claim_due_on_host(conn: &Connection, dir: &Path, limit: usize, host: &str) -> Result<Vec<Claimed>, AppError> {
     let now = chrono::Utc::now();
     let mut out = Vec::new();
-    for (task, runtime) in db::tripwires::list_due(conn, DUE_SCAN)? {
+    for (task, runtime) in db::tripwires::list_due(conn, usize::MAX)? {
         if out.len() >= limit {
             break;
         }
         let Some(spec) = task.tripwire.clone() else { continue };
-        let since = runtime
-            .checked_at
-            .as_deref()
-            .or(runtime.requested_at.as_deref())
-            .or(Some(task.created_at.as_str()))
-            .and_then(tripwire::parse_stamp);
-        let orphaned = tripwire::is_orphaned(
-            task.tripwire_every_minutes,
-            since,
-            runtime.last_note.as_deref(),
-            now,
-        );
+        let since = db::tripwires::inactive_since(&runtime);
+        let orphaned = tripwire::is_orphaned(task.tripwire_every_minutes, since, now);
         let assigned_elsewhere = task.run_on.as_deref().is_some_and(|id| id != host);
         let check = match Tripwire::parse(&spec) {
             // Assigned to another machine: this host never evaluates it, of any
@@ -153,12 +145,14 @@ pub fn claim_due(conn: &Connection, dir: &Path, limit: usize) -> Result<Vec<Clai
                 }
                 let id = task.run_on.as_deref().unwrap_or_default();
                 let label = db::hosts::get(conn, id)?.map(|h| h.label).unwrap_or_else(|| id.into());
-                Check::Unsupported(format!(
+                let note = format!(
                     "{} since {}. This task is assigned to {label}. Check that machine is on, or \
                      pick another one in Run on.",
                     tripwire::ORPHAN_NOTE,
                     since.map(|s| s.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "it began".into()),
-                ))
+                );
+                warn_inactive(conn, &task, &runtime, &note)?;
+                continue;
             }
             // Assigned here: a missing script is this host's own error, so it
             // falls through and fails where it can be fixed.
@@ -168,12 +162,14 @@ pub fn claim_due(conn: &Connection, dir: &Path, limit: usize) -> Result<Vec<Clai
                 if !orphaned {
                     continue;
                 }
-                Check::Unsupported(format!(
+                let note = format!(
                     "{} since {}. It isn't on this host; put an executable named '{name}' in \
                      the tripwires folder of the machine that should run it.",
                     tripwire::ORPHAN_NOTE,
                     since.map(|s| s.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "it began".into()),
-                ))
+                );
+                warn_inactive(conn, &task, &runtime, &note)?;
+                continue;
             }
             Ok(Tripwire::Script { name, arg }) => Check::Script { name, arg },
             Ok(Tripwire::Agent { .. }) => continue,
@@ -194,6 +190,14 @@ pub fn claim_due(conn: &Connection, dir: &Path, limit: usize) -> Result<Vec<Clai
         out.push(Claimed { task, lease_id, check });
     }
     Ok(out)
+}
+
+fn warn_inactive(conn: &Connection, task: &Task, runtime: &db::tripwires::Runtime, note: &str) -> Result<(), AppError> {
+    if db::tripwires::warn_inactive(conn, task, runtime, note)? {
+        log::warn!("tripwire: health warning on {}: {note}", task.id);
+        announce_notice(task, "tripwire-failed", "CXTasks — tripwire health warning", note);
+    }
+    Ok(())
 }
 
 /// Claim what is due and evaluate it on one worker thread. Returns how many
@@ -317,7 +321,7 @@ fn next_due_agent(
     conn: &Connection,
     cap: &crate::routing::HostCapability,
 ) -> Result<Option<(Task, String, String)>, AppError> {
-    for (task, _rt) in db::tripwires::list_due(conn, DUE_SCAN)? {
+    for (task, _rt) in db::tripwires::list_due(conn, usize::MAX)? {
         if !cap.is_mine(task.run_on.as_deref()) {
             continue;
         }
@@ -423,8 +427,7 @@ pub fn agent_pass(
                 BackgroundExecutor::Claude,
                 format!("Tripwire check refused: {reason}"),
             );
-            let _ = db::runs::finish(conn, &run.id, &outcome);
-            record_and_announce(conn, &task, &run.id, &Outcome::Error(reason));
+            finish_check(conn, &task, &run.id, &outcome);
             return Ok(0);
         }
     };
@@ -474,17 +477,15 @@ pub fn agent_pass(
     Ok(1)
 }
 
-/// Close a check: finish the run row, translate the final message into a
-/// tripwire outcome, record it against the run-id lease, announce.
+/// Close a check: translate the verdict, settle acceptance and the run receipt
+/// atomically, then announce. Discards keep the report and usage under their
+/// own terminal status, and persistence failures never masquerade as success.
 ///
 /// No comment and no task-status patch — `db::tripwires::record` writes the
 /// comment on a TRANSITION, and a not-yet is deliberately silent (a check
 /// that commented "not yet" every hour would bury the log). The run row
 /// carries the full message for anyone who wants to read the reasoning.
 pub fn finish_check(conn: &Connection, task: &Task, run_id: &str, outcome: &RunOutcome) {
-    if let Err(e) = db::runs::finish(conn, run_id, outcome) {
-        log::error!("tripwire: could not record check run {run_id}: {e}");
-    }
     let tw = verdict_outcome(outcome);
     log::info!(
         "tripwire: {} agent check → {} ({} tokens)",
@@ -495,14 +496,31 @@ pub fn finish_check(conn: &Connection, task: &Task, run_id: &str, outcome: &RunO
             + outcome.cache_write_tokens.unwrap_or(0)
             + outcome.output_tokens.unwrap_or(0)
     );
-    record_and_announce(conn, task, run_id, &tw);
+    let disposition = match db::tripwires::record_check(conn, &task.id, run_id, &tw, outcome) {
+        Ok(recorded) => {
+            if let Some(t) = recorded.transition { announce(task, &t); }
+            if recorded.discarded { "discarded" } else { "accepted" }
+        }
+        Err(e) => {
+            log::error!("tripwire: could not settle check run {run_id}: {e}");
+            let mut failed = outcome.clone();
+            failed.status = "failed".into();
+            failed.result_text = Some(format!("Tripwire result not recorded: {e}\n\n{}",
+                outcome.result_text.as_deref().unwrap_or("")));
+            if let Err(e) = db::runs::finish(conn, run_id, &failed) {
+                log::error!("tripwire: could not persist settlement failure for {run_id}: {e}");
+            }
+            "not recorded"
+        }
+    };
+    log::info!("tripwire: check run {run_id} {disposition}");
     // The app live-refreshes on a run ending; a check is a run. Envelope
     // only — no banner from here, because a not-yet is not news, and a trip
     // has already been announced by `record_and_announce`.
     let env = Envelope::new("run-finished", &task.id)
         .with_tool("tripwire")
         .with_run_id(run_id)
-        .with_summary(&format!("tripwire check: {}", tw.kind().as_str()));
+        .with_summary(&format!("tripwire check {disposition}: {}", tw.kind().as_str()));
     let _ = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1099,6 +1117,10 @@ fn announce(task: &Task, t: &Transition) {
         ),
         Transition::Failed { note, .. } => ("tripwire-failed", "CXTasks — tripwire check failed", note),
     };
+    announce_notice(task, kind, title, note);
+}
+
+fn announce_notice(task: &Task, kind: &str, title: &str, note: &str) {
     let first_line = note
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -1400,60 +1422,235 @@ mod tests {
         .unwrap();
     }
 
-    /// The other half of skipping: a script nobody holds must not hide its
-    /// task forever. It climbs the ordinary failure path, surfaces, and a
-    /// non-holder's own error does not read as the check it says is missing.
+    /// A non-holder emits a durable, deduplicated warning, not five fake
+    /// failed checks. The owner remains due and the warning cannot hide it
+    /// behind failure backoff or force a re-arm.
     #[test]
-    fn a_script_no_host_has_checked_for_days_surfaces_through_a_non_holder() {
+    fn a_script_no_host_has_checked_for_days_warns_without_claiming() {
         let conn = test_conn();
         let r = root("orphan");
         let t = armed(&conn, "script:typo-in-the-name", Some(5), None);
-        conn.execute(
-            "UPDATE tasks SET created_at = '2000-01-01 00:00:00' WHERE id = ?1",
-            rusqlite::params![t.id],
-        )
-        .unwrap();
-        let mut transitions = Vec::new();
-        for attempt in 1..=5 {
-            transitions = pass(&conn, &r);
-            let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
-            assert_eq!(rt.failures, attempt, "{rt:?}");
-            assert!(rt.last_note.as_deref().unwrap().starts_with(tripwire::ORPHAN_NOTE));
-            assert!(rt.last_note.as_deref().unwrap().contains("typo-in-the-name"));
-            backdate(&conn, &t.id);
+        backdate(&conn, &t.id);
+        let before = db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        for _ in 0..5 { assert!(pass(&conn, &r).is_empty()); }
+        let after = db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
+        let comments = db::comments::for_task(&conn, &t.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].body.contains(tripwire::ORPHAN_NOTE));
+        assert!(comments[0].body.contains("typo-in-the-name"));
+        let task = get(&conn, &t.id).unwrap().unwrap();
+        assert!(task.tripwire_armed(), "warning is not a check result");
+        assert!(task.tripwire_health_warning);
+        assert!(db::tasks::next_task(&conn, None).unwrap().is_none(), "visibility must not release the unmet condition to /next");
+        for view in [db::tasks::View::Open, db::tasks::View::Today] {
+            assert!(db::tasks::list(&conn, &db::tasks::ListFilters { view: Some(view), ..Default::default() }).unwrap().iter().any(|t| t.id == task.id), "warning must be visible in {view:?}");
         }
-        assert!(matches!(&transitions[..], [Transition::Failed { failures: 5, .. }]), "{transitions:?}");
-        assert_eq!(get(&conn, &t.id).unwrap().unwrap().tripwire_state.as_deref(), Some("error"));
+        assert!(db::tasks::list(&conn, &db::tasks::ListFilters { view: Some(db::tasks::View::Waiting), ..Default::default() }).unwrap().is_empty());
+        assert_eq!(db::tripwires::list_due(&conn, 10).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&r);
     }
 
-    /// The pair to the test above: a holder coming back clears a non-holder's
-    /// report, so a laptop shut for a week leaves nothing behind.
     #[test]
-    fn a_holders_answer_clears_a_non_holders_report() {
+    fn a_holders_answer_ends_the_warning_episode() {
         let conn = test_conn();
         let holder = root("holder");
         let bystander = root("bystander");
         script(&holder, "shared", "echo nothing yet; exit 1");
         let t = armed(&conn, "script:shared", Some(5), None);
-        conn.execute(
-            "UPDATE tasks SET created_at = '2000-01-01 00:00:00' WHERE id = ?1",
-            rusqlite::params![t.id],
-        )
-        .unwrap();
-        pass(&conn, &bystander);
-        assert_eq!(crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().failures, 1);
         backdate(&conn, &t.id);
+        pass(&conn, &bystander);
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 1);
         pass(&conn, &holder);
-        let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        let rt = db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
         assert_eq!(rt.failures, 0);
         assert_eq!(rt.last_outcome.as_deref(), Some("not_yet"));
-        // And the bystander goes quiet again: a real answer is recent.
+        assert!(!get(&conn, &t.id).unwrap().unwrap().tripwire_health_warning);
+        assert!(db::tasks::list(&conn, &db::tasks::ListFilters { view: Some(db::tasks::View::Open), ..Default::default() }).unwrap().is_empty());
         backdate_none(&conn, &t.id);
         assert!(pass(&conn, &bystander).is_empty());
-        assert_eq!(crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().failures, 0);
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 1);
+        // A genuinely new long absence can warn again.
+        conn.execute("UPDATE tripwire_runtime SET checked_at='2001-01-01 00:00:00' WHERE task_id=?1", [&t.id]).unwrap();
+        pass(&conn, &bystander);
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 2);
         let _ = std::fs::remove_dir_all(&holder);
         let _ = std::fs::remove_dir_all(&bystander);
+    }
+
+    #[test]
+    fn a_reset_old_task_gets_a_fresh_inactivity_clock() {
+        let conn = test_conn();
+        let r = root("reset-clock");
+        let t = armed(&conn, "script:elsewhere", Some(60), Some("monitor"));
+        assign(&conn, &t.id, "some-other-host");
+        conn.execute("UPDATE tasks SET created_at='2000-01-01' WHERE id=?1", [&t.id]).unwrap();
+        backdate(&conn, &t.id);
+        pass(&conn, &r);
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 1);
+        db::tripwires::reset_runtime(&conn, &t.id).unwrap();
+        pass(&conn, &r);
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 1);
+        assert!(!get(&conn, &t.id).unwrap().unwrap().tripwire_health_warning);
+        let rt = db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert!(rt.checked_at.is_none() && rt.lease_id.is_none());
+        assert!(!tripwire::is_orphaned(Some(60), db::tripwires::inactive_since(&rt), chrono::Utc::now()));
+        // A recent explicit request is also evidence of activity, even if the
+        // last completed check was old. A legacy orphan note cannot override it.
+        backdate(&conn, &t.id);
+        conn.execute("UPDATE tripwire_runtime SET last_note=?2 WHERE task_id=?1", rusqlite::params![t.id, tripwire::ORPHAN_NOTE]).unwrap();
+        db::tripwires::request_check(&conn, &t.id).unwrap();
+        pass(&conn, &r);
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// Incident interleavings, with two independent SQLite replicas. Drive the
+    /// actual bystander lane, push whole rows in both orders, pull, and settle
+    /// a real run-id lease. No scripts, models, network, or live task data.
+    #[test]
+    fn a_foreign_warning_never_defeats_an_owners_check_across_sync() {
+        use crate::sync::{apply, snapshot};
+        for warning_before_claim in [false, true] {
+            for warning_push_first in [false, true] {
+                for result_before_sync in [false, true] {
+                    let mut owner = test_conn();
+                    let mut hub = test_conn();
+                    let observer = test_conn();
+                    let r = root("replica-race");
+                    let t = armed(&owner, "agent:Review the synthetic queue", Some(360), Some("monitor"));
+                    assign(&owner, &t.id, &crate::host::host_id());
+                    db::tags::set_for_task(&owner, &t.id, &["sticky".into()]).unwrap();
+                    backdate(&owner, &t.id);
+                    owner.execute("UPDATE tasks SET updated_at='2000-01-01 00:00:00' WHERE id=?1", [&t.id]).unwrap();
+                    owner.execute("UPDATE tripwire_runtime SET updated_at='2000-01-01 00:00:00' WHERE task_id=?1", [&t.id]).unwrap();
+                    let baseline = snapshot::take(&owner).unwrap();
+                    for table in crate::sync::tables::synced_tables() {
+                        apply::upsert(&hub, table, &baseline.tables[table]).unwrap();
+                        apply::upsert(&observer, table, &baseline.tables[table]).unwrap();
+                    }
+                    let warn = || {
+                        assert!(claim_due_on_host(&observer, &r.join("tripwires"), 10, "foreign-host").unwrap().is_empty());
+                        assert_eq!(db::comments::count_for_task(&observer, &t.id).unwrap(), 1);
+                        let rt = db::tripwires::for_task(&observer, &t.id).unwrap().unwrap();
+                        assert!(rt.lease_id.is_none() && rt.last_outcome.is_none());
+                        assert_eq!(rt.failures, 0);
+                    };
+                    if warning_before_claim { warn(); }
+                    let run = db::runs::start_check(&mut owner, &t.id, t.tripwire.as_deref().unwrap(), 4, BackgroundExecutor::Claude, 10).unwrap().unwrap();
+                    if !warning_before_claim { warn(); }
+                    // The low-level boundary also rejects a foreign "check";
+                    // local CAS alone must never be mistaken for authorization.
+                    assert!(!db::tripwires::claim(&observer, &t.id, "foreign-attempt", "foreign-host", t.tripwire.as_deref().unwrap(), 5).unwrap());
+                    let answer = RunOutcome { status: "succeeded".into(), result_text: Some("VERDICT: TRIPPED\nreal synthetic finding".into()), input_tokens: Some(123), ..Default::default() };
+                    if result_before_sync { finish_check(&owner, &t, &run.id, &answer); }
+                    let owner_image = snapshot::take(&owner).unwrap();
+                    let warning_image = snapshot::take(&observer).unwrap();
+                    let ordered = if warning_push_first { [&warning_image, &owner_image] } else { [&owner_image, &warning_image] };
+                    for image in ordered {
+                        for table in crate::sync::tables::synced_tables() {
+                            apply::upsert_pushed(&mut hub, table, &image.tables[table]).unwrap();
+                        }
+                    }
+                    let canonical = snapshot::take(&hub).unwrap();
+                    for table in crate::sync::tables::synced_tables() {
+                        apply::upsert(&owner, table, &canonical.tables[table]).unwrap();
+                    }
+                    if !result_before_sync {
+                        assert_eq!(db::tripwires::for_task(&owner, &t.id).unwrap().unwrap().lease_id.as_deref(), Some(run.id.as_str()));
+                        finish_check(&owner, &t, &run.id, &answer);
+                    }
+                    let after = get(&owner, &t.id).unwrap().unwrap();
+                    assert_eq!(after.tripwire_state.as_deref(), Some("tripped"));
+                    assert!(!after.tripwire_health_warning, "a stale warning expires on the real result");
+                    let rt = db::tripwires::for_task(&owner, &t.id).unwrap().unwrap();
+                    assert_eq!(rt.failures, 0);
+                    assert_eq!(rt.last_outcome.as_deref(), Some("tripped"));
+                    assert_eq!(db::runs::get(&owner, &run.id).unwrap().unwrap().status, "succeeded");
+                    assert_eq!(db::comments::count_for_task(&owner, &t.id).unwrap(), 2);
+                    // Converge, then replay the stale warning replica again.
+                    let final_image = snapshot::take(&owner).unwrap();
+                    for table in crate::sync::tables::synced_tables() {
+                        apply::upsert_pushed(&mut hub, table, &final_image.tables[table]).unwrap();
+                        apply::upsert_pushed(&mut hub, table, &warning_image.tables[table]).unwrap();
+                        apply::upsert(&observer, table, &snapshot::take(&hub).unwrap().tables[table]).unwrap();
+                    }
+                    assert_eq!(db::tripwires::for_task(&observer, &t.id).unwrap().unwrap().last_outcome.as_deref(), Some("tripped"));
+                    assert!(db::tripwires::list_due(&observer, 10).unwrap().is_empty(), "sticky trip stays open and unchecked");
+                    let _ = std::fs::remove_dir_all(&r);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn check_disposition_is_durable_and_settles_atomically() {
+        let mut conn = test_conn();
+        let t = armed(&conn, "agent:Review synthetic evidence", Some(60), None);
+        let answer = RunOutcome { status: "succeeded".into(), result_text: Some("VERDICT: TRIPPED\nkeep the report".into()), input_tokens: Some(321), ..Default::default() };
+        let run = db::runs::start_check(&mut conn, &t.id, t.tripwire.as_deref().unwrap(), 4, BackgroundExecutor::Claude, 10).unwrap().unwrap();
+        db::tripwires::reset_runtime(&conn, &t.id).unwrap();
+        finish_check(&conn, &t, &run.id, &answer);
+        let settled = db::runs::get(&conn, &run.id).unwrap().unwrap();
+        assert_eq!(settled.status, "discarded");
+        assert_eq!(settled.input_tokens, Some(321));
+        assert!(settled.result_text.unwrap().contains("keep the report"));
+        assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed());
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 0);
+
+        let run = db::runs::start_check(&mut conn, &t.id, t.tripwire.as_deref().unwrap(), 4, BackgroundExecutor::Claude, 10).unwrap().unwrap();
+        // Failure writing the run receipt must roll back the trip and comment.
+        conn.execute_batch("CREATE TEMP TRIGGER fail_receipt BEFORE UPDATE OF finished_at ON task_runs BEGIN SELECT RAISE(ABORT, 'receipt failed'); END;").unwrap();
+        assert!(db::tripwires::record_check(&conn, &t.id, &run.id, &Outcome::Tripped("finding".into()), &answer).is_err());
+        assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed());
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 0);
+        assert_eq!(db::runs::get(&conn, &run.id).unwrap().unwrap().status, "running");
+        assert_eq!(db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().lease_id.as_deref(), Some(run.id.as_str()));
+        conn.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+        finish_check(&conn, &t, &run.id, &answer);
+        let settled = db::runs::get(&conn, &run.id).unwrap().unwrap();
+        assert_eq!(settled.status, "succeeded");
+        assert!(settled.result_text.unwrap().starts_with("Tripwire result: accepted."));
+        finish_check(&conn, &t, &run.id, &answer);
+        assert_eq!(db::runs::get(&conn, &run.id).unwrap().unwrap().status, "succeeded", "retry is idempotent");
+        assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn more_than_two_hundred_orphans_cannot_starve_runnable_checks() {
+        let conn = test_conn();
+        let r = root("orphan-starvation");
+        for _ in 0..201 {
+            let t = armed(&conn, "script:held-elsewhere", Some(5), None);
+            backdate(&conn, &t.id);
+        }
+        script(&r, "local", "exit 1");
+        let local = armed(&conn, "script:local", Some(5), None);
+        let agent = armed(&conn, "agent:Check synthetic evidence", Some(60), None);
+        let claimed = claim_due(&conn, &r.join("tripwires"), 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task.id, local.id);
+        let cap = crate::routing::HostCapability::local_default(crate::host::host_id(), "owner".into());
+        assert_eq!(next_due_agent(&conn, &cap).unwrap().unwrap().0.id, agent.id);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cancellation_reassignment_and_spec_edits_discard_late_check_results() {
+        for change in ["cancel", "reassign", "spec"] {
+            let mut conn = test_conn();
+            let t = armed(&conn, "agent:Check synthetic evidence", Some(60), None);
+            let run = db::runs::start_check(&mut conn, &t.id, t.tripwire.as_deref().unwrap(), 4, BackgroundExecutor::Claude, 10).unwrap().unwrap();
+            match change {
+                "cancel" => { conn.execute("UPDATE task_runs SET cancel_requested_at=datetime('now') WHERE id=?1", [&run.id]).unwrap(); }
+                "reassign" => assign(&conn, &t.id, "new-owner"),
+                _ => { db::tasks::update(&conn, &t.id, &TaskPatch { tripwire: Some(Some("agent:Changed condition".into())), ..Default::default() }).unwrap(); }
+            }
+            finish_check(&conn, &t, &run.id, &RunOutcome { status: "succeeded".into(), result_text: Some("VERDICT: TRIPPED\nlate finding".into()), ..Default::default() });
+            assert_eq!(db::runs::get(&conn, &run.id).unwrap().unwrap().status, "discarded", "{change}");
+            assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed());
+            assert_eq!(db::comments::count_for_task(&conn, &t.id).unwrap(), 0);
+        }
     }
 
     /// A check an hour old: due on a 5-minute cadence, far from orphaned.
@@ -1621,8 +1818,12 @@ mod tests {
         .unwrap();
         let _ = pass(&conn, &r);
         let rt = crate::db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
-        let note = rt.last_note.unwrap();
-        assert!(note.starts_with(crate::tripwire::ORPHAN_NOTE), "{note}");
+        assert!(rt.last_note.is_none() && rt.lease_id.is_none());
+        assert_eq!(rt.failures, 0);
+        let comments = db::comments::for_task(&conn, &t.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        let note = &comments[0].body;
+        assert!(note.contains(crate::tripwire::ORPHAN_NOTE), "{note}");
         assert!(note.contains("assigned to some-other-host"), "{note}");
         assert!(
             get(&conn, &t.id).unwrap().unwrap().tripwire_armed(),

@@ -89,7 +89,7 @@ say "an armed agent tripwire, hourly, on a task with a repo"
 q "INSERT INTO tasks (id, title, body, status, repo_path, bg_executor, model, short_id,
                       tripwire, tripwire_every_minutes, tripwire_state, bg_run_token_cap)
    VALUES ('sim-agent', 'SIM: the changelog mentions 2.0', 'A dress rehearsal for an agent tripwire.',
-           'inbox', '$REPO', 'claude', 'claude-haiku-4-5-20251001', 900,
+           'todo', '$REPO', 'claude', 'claude-haiku-4-5-20251001', 900,
            'agent:CHANGELOG.md in this repo mentions a 2.0 release', 60, 'armed', 0);"
 OUT=$(runner --status 2>&1)
 expect "the runner sees it as due" "1 armed · 1 due now"
@@ -102,10 +102,12 @@ expect "the agent lane started a check" "agent check starting as run"
 expect "and read the verdict" "agent check → not_yet"
 OUT=$(q "SELECT intent || '|' || status || '|' || mode || '|' || COALESCE(timeout_minutes,'') FROM task_runs;")
 expect "one run row, intent=check, succeeded, on the check clock" "check|succeeded|background|10"
+OUT=$(q "SELECT result_text FROM task_runs WHERE intent='check';")
+expect "success includes an accepted tripwire receipt" "Tripwire result: accepted."
 OUT=$(q "SELECT last_outcome || '|' || last_note || '|' || failures || '|' || COALESCE(lease_id,'none') FROM tripwire_runtime WHERE task_id='sim-agent';")
 expect "the attempt landed on the runtime row" "not_yet|CHANGELOG.md tops out at 1.9.3; no 2.0 anywhere.|0|none"
 OUT=$(q "SELECT tripwire_state || '|' || status FROM tasks WHERE id='sim-agent';")
-expect "the task is still armed and untouched" "armed|inbox"
+expect "the task is still armed and untouched" "armed|todo"
 OUT=$(q "SELECT COUNT(*) FROM task_comments WHERE task_id='sim-agent';")
 expect "a not-yet is silent on the task" "0"
 
@@ -148,7 +150,7 @@ q "UPDATE tripwire_runtime SET requested_at = strftime('%Y-%m-%d %H:%M:%f','now'
 OUT=$(runner --once 2>&1)
 expect "the request was honoured" "agent check → tripped"
 OUT=$(q "SELECT tripwire_state || '|' || status || '|' || COALESCE(tripwire_tripped_at,'') FROM tasks WHERE id='sim-agent';")
-expect "the task surfaced, still open" "tripped|inbox|20"
+expect "the task surfaced, still open" "tripped|todo|20"
 OUT=$(q "SELECT author || ': ' || body FROM task_comments WHERE task_id='sim-agent';")
 expect "with the evidence as a comment under the tripwire author" "line 2 says v2.0.0 shipped"
 TRIP_RUN=$(q "SELECT id FROM task_runs WHERE intent='check' ORDER BY rowid DESC LIMIT 1;")

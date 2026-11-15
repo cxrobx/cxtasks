@@ -1345,6 +1345,12 @@ export function TaskRow({
             </span>
           </div>
 
+          {task.tripwire_health_warning && (
+            <div className="truncate text-[11px] text-warning" data-testid="tripwire-health-warning">
+              Machine not checking — check Run on and Activity
+            </div>
+          )}
+
           {/* Waiting on WHAT, and since when. The tripwire's last note is the
               runner's own words ("0/50 outside users — 4 signups, 0 paying"),
               which beats any badge; the others say the one fact the reason

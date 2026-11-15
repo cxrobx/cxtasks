@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 /// with **no producer anywhere in Rust** — the per-run spend guard was designed
 /// and never built — which is why a stopped run used to be recorded as `failed`
 /// with nothing naming the guard.
-pub const RUN_STATUSES: [&str; 13] = [
+pub const RUN_STATUSES: [&str; 14] = [
     "requested",
     "running",
     "ready_for_review",
@@ -50,6 +50,7 @@ pub const RUN_STATUSES: [&str; 13] = [
     "turns_exhausted",
     "dispatched",
     "abandoned",
+    "discarded",
 ];
 
 /// What a foreground dispatch records: a session was opened, full stop.

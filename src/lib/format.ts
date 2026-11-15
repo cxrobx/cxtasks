@@ -237,11 +237,12 @@ export function orderTagsByKind<T extends { name: string }>(tags: readonly T[]):
  * (invariant 26). Derived from the row, never from `status`.
  */
 export function isTripwireArmed(
-  task: Pick<Task, "tripwire" | "tripwire_state" | "status">,
+  task: Pick<Task, "tripwire" | "tripwire_state" | "status" | "tripwire_health_warning">,
 ): boolean {
   return (
     task.tripwire !== null &&
     task.tripwire_state === "armed" &&
+    !task.tripwire_health_warning &&
     !isClosed(task.status)
   );
 }
@@ -541,6 +542,7 @@ export const RUN_STATUS_LABELS: Record<TaskRun["status"], string> = {
   turns_exhausted: "Stopped — turn limit",
   dispatched: "Opened in Ghostty",
   abandoned: "Lost track",
+  discarded: "Check discarded",
 };
 
 /**
@@ -571,6 +573,7 @@ export const RUN_STATUS_CLASS: Record<TaskRun["status"], string> = {
   turns_exhausted: "text-warning",
   dispatched: "text-content-muted",
   abandoned: "text-warning",
+  discarded: "text-warning",
 };
 
 /**

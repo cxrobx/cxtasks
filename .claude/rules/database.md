@@ -980,11 +980,37 @@ so an armed tripwire on a deferred task is not checked until the date passes —
 which is what keeps `on_trip = complete` from closing a task before the day it
 was deferred to. "Check now" on such a task is refused naming the date.
 
+**Health observations are independent of attempts (2026-11-15).** A foreign
+host or missing-script non-holder never claims, records an error, consumes a
+request, increments backoff or changes the task state. It appends a deterministic
+`tripwire-health:` comment keyed by task/spec/assignment and the runtime clock
+inputs. `Task.tripwire_health_warning` is derived on read using the same JSON
+identity; it is not a schema column and never travels as a task post-image.
+Current warnings surface open tasks in Open/Today, with a warning in the row
+and tripwire detail. Done monitors remain visible in Monitors. A real answer,
+request, reset or changed assignment/spec makes an older warning historical,
+including a stale observation that arrives after the real answer. Background
+execution still requires `TRIPWIRE_NOT_ARMED`: visibility is not permission.
+
+Inactivity starts at the latest checked/requested timestamp, falling back to
+`runtime.updated_at` when neither exists. Reset stamps that clock freshly;
+`task.created_at` and an old orphan note are not evidence of current inactivity.
+Warnings deduplicate across hosts for the same episode without an accumulating
+fake failure count. Candidate scans are not truncated before filtering by lane
+and ownership: permanently due foreign tasks must not starve runnable checks.
+
+Agent checks settle `record` and `runs::finish` in one transaction. Accepted
+runs retain the provider status and get `Tripwire result: accepted.` in their
+full report; rejected attempts finish as `discarded`, with report and usage
+retained. A persistence failure is reported as failed/not recorded, never as a
+successful check. Cancellation and reassignment are rechecked at settlement.
+
 **An attempt is a leased, CAS-recorded transition.** `claim` is one `UPDATE …
 WHERE lease_id IS NULL OR lease_expires_at < now` — expiry is the ONE reclaim
 rule, so a runner that crashes mid-attempt leaves a lease to expire and the next
-tick re-runs it, and two runner processes (the LaunchAgent plus a hand-run
-`--once`) cannot both run one attempt. `record` opens `BEGIN IMMEDIATE`, re-reads
+tick re-runs it, and two processes on the SAME SQLite database (the LaunchAgent plus a
+hand-run `--once`) cannot both run one attempt. Replica-local CAS is not a
+distributed lock; `claim` also enforces assignment and spec. `record` opens `BEGIN IMMEDIATE`, re-reads
 the task (not live, closed, no longer armed, spec changed → DISCARD, releasing
 the lease and writing nothing else), CAS-updates the runtime row on the lease id
 (a reclaimed attempt's late result is dropped), and then — in the same

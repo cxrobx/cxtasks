@@ -101,6 +101,8 @@ export interface Task {
    *  runner; the one value a client may write is `"armed"` (a re-arm). */
   tripwire_state: TripwireState | null;
   tripwire_tripped_at: string | null;
+  /** Current independent missing-owner warning; expires on a real answer/reset. */
+  tripwire_health_warning?: boolean;
 }
 
 /** Mirrors `tripwire::TripwireState`. */
@@ -905,7 +907,8 @@ export interface TaskRun {
     | "budget_stopped"
     | "turns_exhausted"
     | "dispatched"
-    | "abandoned";
+    | "abandoned"
+    | "discarded";
   started_at: string;
   finished_at: string | null;
   session_id: string | null;

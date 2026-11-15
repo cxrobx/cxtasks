@@ -84,9 +84,7 @@ pub const ORPHAN_MIN_DAYS: i64 = 3;
 /// Cadences a script may go unchecked before the same thing is said, for a
 /// cadence long enough that [`ORPHAN_MIN_DAYS`] would be shorter than one gap.
 pub const ORPHAN_CADENCES: i64 = 3;
-/// How a non-holder's error opens. [`is_orphaned`] reads it back, because that
-/// error stamps `checked_at` and would otherwise look like the check it reports
-/// as missing.
+/// How a non-holder's health warning opens. It is not a terminal attempt.
 pub const ORPHAN_NOTE: &str = "No machine that should run this has checked it";
 /// Bytes kept from each of stdout and stderr. The rest is drained and dropped.
 pub const CAPTURE_BYTES: usize = 4096;
@@ -178,20 +176,16 @@ impl TripwireKind {
 ///
 /// Runners skip a script they do not hold, and on its own that would break
 /// invariant 26: a mistyped or deleted script would hold nobody's attention
-/// and stay hidden forever. So non-holders watch the clock. The verdict goes
-/// through the ordinary failure path, which means a holder's next real answer
-/// clears it, and a machine that was merely shut raises nothing lasting.
+/// and stay hidden forever. Non-holders watch the clock and post a health
+/// warning independently of check outcomes. Only elapsed time is evidence;
+/// a previous warning must never perpetuate an orphan diagnosis.
 ///
 /// `since` is the last terminal attempt, else the moment the row began.
 pub fn is_orphaned(
     every_minutes: Option<i64>,
     since: Option<DateTime<Utc>>,
-    last_note: Option<&str>,
     now: DateTime<Utc>,
 ) -> bool {
-    if last_note.is_some_and(|n| n.starts_with(ORPHAN_NOTE)) {
-        return true;
-    }
     let Some(since) = since else { return false };
     let cadences = every_minutes.unwrap_or(0).saturating_mul(ORPHAN_CADENCES);
     let grace = cadences.max(ORPHAN_MIN_DAYS * 1440);

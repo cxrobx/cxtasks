@@ -114,6 +114,14 @@ beforeEach(() => {
 });
 
 describe("the row badge", () => {
+  it("surfaces an independent health warning while the real check stays armed", () => {
+    const warned = task({ tripwire_health_warning: true });
+    expect(isTripwireArmed(warned)).toBe(false);
+    render(<TaskRow task={warned} selected={false} onSelect={() => {}} onComplete={() => {}} />);
+    expect(screen.getByTestId("tripwire-health-warning")).toHaveTextContent("Machine not checking");
+    expect(screen.queryByTestId("tripwire-badge")).toBeNull();
+  });
+
   it("shows only while ARMED — tripped and errored tasks are back on the board", () => {
     const { rerender } = render(
       <TaskRow task={task()} selected={false} onSelect={() => {}} onComplete={() => {}} />
