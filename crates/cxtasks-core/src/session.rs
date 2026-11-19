@@ -265,7 +265,7 @@ pub fn request(
     });
     Ok(SessionRequest {
         message: format!(
-            "Requested on {}. It opens in {} there within a few minutes.",
+            "Requested on {}. It normally opens in {} there within a few seconds.",
             host.label,
             target.label()
         ),

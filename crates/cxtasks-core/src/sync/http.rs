@@ -175,6 +175,14 @@ impl HttpPeer {
             .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
             .collect())
     }
+
+    /// A small host-scoped read, never a window of recent runs: pending
+    /// interactive requests must not disappear behind unrelated run history.
+    pub fn pending_session_request_ids(&self, host: &str) -> Result<Vec<String>, AppError> {
+        self.post("/rpc", &serde_json::json!({
+            "cmd": "pending_session_request_ids", "args": { "host": host }
+        }))
+    }
 }
 
 impl Peer for HttpPeer {

@@ -105,9 +105,9 @@ pub fn backstop_pass(conn: &mut Connection) -> Result<Option<ReconcileReport>, A
 // Everything else still waits for the ordinary cadence.
 
 /// How often the runner's sync thread looks.
-pub const QUICK_TICK_SECONDS: u64 = 20;
+pub const QUICK_TICK_SECONDS: u64 = 3;
 /// Never two attempts closer than this, whatever the reason.
-pub const QUICK_GAP_SECONDS: i64 = 15;
+pub const QUICK_GAP_SECONDS: i64 = 3;
 /// While a run is in flight here, push its trace this often.
 pub const IN_FLIGHT_EVERY_SECONDS: i64 = 60;
 /// A hub/replica mismatch that one reconcile didn't settle is not re-chased
@@ -194,6 +194,13 @@ pub fn unseen_queued(conn: &Connection, hub_queued: &[String]) -> std::collectio
 static LAST_MISMATCH: std::sync::Mutex<Option<(std::collections::BTreeSet<String>, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
+pub fn unseen_session_requests(conn: &Connection, pending: &[String]) -> std::collections::BTreeSet<String> {
+    pending.iter().filter(|id| {
+        !conn.query_row("SELECT EXISTS(SELECT 1 FROM task_runs WHERE id = ?1)",
+            [id], |r| r.get::<_, bool>(0)).unwrap_or(false)
+    }).map(|id| format!("session:{id}")).collect()
+}
+
 /// The runner's sync tick: reconcile now when a reason above holds, else do
 /// nothing. `Ok(None)` for unpaired / paused / canonical, as [`pass`].
 pub fn quick_pass(conn: &mut Connection) -> Result<Option<(QuickReason, ReconcileReport)>, AppError> {
@@ -211,7 +218,16 @@ pub fn quick_pass(conn: &mut Connection) -> Result<Option<(QuickReason, Reconcil
         let hub = state::peer_token().and_then(|token| HttpPeer::new(&url, &token).queued_task_ids());
         match hub {
             Ok(ids) => {
-                let unseen = unseen_queued(conn, &ids);
+                let mut unseen = unseen_queued(conn, &ids);
+                // Older hubs may not have the read yet. Keep background
+                // pickup working while the hub and runner roll out separately.
+                if let Ok(token) = state::peer_token() {
+                    let peer = HttpPeer::new(&url, &token);
+                    match peer.pending_session_request_ids(&crate::host::host_id()) {
+                        Ok(ids) => unseen.extend(unseen_session_requests(conn, &ids)),
+                        Err(e) => log::debug!("sync: session probe failed: {e}"),
+                    }
+                }
                 if !unseen.is_empty() {
                     let mut last = LAST_MISMATCH.lock().unwrap_or_else(|p| p.into_inner());
                     let repeat = matches!(&*last, Some((set, at))
@@ -338,7 +354,7 @@ mod tests {
         // Started after an attempt 30 s ago: push it.
         assert_eq!(local_reason(&conn, Some(&ago(30)), now), Some(QuickReason::RunChanged));
         // ...but not within the gap.
-        assert_eq!(local_reason(&conn, Some(&ago(5)), now), None);
+        assert_eq!(local_reason(&conn, Some(&ago(1)), now), None);
         // Started before the attempt, still running: once a minute.
         let after_start = crate::recurrence::to_iso(chrono::Utc::now() + chrono::Duration::seconds(2));
         let later = now + chrono::Duration::seconds(40);
@@ -360,6 +376,22 @@ mod tests {
         conn.execute("UPDATE tasks SET status = 'queued' WHERE id = ?1", [&mine]).unwrap();
         let unseen = unseen_queued(&conn, &[mine.clone(), "from-the-phone".into()]);
         assert_eq!(unseen.into_iter().collect::<Vec<_>>(), vec!["from-the-phone".to_string()]);
+    }
+
+    #[test]
+    fn interactive_requests_trigger_pickup_without_a_queued_task() {
+        use crate::db::{runs, tasks};
+        let conn = test_conn();
+        let t = tasks::create(&conn, &tasks::NewTask { title: "session".into(), ..Default::default() }).unwrap();
+        let r = runs::request_session(&conn, &t.id, "mini", crate::intent::BackgroundIntent::Work, Some("t3")).unwrap();
+        let pending = vec![r.id.clone(), "new-phone-request".into()];
+        assert!(unseen_queued(&conn, &[]).is_empty());
+        assert_eq!(unseen_session_requests(&conn, &pending),
+            std::collections::BTreeSet::from(["session:new-phone-request".into()]));
+        // An already-dispatched local run must not be launched again just
+        // because the hub still holds its earlier requested copy.
+        runs::claim_session(&conn, &r.id, "mini").unwrap();
+        assert!(unseen_session_requests(&conn, &[r.id]).is_empty());
     }
 
     /// The quick pass is as quiet as the timer on a host with no peer.

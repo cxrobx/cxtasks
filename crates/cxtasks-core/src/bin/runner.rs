@@ -310,7 +310,14 @@ fn main() -> anyhow::Result<()> {
     // reconcile can take minutes, and neither a Stop nor a tick waits for one.
     // Off for `--once` for the same reason, too.
     if !once {
-        // Every 20 s, but a full reconcile only for a reason
+        std::thread::spawn(|| loop {
+            match runner::open_db().and_then(|conn| runner::session::pass_here(&conn)) {
+                Ok(_) => {}
+                Err(e) => log::warn!("interactive session pass failed: {e}"),
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        // Every 3 s, but a full reconcile only for a reason
         // (`auto::quick_pass`): the old backstop, run activity here, or work
         // queued on the hub that this replica hasn't pulled — which is what
         // makes a request from the phone start in seconds, not minutes.

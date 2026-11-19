@@ -944,14 +944,15 @@ The request is a ROW instead, and the machine it names opens it.
   session opened, a failure or refusal stamps `finished_at`. So the claim wins at
   the hub over the hub's own `requested`, and an older re-send can't put it back
   (`sync::apply::tests::a_claimed_session_request_wins_at_the_hub_…`).
-* **Latency, tap to tab:** the hub write is immediate; the mini's runner sees it
-  within one `sync::auto::quick_pass` tick (20 s), which probes the hub's queue
-  and reconciles when it holds work this replica hasn't pulled, then up to one
-  20 s runner tick. Typically under a minute. Run activity here is pushed within
-  ~15 s (a minute apart while a run is in flight), so the outcome reaches the
-  phone about as fast. A session request is a `task_runs` row, not a queued
-  task, so the queue probe doesn't see it: it still waits for the ordinary
-  cadence, up to about 7 minutes.
+* **Latency, tap to tab (2026-11-16):** the fast sync pass probes both queued
+  tasks and the host-scoped `pending_session_request_ids` read every 3 s.
+  Interactive requests are run rows, not queued tasks; omitting them previously
+  left a phone tap waiting for the ordinary sync cadence, up to about 7 minutes.
+  A dedicated 3 s session worker opens them independently of the work tick, so
+  a slow tripwire cannot hold up a launch. Normal pickup is roughly 0–6 s plus
+  sync and local launch time. The result and `in_progress` status push back on
+  the next fast sync pass. The existing claim and claim-note protection still
+  prevents duplicate launches.
 * **What reads it.** `sweep_abandoned`, `heal_foreground_runs`, the concurrency
   counts and `cancel_run` all filter `status = 'running'` or `mode = 'background'`,
   so a request is invisible to them (pinned by

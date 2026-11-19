@@ -347,6 +347,9 @@ pub fn dispatch(conn: &mut Connection, cmd: &str, args: &Value) -> Result<Value,
 
         // ── runs & budget ───────────────────────────────────────────────────
         "list_runs" => ok(db::runs::list_for_task(conn, &arg::<String>(args, "task_id")?)?),
+        "pending_session_request_ids" => ok(db::runs::pending_session_requests(
+            conn, &arg::<String>(args, "host")?,
+        )?.into_iter().map(|r| r.id).collect::<Vec<_>>()),
 
         // ── hosts ──────────────────────────────────────────────────────────
         // A READ. It does not register this machine, deliberately: a host row
@@ -737,7 +740,7 @@ pub const ALL_VERBS: &[&str] = &[
     "filter_tasks", "count_filtered", "retrospective", "jev_status", "save_jev_settings", "jev_assess_capture",
     "jev_assess_readiness", "list_runs", "list_run_events", "recent_runs", "get_run", "budget_status",
     "save_budget_settings", "reset_budget_window", "set_background_paused", "cancel_run",
-    "request_session", "queue_background", "list_tags", "task_tags", "set_task_tags", "rename_tag", "task_tag_map",
+    "request_session", "pending_session_request_ids", "queue_background", "list_tags", "task_tags", "set_task_tags", "rename_tag", "task_tag_map",
     "tag_usage_count", "delete_tag", "task_relations", "add_dependency", "remove_dependency",
     "blocked_task_ids", "add_relation", "remove_relation", "list_tripwire_runtime",
     "list_comments", "add_comment", "edit_comment", "delete_comment",
@@ -758,7 +761,7 @@ const READ_ONLY: &[&str] = &[
     "intake_route", "intake_resolve", "intake_places",
     "view_counts", "search_tasks", "filter_tasks", "count_filtered", "retrospective", "jev_status",
     "jev_assess_capture", "jev_assess_readiness",
-    "list_runs", "list_run_events", "recent_runs", "get_run", "budget_status",
+    "pending_session_request_ids", "list_runs", "list_run_events", "recent_runs", "get_run", "budget_status",
     "list_tags", "task_tags", "task_tag_map", "tag_usage_count",
     "task_relations", "blocked_task_ids", "list_tripwire_runtime",
     "list_comments",
@@ -1136,6 +1139,18 @@ mod tests {
     fn get_run_returns_null_for_an_unknown_id() {
         let mut c = conn();
         assert!(call(&mut c, "get_run", json!({ "run_id": "nope" })).unwrap().is_null());
+    }
+
+    #[test]
+    fn session_probe_is_host_scoped_and_excludes_launched_requests() {
+        let mut c = conn();
+        let t = call(&mut c, "create_task", json!({"task":{"title":"interactive"}})).unwrap();
+        let id = t["id"].as_str().unwrap();
+        let r = db::runs::request_session(&c, id, "mini", crate::intent::BackgroundIntent::Work, Some("t3")).unwrap();
+        assert_eq!(call(&mut c, "pending_session_request_ids", json!({"host":"mini"})).unwrap(), json!([r.id]));
+        assert_eq!(call(&mut c, "pending_session_request_ids", json!({"host":"other"})).unwrap(), json!([]));
+        db::runs::claim_session(&c, &r.id, "mini").unwrap();
+        assert_eq!(call(&mut c, "pending_session_request_ids", json!({"host":"mini"})).unwrap(), json!([]));
     }
 
     /// A host-local verb is refused DIFFERENTLY from an unknown one.

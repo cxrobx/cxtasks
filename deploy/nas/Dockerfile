@@ -22,7 +22,9 @@ COPY src-tauri ./src-tauri
 
 # `--locked`, so a deploy can never quietly resolve a different dependency tree
 # than the one that passed the tests.
-RUN cargo build --release --locked -p cxtasks-server
+# Bound emulated amd64 compilation on the mini; Cargo's uncapped job count
+# can overwhelm the VM while other apps and simulators are in use.
+RUN cargo build --release --locked -j 4 -p cxtasks-server
 
 FROM --platform=linux/amd64 debian:bookworm-slim
 # `tini` because the server is PID 1 in this container and PID 1 does not get

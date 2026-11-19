@@ -51,6 +51,20 @@ const FAILED_PREFIX: &str = "failed\n";
 /// A note for a launch that left a reference (`t3:<thread id>`).
 const OPENED_PREFIX: &str = "dispatched\n";
 
+/// Interactive launches have their own connection/thread so a slow script in
+/// the ordinary work tick cannot delay a tap on the phone.
+pub fn pass_here(conn: &rusqlite::Connection) -> Result<usize, AppError> {
+    let cap = db::hosts::local(conn, &HostCapability::declared_for_this_host())?;
+    let settings = db::meta::budget_settings(conn);
+    let gate = crate::runner::gate(crate::paths::background_paused(), &settings, &cap, 0, 0, 0);
+    let refusal = refusal_for(&gate, &cap.label);
+    session_pass(conn, &cap, refusal.as_deref(), &claims_dir(), |task, target| match target {
+        crate::session::SessionTarget::Herdr => crate::session::open_here(task, &cap.label)
+            .map(|scratch| crate::session::Launched { scratch, session_ref: None }),
+        crate::session::SessionTarget::T3 => crate::session::open_t3_here(task, &cap.label),
+    })
+}
+
 /// One pass: expire, then open (or refuse) every fresh request for `cap`.
 ///
 /// `open` is the launch itself, injected so tests never touch Herdr. Returns
