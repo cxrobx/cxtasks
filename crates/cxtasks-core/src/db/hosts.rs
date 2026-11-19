@@ -28,7 +28,7 @@
 //! queries across. A comma string is also readable from the `sqlite3` CLI,
 //! which is where this table gets inspected when a host is behaving oddly.
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::AppError;
 use crate::executor::BackgroundExecutor;
@@ -420,6 +420,32 @@ pub fn remove(conn: &Connection, id: &str) -> Result<bool, AppError> {
     Ok(n > 0)
 }
 
+/// Is this host's `paused` flag a pause REQUESTED from the registry, rather
+/// than an echo of its own last heartbeat?
+///
+/// [`heartbeat`] copies the kill-switch file's state into `paused` and stamps
+/// `last_seen_at` and `updated_at` with the same instant. The control loop
+/// used to raise the file whenever the row said paused and the file was
+/// absent, which also fires right after the file is deleted by hand or by the
+/// app's resume: the row still holds the last beat's `paused = 1`, the file
+/// comes straight back, and the next beat reports paused again — a pause that
+/// can never be lifted (2026-11-19, the laptop, after a ship held the switch
+/// across one heartbeat). A row written after the last beat (`updated_at`
+/// newer), or by a host that has never beaten, is a genuine request; an echo
+/// is not.
+pub fn pause_requested_since_last_beat(conn: &Connection, id: &str) -> Result<bool, AppError> {
+    let requested: Option<bool> = conn
+        .query_row(
+            "SELECT paused = 1 AND (last_seen_at IS NULL
+                                   OR datetime(updated_at) > datetime(last_seen_at))
+               FROM hosts WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(requested.unwrap_or(false))
+}
+
 /// This host's capability, registering the local default first if it is new.
 ///
 /// The runner and the app both call this on every start, so a machine appears
@@ -439,6 +465,26 @@ pub fn local(conn: &Connection, default_cap: &HostCapability) -> Result<HostCapa
 mod tests {
     use super::*;
     use crate::db::schema::test_conn;
+
+    #[test]
+    fn an_echoed_pause_is_not_a_request_but_a_newer_write_is() {
+        let conn = test_conn();
+        let c = cap();
+        local(&conn, &c).unwrap();
+        // The host's own beat reported the switch raised; the file is then removed.
+        heartbeat(&conn, &c.id, true, None, &[]).unwrap();
+        assert!(!pause_requested_since_last_beat(&conn, &c.id).unwrap(), "own report echoed back");
+        // A write after the beat that leaves paused = 1 is a request.
+        conn.execute("UPDATE hosts SET updated_at = datetime('now', '+1 minute') WHERE id = ?1", params![c.id]).unwrap();
+        assert!(pause_requested_since_last_beat(&conn, &c.id).unwrap());
+        // The next beat with the switch down clears it.
+        heartbeat(&conn, &c.id, false, None, &[]).unwrap();
+        assert!(!pause_requested_since_last_beat(&conn, &c.id).unwrap());
+        // Never beaten, paused set: a request.
+        conn.execute("UPDATE hosts SET paused = 1, last_seen_at = NULL WHERE id = ?1", params![c.id]).unwrap();
+        assert!(pause_requested_since_last_beat(&conn, &c.id).unwrap());
+        assert!(!pause_requested_since_last_beat(&conn, "no-such-host").unwrap());
+    }
 
     fn cap() -> HostCapability {
         HostCapability::local_default("mac-1".into(), "this Mac".into())

@@ -1452,7 +1452,10 @@ pub fn control_pass(conn: &Connection, beat: bool) -> Result<bool, AppError> {
     // by hand. The global switch stays a file too, which is why pausing works
     // even when this loop is not running.
     let switch = crate::paths::kill_switch_path();
-    if cap.paused && !switch.exists() {
+    // Only a pause requested since this host's last beat, never an echo of
+    // that beat: otherwise lowering the switch by hand or from the app's
+    // resume re-raises it at once and the pause can never be lifted.
+    if cap.paused && !switch.exists() && db::hosts::pause_requested_since_last_beat(conn, &cap.id)? {
         if let Err(e) = std::fs::write(&switch, "paused from the host registry\n") {
             log::warn!("control: could not raise the kill switch: {e}");
         }
