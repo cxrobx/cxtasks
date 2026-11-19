@@ -801,10 +801,13 @@ pub fn parse_verdict(text: &str) -> (Option<Verdict>, String) {
 }
 
 fn strip_marker<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
-    if line.len() >= marker.len() && line[..marker.len()].eq_ignore_ascii_case(marker) {
-        Some(&line[marker.len()..])
-    } else {
-        None
+    // `get`, not `[..]`: the marker is ASCII, but the line is model output, and
+    // a byte index can land inside a multi-byte char (`Notes X — …` puts byte 9
+    // inside the em dash). Indexing panicked the runner thread and the check's
+    // verdict was never recorded; a non-boundary simply isn't the marker.
+    match line.get(..marker.len()) {
+        Some(head) if head.eq_ignore_ascii_case(marker) => line.get(marker.len()..),
+        _ => None,
     }
 }
 
@@ -947,6 +950,20 @@ mod tests {
 
     /// The composition rule for a check's bounds: a task's "no ceiling" must
     /// never become a check's "no ceiling".
+    #[test]
+    fn parse_verdict_survives_multibyte_chars_at_the_marker_boundary() {
+        // The shape of a check report that panicked the runner on 2026-11-19: a
+        // line whose ninth byte sits inside an em dash.
+        let text = "Notes X — workspace (534 B) is under the bar.\n\
+                    VERDICT: NOT_YET\nEVIDENCE: Prune: nothing needed, root 50116 bytes";
+        let (v, ev) = parse_verdict(text);
+        assert_eq!(v, Some(Verdict::NotYet));
+        assert_eq!(ev, "Prune: nothing needed, root 50116 bytes");
+        assert_eq!(strip_marker("Notes X — x", EVIDENCE_MARKER), None);
+        assert_eq!(strip_marker("éé", VERDICT_MARKER), None);
+        assert_eq!(strip_marker("verdict: tripped", VERDICT_MARKER), Some(" tripped"));
+    }
+
     #[test]
     fn min_nonzero_never_lets_a_zero_disable_the_constant() {
         assert_eq!(min_nonzero(0, CHECK_TOKEN_CEILING), CHECK_TOKEN_CEILING);
