@@ -1458,6 +1458,9 @@ pub fn sweep_abandoned(conn: &Connection) -> Result<usize, AppError> {
              + {ABANDON_GRACE_MINUTES}m grace (global timeout {global}m)"
         );
     }
+    // Unconditional, not only when this sweep reclaimed something: a lease
+    // stranded by an earlier sweep (or a binary without this step) clears too.
+    crate::db::tripwires::settle_abandoned_check_leases(conn)?;
     Ok(n)
 }
 

@@ -1584,6 +1584,33 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_check_run_releases_its_lease_as_an_error() {
+        // 2026-11-19: a runner restart killed a T680 check mid-run; the sweep
+        // marked the run abandoned but the lease stood until expiry, so the
+        // task could not be checked again for 25 minutes.
+        let mut conn = test_conn();
+        let t = armed(&conn, "agent:Review synthetic evidence", Some(60), None);
+        let run = db::runs::start_check(&mut conn, &t.id, t.tripwire.as_deref().unwrap(), 4, BackgroundExecutor::Claude, 10).unwrap().unwrap();
+        assert_eq!(db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().lease_id.as_deref(), Some(run.id.as_str()));
+        conn.execute(
+            "UPDATE task_runs SET started_at = datetime('now','-3 hours'), heartbeat_at = datetime('now','-3 hours') WHERE id = ?1",
+            rusqlite::params![run.id],
+        ).unwrap();
+
+        assert_eq!(db::runs::sweep_abandoned(&conn).unwrap(), 1);
+        assert_eq!(db::runs::get(&conn, &run.id).unwrap().unwrap().status, "abandoned");
+        let rt = db::tripwires::for_task(&conn, &t.id).unwrap().unwrap();
+        assert!(rt.lease_id.is_none(), "lease released: {rt:?}");
+        assert_eq!(rt.last_outcome.as_deref(), Some("error"));
+        assert_eq!(rt.failures, 1, "counts as a failed check, so a check that always dies backs off");
+        assert!(get(&conn, &t.id).unwrap().unwrap().tripwire_armed(), "one failure doesn't surface it");
+
+        // Idempotent: a second sweep finds nothing left to settle.
+        assert_eq!(db::tripwires::settle_abandoned_check_leases(&conn).unwrap(), 0);
+        assert_eq!(db::tripwires::for_task(&conn, &t.id).unwrap().unwrap().failures, 1);
+    }
+
+    #[test]
     fn check_disposition_is_durable_and_settles_atomically() {
         let mut conn = test_conn();
         let t = armed(&conn, "agent:Review synthetic evidence", Some(60), None);

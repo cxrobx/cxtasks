@@ -282,6 +282,46 @@ pub fn claim(
 /// Inactivity starts at the latest real answer or request. A reset has neither,
 /// so its own timestamp starts a fresh clock, never the task's creation date.
 /// Claims may refresh a never-checked clock too: activity is evidence of life.
+/// Settle every agent-check lease whose run was reclaimed as abandoned.
+///
+/// An agent check's lease id IS its run id. When the process running it dies
+/// (a runner restart mid-check, a panic in the parse), [`sweep_abandoned`]
+/// marks the run `abandoned` but nothing touched `tripwire_runtime`, so the
+/// lease sat there until its own expiry and the task could not be checked
+/// again for up to the check's timeout plus grace (2026-11-19: T680 waited 25
+/// minutes behind a run a ship restart had killed). Recorded as an ERROR, not
+/// just released: a check that dies every time must back off and surface after
+/// the usual threshold rather than retry every sweep at a check's full cost.
+/// Only this host's leases — each host settles its own checks.
+///
+/// [`sweep_abandoned`]: crate::db::runs::sweep_abandoned
+pub fn settle_abandoned_check_leases(conn: &Connection) -> Result<usize, AppError> {
+    let me = crate::host::host_id();
+    let stranded: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT r.task_id, r.lease_id FROM tripwire_runtime r
+               JOIN task_runs t ON t.id = r.lease_id
+              WHERE t.status = 'abandoned' AND (r.lease_host IS NULL OR r.lease_host = ?1)",
+        )?;
+        let rows = stmt.query_map(params![me], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let outcome = Outcome::Error(
+        "The check's run was reclaimed as abandoned: its process ended before a verdict was \
+         recorded (a runner restart or crash mid-check)."
+            .into(),
+    );
+    let mut n = 0;
+    for (task_id, lease_id) in stranded {
+        record(conn, &task_id, &lease_id, &outcome)?;
+        n += 1;
+    }
+    if n > 0 {
+        log::warn!("settled {n} tripwire lease(s) held by abandoned check runs");
+    }
+    Ok(n)
+}
+
 pub fn inactive_since(rt: &Runtime) -> Option<chrono::DateTime<chrono::Utc>> {
     let checked = rt.checked_at.as_deref().and_then(tripwire::parse_stamp);
     let requested = rt.requested_at.as_deref().and_then(tripwire::parse_stamp);
