@@ -1,4 +1,4 @@
-//! Due reminders pushed to phones through APNs.
+//! Due reminders and tripwire trips pushed to phones through APNs.
 //!
 //! # Why the server, when the phone already schedules its own
 //!
@@ -17,6 +17,14 @@
 //!   its own reminders so nothing arrives twice.
 //! - [`run`] wakes every [`TICK`], finds open tasks whose `due_at` passed within
 //!   [`WINDOW`], and pushes each ONCE per due date.
+//!
+//! - The same tick finds tasks whose tripwire TRIPPED within [`TRIP_WINDOW`]
+//!   and pushes each trip ONCE. A trip is recorded on whichever Mac ran the
+//!   check, so before this the only signal was that Mac's banner; the row
+//!   syncs here whole (`tripwire_state`, `tripwire_tripped_at`), which makes
+//!   this node the one place that can tell the phone. The key is
+//!   `(task, tripped_at)`: a monitor that clears and trips again pushes again,
+//!   a re-check that stays tripped does not (it never rewrites the time).
 //!
 //! # Where the state lives
 //!
@@ -54,6 +62,16 @@ pub const TICK: Duration = Duration::from_secs(20);
 /// push for it would only be noise — on a first deploy, a flood of it.
 pub const WINDOW: chrono::Duration = chrono::Duration::minutes(15);
 
+/// How far back a trip still earns a push. Wider than [`WINDOW`] because a
+/// trip is stamped on the Mac that ran the check and reaches this node by
+/// sync, which can lag by hours while that Mac sleeps. A trip older than this
+/// is already on the board; a push for it would be news from yesterday.
+pub const TRIP_WINDOW: chrono::Duration = chrono::Duration::hours(6);
+
+/// The longest evidence line a trip push carries. The full finding is in the
+/// task's comments, one tap away.
+const EVIDENCE_CHARS: usize = 180;
+
 /// Apple accepts a provider token for an hour and refuses one refreshed more
 /// often than every 20 minutes. 50 sits inside both.
 const JWT_LIFETIME_SECS: u64 = 50 * 60;
@@ -79,6 +97,65 @@ pub struct DueTask {
     pub reference: String,
     pub title: String,
     pub due_at: String,
+}
+
+/// One task whose tripwire just tripped, as the payload needs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrippedTask {
+    pub id: String,
+    pub reference: String,
+    pub title: String,
+    pub tripped_at: String,
+    /// The first line of the trip's evidence, when its comment has synced.
+    pub evidence: Option<String>,
+}
+
+/// What one push says, whatever raised it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notice {
+    pub reference: String,
+    pub title: String,
+    pub body: String,
+    /// A re-send with the same key replaces the banner, never stacks.
+    pub collapse_id: String,
+    pub thread: &'static str,
+}
+
+impl DueTask {
+    pub fn notice(&self) -> Notice {
+        // The reference is the title (it is what the local reminder showed,
+        // and what a T-number search finds); a task with none falls back to
+        // the title.
+        let title = if self.reference.is_empty() { self.title.clone() } else { self.reference.clone() };
+        Notice {
+            reference: self.reference.clone(),
+            title,
+            body: self.title.clone(),
+            collapse_id: format!("due-{}", self.id),
+            thread: "due",
+        }
+    }
+}
+
+impl TrippedTask {
+    pub fn notice(&self) -> Notice {
+        let title = if self.reference.is_empty() {
+            "Tripwire tripped".to_string()
+        } else {
+            format!("Tripped · {}", self.reference)
+        };
+        let body = match &self.evidence {
+            Some(e) => format!("{}\n{e}", self.title),
+            None => self.title.clone(),
+        };
+        Notice {
+            reference: self.reference.clone(),
+            title,
+            body,
+            collapse_id: format!("trip-{}", self.id),
+            thread: "tripwire",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,12 +251,12 @@ impl Push {
 
     /// One push to one phone. Returns Apple's verdict as a short string for the
     /// log; a token Apple says is dead is forgotten here.
-    async fn send(&self, device: &Device, task: &DueTask) -> String {
+    async fn send(&self, device: &Device, notice: &Notice) -> String {
         let jwt = match self.jwt() {
             Ok(j) => j,
             Err(e) => return format!("no provider token: {e:#}"),
         };
-        let req = build_request(device, task, &self.topic, &jwt);
+        let req = build_request(device, notice, &self.topic, &jwt);
         let mut builder = self.http.post(&req.url);
         for (k, v) in &req.headers {
             builder = builder.header(*k, v);
@@ -221,7 +298,7 @@ impl Push {
             due_at: now_iso(),
         };
         // Through `send`, minus its forgetting: the fake token was never stored.
-        self.send(&device, &task).await
+        self.send(&device, &task.notice()).await
     }
 }
 
@@ -239,35 +316,48 @@ pub async fn run(state: Arc<ServerState>, push: Arc<Push>) {
 
 async fn tick(state: &ServerState, push: &Push) -> Result<()> {
     let now = chrono::Utc::now();
-    let due = {
+    let (due, tripped) = {
         let conn = lock(&state.db);
-        due_tasks(&conn, now)?
+        (due_tasks(&conn, now)?, tripped_tasks(&conn, now)?)
     };
-    if due.is_empty() {
+    if due.is_empty() && tripped.is_empty() {
         return Ok(());
     }
     let devices = push.devices()?;
+    // Claimed before sending: at most once. With no phone registered the
+    // claim still lands, so registering later does not replay old ones.
     for task in due {
-        // Claimed before sending: at most once. With no phone registered the
-        // claim still lands, so registering later does not replay old dues.
         let claimed = {
             let conn = lock(&push.store);
             claim(&conn, &task, &now_db())?
         };
-        if !claimed {
-            continue;
+        if claimed {
+            deliver(push, &devices, &task.notice()).await;
         }
-        for device in &devices {
-            let verdict = push.send(device, &task).await;
-            log::info!(
-                "push: {} → {}… ({}): {verdict}",
-                task.reference,
-                &device.token[..8.min(device.token.len())],
-                device.environment
-            );
+    }
+    for task in tripped {
+        let claimed = {
+            let conn = lock(&push.store);
+            claim_trip(&conn, &task, &now_db())?
+        };
+        if claimed {
+            deliver(push, &devices, &task.notice()).await;
         }
     }
     Ok(())
+}
+
+async fn deliver(push: &Push, devices: &[Device], notice: &Notice) {
+    for device in devices {
+        let verdict = push.send(device, notice).await;
+        log::info!(
+            "push: {} [{}] → {}… ({}): {verdict}",
+            notice.reference,
+            notice.thread,
+            &device.token[..8.min(device.token.len())],
+            device.environment
+        );
+    }
 }
 
 // ── pure parts, tested below ────────────────────────────────────────────────
@@ -305,22 +395,74 @@ pub fn due_tasks(conn: &rusqlite::Connection, now: chrono::DateTime<chrono::Utc>
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Tasks whose tripwire tripped within [`TRIP_WINDOW`] of `now`, with the
+/// first evidence line of the newest trip comment when it has synced.
+///
+/// Closed tasks are included on purpose: `on_trip = complete` closes the task
+/// in the same transaction that trips it, and that trip is still news. Deleted
+/// and archived ones are not. Both times go through `datetime()` (invariant 1).
+pub fn tripped_tasks(conn: &rusqlite::Connection, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<TrippedTask>> {
+    let upper = iso(now);
+    let lower = iso(now - TRIP_WINDOW);
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.short_id, t.title, t.tripwire_tripped_at,
+                (SELECT c.body FROM task_comments c
+                  WHERE c.task_id = t.id AND c.author = ?3
+                  ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1)
+           FROM tasks t
+          WHERE t.tripwire_state = 'tripped' AND t.tripwire_tripped_at IS NOT NULL
+            AND datetime(t.tripwire_tripped_at) <= datetime(?1)
+            AND datetime(t.tripwire_tripped_at) > datetime(?2)
+            AND t.deleted_at IS NULL AND t.archived_at IS NULL
+          ORDER BY t.tripwire_tripped_at",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![&upper, &lower, cxtasks_core::db::comments::AUTHOR_TRIPWIRE],
+        |r| {
+            let short: Option<i64> = r.get(1)?;
+            let comment: Option<String> = r.get(4)?;
+            Ok(TrippedTask {
+                id: r.get(0)?,
+                reference: short.map(|n| format!("T{n}")).unwrap_or_default(),
+                title: r.get(2)?,
+                tripped_at: r.get(3)?,
+                evidence: comment.as_deref().and_then(evidence_line),
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The first non-empty line after a trip comment's header ("Tripwire tripped ·
+/// <spec>"), cut to [`EVIDENCE_CHARS`] on a char boundary. `None` for a comment
+/// with no evidence, so the push falls back to the title alone.
+pub fn evidence_line(comment: &str) -> Option<String> {
+    let line = comment
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .find(|l| !l.is_empty() && *l != "(no output)")?;
+    if line.chars().count() <= EVIDENCE_CHARS {
+        return Some(line.to_string());
+    }
+    let cut: String = line.chars().take(EVIDENCE_CHARS - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
+}
+
 pub struct ApnsRequest {
     pub url: String,
     pub headers: Vec<(&'static str, String)>,
     pub body: Value,
 }
 
-pub fn build_request(device: &Device, task: &DueTask, topic: &str, jwt: &str) -> ApnsRequest {
+pub fn build_request(device: &Device, notice: &Notice, topic: &str, jwt: &str) -> ApnsRequest {
     let host = if device.environment == "development" {
         "api.sandbox.push.apple.com"
     } else {
         "api.push.apple.com"
     };
+    // A due reminder or a trip an hour late is noise; let Apple drop it.
     let expires = unix_now() + 3600;
-    // The reference is the title (it is what the local reminder showed, and
-    // what a T-number search finds); a task with none falls back to the title.
-    let title = if task.reference.is_empty() { task.title.clone() } else { task.reference.clone() };
     ApnsRequest {
         url: format!("https://{host}/3/device/{}", device.token),
         headers: vec![
@@ -328,20 +470,18 @@ pub fn build_request(device: &Device, task: &DueTask, topic: &str, jwt: &str) ->
             ("apns-topic", topic.to_string()),
             ("apns-push-type", "alert".into()),
             ("apns-priority", "10".into()),
-            // A due reminder an hour late is noise; let Apple drop it.
             ("apns-expiration", expires.to_string()),
-            // A re-send for the same task replaces the banner, never stacks.
-            ("apns-collapse-id", format!("due-{}", task.id)),
+            ("apns-collapse-id", notice.collapse_id.clone()),
         ],
         body: json!({
             "aps": {
-                "alert": { "title": title, "body": task.title },
+                "alert": { "title": notice.title, "body": notice.body },
                 "sound": "default",
-                "thread-id": "due",
+                "thread-id": notice.thread,
             },
             // `NotificationRouter` resolves this the same way it resolves a
             // local reminder's `ref`, so a tap opens the task.
-            "ref": task.reference,
+            "ref": notice.reference,
         }),
     }
 }
@@ -402,6 +542,12 @@ pub fn init_store(conn: &rusqlite::Connection) -> Result<()> {
              due_at  TEXT NOT NULL,
              sent_at TEXT NOT NULL,
              PRIMARY KEY (task_id, due_at)
+         );
+         CREATE TABLE IF NOT EXISTS trips_sent (
+             task_id    TEXT NOT NULL,
+             tripped_at TEXT NOT NULL,
+             sent_at    TEXT NOT NULL,
+             PRIMARY KEY (task_id, tripped_at)
          );",
     )?;
     Ok(())
@@ -435,6 +581,15 @@ pub fn claim(conn: &rusqlite::Connection, task: &DueTask, now: &str) -> Result<b
     let n = conn.execute(
         "INSERT OR IGNORE INTO sent (task_id, due_at, sent_at) VALUES (?1, ?2, ?3)",
         rusqlite::params![task.id, task.due_at, now],
+    )?;
+    Ok(n == 1)
+}
+
+/// True the first time a `(task, tripped_at)` is seen; false ever after.
+pub fn claim_trip(conn: &rusqlite::Connection, task: &TrippedTask, now: &str) -> Result<bool> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO trips_sent (task_id, tripped_at, sent_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![task.id, task.tripped_at, now],
     )?;
     Ok(n == 1)
 }
@@ -562,7 +717,7 @@ mod tests {
     fn the_request_targets_the_right_gateway_and_carries_the_ref() {
         let task = DueTask { id: "uuid-1".into(), reference: "T635".into(), title: "Reminder test".into(), due_at: String::new() };
         let dev = Device { token: "ab".repeat(32), environment: "development".into() };
-        let req = build_request(&dev, &task, "app.cxtasks", "JWT");
+        let req = build_request(&dev, &task.notice(), "app.cxtasks", "JWT");
         assert!(req.url.starts_with("https://api.sandbox.push.apple.com/3/device/"));
         assert!(req.headers.contains(&("apns-topic", "app.cxtasks".into())));
         assert!(req.headers.contains(&("authorization", "bearer JWT".into())));
@@ -572,6 +727,87 @@ mod tests {
         assert_eq!(req.body["aps"]["alert"]["body"], "Reminder test");
 
         let prod = Device { environment: "production".into(), ..dev };
-        assert!(build_request(&prod, &task, "app.cxtasks", "JWT").url.starts_with("https://api.push.apple.com/"));
+        assert!(build_request(&prod, &task.notice(), "app.cxtasks", "JWT").url.starts_with("https://api.push.apple.com/"));
+    }
+
+    fn trip(conn: &rusqlite::Connection, short: i64, status: &str, state: &str, at: Option<&str>, archived: bool) {
+        insert(conn, short, status, None, archived);
+        conn.execute(
+            "UPDATE tasks SET tripwire = 'script:x', tripwire_state = ?2, tripwire_tripped_at = ?3 WHERE id = ?1",
+            rusqlite::params![format!("id-{short}"), state, at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_trips_inside_the_window_and_not_archived() {
+        let conn = tasks_db();
+        trip(&conn, 1, "todo", "tripped", Some("2026-11-20 01:00:00"), false); // 2h ago
+        trip(&conn, 2, "done", "tripped", Some("2026-11-20 02:59:00"), false); // on_trip=complete closed it
+        trip(&conn, 3, "todo", "tripped", Some("2026-11-19 18:00:00"), false); // 9h ago: stale
+        trip(&conn, 4, "todo", "armed", None, false); // still waiting
+        trip(&conn, 5, "todo", "tripped", Some("2026-11-20 02:00:00"), true); // archived
+        trip(&conn, 6, "todo", "tripped", Some("2026-11-20 03:30:00"), false); // stamped ahead of this clock
+        let refs: Vec<_> = tripped_tasks(&conn, at("2026-11-20T03:00:00.000Z"))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.reference)
+            .collect();
+        assert_eq!(refs, ["T1", "T2"]);
+    }
+
+    #[test]
+    fn a_trip_carries_the_newest_tripwire_evidence() {
+        let conn = tasks_db();
+        trip(&conn, 1, "todo", "tripped", Some("2026-11-20 02:00:00"), false);
+        let first = tripped_tasks(&conn, at("2026-11-20T03:00:00.000Z")).unwrap();
+        assert_eq!(first[0].evidence, None, "no comment synced yet: title only");
+
+        cxtasks_core::db::comments::add(&conn, "id-1", "chris", "a human note").unwrap();
+        cxtasks_core::db::comments::add(
+            &conn,
+            "id-1",
+            cxtasks_core::db::comments::AUTHOR_TRIPWIRE,
+            "Tripwire tripped · script:x\n\nThe fix is published: build 11.\nmore detail",
+        )
+        .unwrap();
+        let got = tripped_tasks(&conn, at("2026-11-20T03:00:00.000Z")).unwrap();
+        assert_eq!(got[0].evidence.as_deref(), Some("The fix is published: build 11."));
+
+        let n = got[0].notice();
+        assert_eq!(n.title, "Tripped · T1");
+        assert_eq!(n.body, "task 1\nThe fix is published: build 11.");
+        assert_eq!(n.collapse_id, "trip-id-1");
+        let dev = Device { token: "ab".repeat(32), environment: "production".into() };
+        let req = build_request(&dev, &n, "app.cxtasks", "JWT");
+        assert_eq!(req.body["aps"]["thread-id"], "tripwire");
+        assert_eq!(req.body["ref"], "T1");
+    }
+
+    #[test]
+    fn evidence_is_trimmed_and_cut_on_a_char_boundary() {
+        assert_eq!(evidence_line("Tripwire tripped · s\n\n(no output)"), None);
+        assert_eq!(evidence_line("Tripwire tripped · s"), None);
+        let long = format!("Tripwire tripped · s\n\n{}", "é".repeat(400));
+        let line = evidence_line(&long).unwrap();
+        assert_eq!(line.chars().count(), EVIDENCE_CHARS);
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
+    fn a_trip_is_pushed_once_and_a_new_trip_again() {
+        let store = rusqlite::Connection::open_in_memory().unwrap();
+        init_store(&store).unwrap();
+        let mut t = TrippedTask {
+            id: "a".into(),
+            reference: "T1".into(),
+            title: "x".into(),
+            tripped_at: "2026-11-20 02:00:00".into(),
+            evidence: None,
+        };
+        assert!(claim_trip(&store, &t, "now").unwrap());
+        assert!(!claim_trip(&store, &t, "now").unwrap(), "a re-check that stays tripped must not re-send");
+        t.tripped_at = "2026-11-21 02:00:00".into();
+        assert!(claim_trip(&store, &t, "now").unwrap(), "a monitor that trips again pushes again");
     }
 }
