@@ -5938,6 +5938,25 @@ mod auto_archive_tests {
     }
 
     #[test]
+    fn an_open_decision_is_held_and_archives_once_decided() {
+        let conn = test_conn();
+        let t = retiring(&conn, "pick a vendor", "2026-01-01T00:00:00.000Z");
+        crate::db::tags::set_for_task(&conn, &t.id, &[DECISION_TAG.to_string()]).unwrap();
+
+        let out = auto_archive_due(&conn, &mine()).unwrap();
+        assert_eq!(out.held, vec![t.id.clone()]);
+        assert!(out.archived.is_empty());
+        assert!(!is_archived(&conn, &t.id), "an open decision must stay in front of Chris");
+        assert!(runner_comments(&conn, &t.id)[0].contains("open decision"));
+
+        // Deciding it (done) clears the hold; the tag alone no longer keeps it.
+        update(&conn, &t.id, &TaskPatch { status: Some("done".into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(auto_archive_due(&conn, &mine()).unwrap().archived, vec![t.id.clone()]);
+        assert!(is_archived(&conn, &t.id));
+    }
+
+    #[test]
     fn only_the_host_the_task_belongs_to_archives_it() {
         let conn = test_conn();
         let t = create(
