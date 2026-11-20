@@ -289,6 +289,10 @@ pub struct Task {
     /// The machine this task runs on, as a host id; `None` is whichever host
     /// takes unassigned work (`routing`'s module docs).
     pub run_on: Option<String>,
+    /// The retire date: once it passes, the runner archives the task
+    /// ([`auto_archive_due`]) unless it needs Chris right then. `None` keeps it
+    /// until somebody archives it by hand.
+    pub archive_at: Option<String>,
     /// Comma-separated MCP server NAMES a detached run of this task may reach,
     /// validated against [`crate::mcp_registry::REGISTRY`].
     ///
@@ -424,7 +428,7 @@ pub(crate) const COLUMNS: &str = concat!("id, title, body, status, priority, pro
      deleted_at, archived_at, short_id, bg_shell_allowed, bg_executor, bg_codex_allowed, \
      blocked_reason, bg_intent, bg_timeout_minutes, bg_run_token_cap, bg_remote_allowed, \
      bg_mcp_servers, tripwire, tripwire_every_minutes, tripwire_on_trip, tripwire_state, \
-     tripwire_tripped_at, run_on, ", health_warning_sql!(), " AS tripwire_health_warning");
+     tripwire_tripped_at, run_on, archive_at, ", health_warning_sql!(), " AS tripwire_health_warning");
 
 pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
     // Index 16 is the RAW `bg_allowed` column — Claude's gate alone — and index
@@ -480,7 +484,8 @@ pub(crate) fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
         tripwire_state: row.get(36)?,
         tripwire_tripped_at: row.get(37)?,
         run_on: row.get(38)?,
-        tripwire_health_warning: row.get(39)?,
+        archive_at: row.get(39)?,
+        tripwire_health_warning: row.get(40)?,
     })
 }
 
@@ -599,6 +604,8 @@ pub struct NewTask {
     pub bg_remote_allowed: Option<bool>,
     #[serde(default)]
     pub run_on: Option<String>,
+    #[serde(default)]
+    pub archive_at: Option<String>,
     pub bg_mcp_servers: Option<String>,
     pub model: Option<String>,
     pub section_id: Option<String>,
@@ -825,9 +832,9 @@ pub fn create(conn: &Connection, new: &NewTask) -> Result<Task, AppError> {
                             short_id, bg_executor, bg_codex_allowed, blocked_reason,
                             bg_timeout_minutes, bg_run_token_cap, bg_remote_allowed,
                             bg_mcp_servers, tripwire, tripwire_every_minutes, tripwire_on_trip,
-                            tripwire_state, run_on)
+                            tripwire_state, run_on, archive_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
         params![
             id,
             title,
@@ -860,6 +867,7 @@ pub fn create(conn: &Connection, new: &NewTask) -> Result<Task, AppError> {
             tripwire_cols.as_ref().and_then(|t| t.on_trip.clone()),
             tripwire_cols.as_ref().map(|_| TripwireState::Armed.as_str()),
             new.run_on.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            new.archive_at.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ],
     )?;
     if tripwire_cols.is_some() {
@@ -1611,6 +1619,9 @@ pub struct TaskPatch {
     /// the task goes back to whichever host takes unassigned work.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub run_on: Option<Option<String>>,
+    /// The retire date ([`auto_archive_due`]). `Some(None)` clears it.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub archive_at: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
@@ -1685,6 +1696,7 @@ impl TaskPatch {
             && self.bg_shell_allowed.is_none()
             && self.bg_remote_allowed.is_none()
             && self.run_on.is_none()
+            && self.archive_at.is_none()
             && self.bg_mcp_servers.is_none()
             && self.model.is_none()
             && self.section_id.is_none()
@@ -2153,6 +2165,12 @@ pub fn update(conn: &Connection, id: &str, patch: &TaskPatch) -> Result<Task, Ap
             v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
         ));
     }
+    if let Some(v) = &patch.archive_at {
+        sets.push("archive_at = ?");
+        binds.push(Box::new(
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        ));
+    }
     if let Some(v) = &patch.bg_mcp_servers {
         sets.push("bg_mcp_servers = ?");
         // An empty string stores NULL, so "no servers" has ONE representation
@@ -2356,6 +2374,127 @@ pub fn archive(conn: &Connection, id: &str) -> Result<String, AppError> {
     let stamp = now_ms(conn)?;
     stamp_subtree(conn, id, Hidden::Archived, &stamp, &new_batch())?;
     Ok(stamp)
+}
+
+/// What one [`auto_archive_due`] pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AutoArchive {
+    /// Tasks archived because their retire date passed.
+    pub archived: Vec<String>,
+    /// Tasks whose date passed but which need Chris right now, so they stay.
+    pub held: Vec<String>,
+}
+
+/// Comment prefix on a held task. Also the dedupe key: a task is told once per
+/// retire date, not on every 20-second tick.
+const HELD_PREFIX: &str = "Not auto-archived yet";
+
+/// Archive every task whose `archive_at` has passed — unless it needs Chris.
+///
+/// **The retire date.** A watch that should stop on a date (T654: "if still
+/// quiet on 2026-11-22, archive it") used to need someone to remember the
+/// date, and nothing surfaced it, because an armed tripwire keeps its task in
+/// Waiting. This is that someone.
+///
+/// **Held, not archived,** when the task needs attention at that moment: its
+/// tripwire has fired, it is `in_review`, it is an open decision, or a run is
+/// in flight. Archiving then would hide the one thing the task exists to show.
+/// The task stays where it is (each of those already surfaces it), gets one
+/// comment saying why, and is archived on a later pass once the reason clears —
+/// completing it, re-arming its tripwire, or finishing the run.
+///
+/// **One claimant.** A clock-driven write that two replicas both make is a
+/// conflict sync resolves arbitrarily, so only the host the task belongs to
+/// ([`HostCapability::is_mine`] on `run_on`) acts; every other host skips it.
+/// Like every other runner write, the change travels by the sync sweep.
+///
+/// [`HostCapability::is_mine`]: crate::routing::HostCapability::is_mine
+pub fn auto_archive_due(
+    conn: &Connection,
+    cap: &crate::routing::HostCapability,
+) -> Result<AutoArchive, AppError> {
+    let decision = is_decision_sql();
+    // `datetime()` on both sides (module rule): `archive_at` is ISO with a `T`
+    // and a `Z`, which compares byte-wise wrong against SQLite's own form.
+    let sql = format!(
+        "SELECT id, run_on, archive_at,
+                CASE
+                  WHEN tripwire_state = 'tripped' THEN 'its tripwire has fired'
+                  WHEN status = 'in_review' THEN 'it is waiting for review'
+                  WHEN status <> 'done' AND {decision} THEN 'it is an open decision'
+                  WHEN EXISTS(SELECT 1 FROM task_runs r
+                               WHERE r.task_id = tasks.id
+                                 AND r.status IN ('running', 'requested'))
+                    THEN 'a run is in progress'
+                END
+           FROM tasks
+          WHERE {LIVE}
+            AND archive_at IS NOT NULL
+            AND datetime(archive_at) <= datetime('now')
+          ORDER BY datetime(archive_at) ASC"
+    );
+    let rows: Vec<(String, Option<String>, String, Option<String>)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        mapped.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = AutoArchive::default();
+    for (id, run_on, archive_at, hold) in rows {
+        if !cap.is_mine(run_on.as_deref()) {
+            continue;
+        }
+        // A parent archived earlier in this pass took its subtree with it.
+        let still_live: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND {LIVE})"),
+            params![id],
+            |r| r.get(0),
+        )?;
+        if !still_live {
+            continue;
+        }
+        match hold {
+            Some(reason) => {
+                let told: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_comments
+                                    WHERE task_id = ?1 AND author = ?2
+                                      AND body LIKE ?3 || '%'
+                                      AND datetime(created_at) >= datetime(?4))",
+                    params![id, crate::db::comments::AUTHOR_RUNNER, HELD_PREFIX, archive_at],
+                    |r| r.get(0),
+                )?;
+                if !told {
+                    crate::db::comments::add(
+                        conn,
+                        &id,
+                        crate::db::comments::AUTHOR_RUNNER,
+                        &format!(
+                            "{HELD_PREFIX}: its retire date ({archive_at}) has passed, but \
+                             {reason}. It stays on the board and is archived once that clears. \
+                             Clear `archive_at` to keep it."
+                        ),
+                    )?;
+                }
+                out.held.push(id);
+            }
+            None => {
+                crate::db::comments::add(
+                    conn,
+                    &id,
+                    crate::db::comments::AUTHOR_RUNNER,
+                    &format!(
+                        "Auto-archived: its retire date ({archive_at}) passed. \
+                         `unarchive_task` brings it back."
+                    ),
+                )?;
+                archive(conn, &id)?;
+                out.archived.push(id);
+            }
+        }
+    }
+    if !out.archived.is_empty() {
+        log::info!("auto-archived {} task(s) past their retire date", out.archived.len());
+    }
+    Ok(out)
 }
 
 pub fn unarchive(conn: &Connection, id: &str) -> Result<Task, AppError> {
@@ -5691,5 +5830,149 @@ mod waiting_and_decision_tests {
         assert_eq!(got(people(&["@sam", "dana"])), vec!["ask Dana", "follow up with Sam"], "OR, not AND");
         assert_eq!(got(people(&["*"])), vec!["ask Dana", "follow up with Sam"], "any person at all");
         assert!(got(people(&["nobody"])).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod auto_archive_tests {
+    use super::*;
+    use crate::db::schema::test_conn;
+    use crate::routing::HostCapability;
+
+    fn mine() -> HostCapability {
+        HostCapability::local_default("mini".into(), "Mac mini".into())
+    }
+
+    fn retiring(conn: &Connection, title: &str, archive_at: &str) -> Task {
+        create(
+            conn,
+            &NewTask {
+                title: title.into(),
+                archive_at: Some(archive_at.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn is_archived(conn: &Connection, id: &str) -> bool {
+        get(conn, id).unwrap().unwrap().archived_at.is_some()
+    }
+
+    fn runner_comments(conn: &Connection, id: &str) -> Vec<String> {
+        crate::db::comments::for_task(conn, id)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.author == crate::db::comments::AUTHOR_RUNNER)
+            .map(|c| c.body)
+            .collect()
+    }
+
+    #[test]
+    fn a_passed_retire_date_archives_and_a_future_one_does_not() {
+        let conn = test_conn();
+        let past = retiring(&conn, "quiet watch", "2026-01-01T00:00:00.000Z");
+        let future = retiring(&conn, "still running", "2999-01-01T00:00:00.000Z");
+        let plain = create(&conn, &NewTask { title: "no date".into(), ..Default::default() }).unwrap();
+
+        let out = auto_archive_due(&conn, &mine()).unwrap();
+        assert_eq!(out.archived, vec![past.id.clone()]);
+        assert!(out.held.is_empty());
+        assert!(is_archived(&conn, &past.id));
+        assert!(!is_archived(&conn, &future.id));
+        assert!(!is_archived(&conn, &plain.id));
+        let notes = runner_comments(&conn, &past.id);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("Auto-archived"), "{notes:?}");
+
+        // Idempotent: an archived task is not LIVE, so the next tick is a no-op.
+        assert_eq!(auto_archive_due(&conn, &mine()).unwrap(), AutoArchive::default());
+    }
+
+    #[test]
+    fn a_tripped_watch_is_held_with_one_comment_then_archived_once_rearmed() {
+        let conn = test_conn();
+        let t = retiring(&conn, "watch", "2026-01-01T00:00:00.000Z");
+        conn.execute("UPDATE tasks SET tripwire_state = 'tripped' WHERE id = ?1", [&t.id]).unwrap();
+
+        for _ in 0..3 {
+            let out = auto_archive_due(&conn, &mine()).unwrap();
+            assert_eq!(out.held, vec![t.id.clone()]);
+            assert!(out.archived.is_empty());
+        }
+        assert!(!is_archived(&conn, &t.id), "a fired watch must stay visible");
+        let notes = runner_comments(&conn, &t.id);
+        assert_eq!(notes.len(), 1, "told once, not every tick: {notes:?}");
+        assert!(notes[0].contains("tripwire has fired"), "{notes:?}");
+
+        conn.execute("UPDATE tasks SET tripwire_state = 'armed' WHERE id = ?1", [&t.id]).unwrap();
+        assert_eq!(auto_archive_due(&conn, &mine()).unwrap().archived, vec![t.id.clone()]);
+        assert!(is_archived(&conn, &t.id));
+    }
+
+    #[test]
+    fn review_decisions_and_live_runs_hold_but_done_does_not() {
+        let conn = test_conn();
+        let review = retiring(&conn, "review me", "2026-01-01T00:00:00.000Z");
+        update(&conn, &review.id, &TaskPatch { status: Some("in_review".into()), ..Default::default() })
+            .unwrap();
+        let busy = retiring(&conn, "busy", "2026-01-01T00:00:00.000Z");
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, mode, status) VALUES ('r1', ?1, 'background', 'running')",
+            [&busy.id],
+        )
+        .unwrap();
+        let finished = retiring(&conn, "finished", "2026-01-01T00:00:00.000Z");
+        update(&conn, &finished.id, &TaskPatch { status: Some("done".into()), ..Default::default() })
+            .unwrap();
+
+        let out = auto_archive_due(&conn, &mine()).unwrap();
+        assert_eq!(out.archived, vec![finished.id.clone()]);
+        let mut held = out.held.clone();
+        held.sort();
+        let mut want = vec![review.id.clone(), busy.id.clone()];
+        want.sort();
+        assert_eq!(held, want);
+        assert!(runner_comments(&conn, &review.id)[0].contains("waiting for review"));
+        assert!(runner_comments(&conn, &busy.id)[0].contains("run is in progress"));
+    }
+
+    #[test]
+    fn only_the_host_the_task_belongs_to_archives_it() {
+        let conn = test_conn();
+        let t = create(
+            &conn,
+            &NewTask {
+                title: "laptop's".into(),
+                archive_at: Some("2026-01-01T00:00:00.000Z".into()),
+                run_on: Some("laptop".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let unassigned = retiring(&conn, "default host's", "2026-01-01T00:00:00.000Z");
+
+        let mut laptop = HostCapability::local_default("laptop".into(), "laptop".into());
+        laptop.takes_unassigned = false;
+
+        assert_eq!(auto_archive_due(&conn, &mine()).unwrap().archived, vec![unassigned.id.clone()]);
+        assert!(!is_archived(&conn, &t.id), "the mini must not act on the laptop's task");
+        assert_eq!(auto_archive_due(&conn, &laptop).unwrap().archived, vec![t.id.clone()]);
+    }
+
+    #[test]
+    fn the_patch_sets_and_clears_the_retire_date() {
+        let conn = test_conn();
+        let t = create(&conn, &NewTask { title: "x".into(), ..Default::default() }).unwrap();
+        let set = update(
+            &conn,
+            &t.id,
+            &TaskPatch { archive_at: Some(Some("2026-11-22T17:00:00.000Z".into())), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(set.archive_at.as_deref(), Some("2026-11-22T17:00:00.000Z"));
+        let cleared =
+            update(&conn, &t.id, &TaskPatch { archive_at: Some(None), ..Default::default() }).unwrap();
+        assert_eq!(cleared.archive_at, None);
     }
 }

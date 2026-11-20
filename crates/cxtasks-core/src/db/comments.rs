@@ -32,6 +32,10 @@ pub const AGENT_AUTHORS: &[&str] = &[AUTHOR_CLAUDE, AUTHOR_CODEX];
 /// note on a failure. Its own name so a condition coming true reads as an
 /// event in the log, not as something an agent said.
 pub const AUTHOR_TRIPWIRE: &str = "tripwire";
+/// Author of the entries the runner writes on its own clock — today, the
+/// auto-archive sweep (`db::tasks::auto_archive_due`). Its own name so a
+/// housekeeping step reads as the system acting, not as an agent or Chris.
+pub const AUTHOR_RUNNER: &str = "runner";
 /// Author for structured post-run flags produced by the optional Jev reviewer.
 pub const AUTHOR_JEV: &str = "jev";
 

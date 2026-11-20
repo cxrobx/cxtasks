@@ -147,6 +147,8 @@ pub struct FileTaskParams {
         description = "The machine this task and its tripwire run on: a label like 'Mac mini', or a word that picks out one, like 'mini'. Omit for whichever machine takes unassigned work. A task assigned to a machine that is off waits for it; it never moves on its own."
     )]
     pub run_on: Option<String>,
+    #[schemars(description = "RETIRE date: once this ISO-8601 UTC instant passes, the runner archives the task with a comment, so a watch or a time-boxed task cleans itself up. Held instead (left on the board, one comment saying why) while its tripwire has fired, it is in review, it is an open decision, or a run is in flight; archived once that clears. Set it on a tripwire watch meant to end on a date ('if still quiet on the 22nd, archive it'). Omit to keep the task until archived by hand.")]
+    pub archive_at: Option<String>,
     #[schemars(
         description = "ABSOLUTE path to the repo this task should be worked in — pass YOUR CURRENT WORKING DIRECTORY when the task is about the code you are looking at. This is what lets CXTasks hand the task back to a Claude session later with the right context. Omit for a task that isn't about a codebase."
     )]
@@ -431,6 +433,8 @@ pub struct UpdateTaskParams {
         description = "The machine this task and its tripwire run on: a label like 'Mac mini', or a word that picks out one, like 'mini'. Omit for whichever machine takes unassigned work; pass an empty string to clear. A task assigned to a machine that is off waits for it; it never moves on its own."
     )]
     pub run_on: Option<String>,
+    #[schemars(description = "Retire date: once this ISO-8601 UTC instant passes, the runner archives the task, unless its tripwire has fired, it is in review, it is an open decision, or a run is in flight (then it stays, with one comment saying why, and is archived once that clears). Pass an empty string to clear.")]
+    pub archive_at: Option<String>,
     #[schemars(
         description = "Allow this task to run on a host that is not the machine holding its repo — e.g. so it can run while the laptop is shut. Only meaningful for read-only work: a remote host works from a mirror, which is a throwaway clone with no tree to write back to, so anything above read-only is refused at queue time."
     )]
@@ -1117,6 +1121,22 @@ impl CxTasksMcp {
     }
 }
 
+/// Validate an `archive_at` parameter. `None` = not passed, `Some(None)` = an
+/// empty string (clear it), `Some(Some(v))` = a date that parses. A date that
+/// doesn't parse is refused: SQLite's `datetime()` turns it into NULL, which
+/// matches nothing, so the task would silently never retire.
+fn check_archive_at(raw: Option<&str>) -> Result<Option<Option<String>>, McpError> {
+    match raw.map(str::trim) {
+        None => Ok(None),
+        Some("") => Ok(Some(None)),
+        Some(v) if crate::recurrence::parse_iso(v).is_some() => Ok(Some(Some(v.to_string()))),
+        Some(v) => Err(McpError::invalid_params(
+            format!("archive_at '{v}' is not an ISO-8601 UTC instant (e.g. 2026-11-22T17:00:00.000Z)"),
+            None,
+        )),
+    }
+}
+
 /// Map an MCP integer override onto `TaskPatch`'s two-level option.
 ///
 /// `None` (key omitted, or JSON `null`) → leave the stored value alone.
@@ -1562,6 +1582,9 @@ fn format_detail(
     }
     if let Some(id) = t.run_on.as_deref() {
         s.push_str(&format!("  run_on:     {id}\n"));
+    }
+    if let Some(d) = t.archive_at.as_deref() {
+        s.push_str(&format!("  archive_at: {d}\n"));
     }
     if t.bg_allowed {
         s.push_str(&format!(
@@ -2175,6 +2198,7 @@ impl CxTasksMcp {
             // routing decision, made deliberately — `update_task` sets it.
             bg_remote_allowed: None,
             run_on,
+            archive_at: check_archive_at(params.archive_at.as_deref())?.flatten(),
             bg_mcp_servers: params.bg_mcp_servers.clone(),
             model: params.model.clone(),
             section_id: None,
@@ -2609,6 +2633,7 @@ impl CxTasksMcp {
             bg_shell_allowed: params.bg_shell_allowed,
             bg_remote_allowed: params.bg_remote_allowed,
             run_on,
+            archive_at: check_archive_at(params.archive_at.as_deref())?,
             bg_mcp_servers: params.bg_mcp_servers.clone(),
             model: params.model.map(Some),
             section_id: None,
@@ -2656,6 +2681,7 @@ impl CxTasksMcp {
                 || patch.project.is_some()
                 || patch.due_at.is_some()
                 || patch.defer_until.is_some()
+                || patch.archive_at.is_some()
                 || patch.recurrence.is_some()
                 || patch.repo_path.is_some()
                 || patch.prompt.is_some()
@@ -4359,6 +4385,7 @@ mod tests {
     fn update_params(task_id: &str) -> UpdateTaskParams {
         UpdateTaskParams {
             run_on: None,
+            archive_at: None,
             task_id: task_id.into(),
             title: None,
             body: None,
@@ -4975,6 +5002,7 @@ mod tests {
         let err = server
             .file_task(Parameters(FileTaskParams {
             run_on: None,
+            archive_at: None,
                 title: "straight to the queue".into(),
                 why: Some("chris-asked".into()),
                 decision: None,
@@ -5022,6 +5050,7 @@ mod tests {
     fn plain_filing(title: &str, why: Option<&str>) -> FileTaskParams {
         FileTaskParams {
             run_on: None,
+            archive_at: None,
             title: title.into(),
             why: why.map(str::to_string),
             decision: None,

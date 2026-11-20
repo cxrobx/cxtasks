@@ -66,6 +66,7 @@ function fixture(over: Partial<Task> = {}): Task {
     bg_shell_allowed: false,
     bg_remote_allowed: false,
     run_on: null,
+    archive_at: null,
     bg_mcp_servers: null,
     reminded_at: null,
     model: null,

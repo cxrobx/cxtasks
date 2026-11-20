@@ -6,7 +6,7 @@ use crate::error::AppError;
 use rusqlite::{Connection, Result};
 
 /// Bump this and add a `create_tables_vN` when the schema changes.
-pub const CURRENT_VERSION: i32 = 30;
+pub const CURRENT_VERSION: i32 = 31;
 
 /// The version of the **wire protocol** between this build and a sync peer.
 ///
@@ -141,6 +141,10 @@ pub fn initialize(conn: &Connection) -> Result<(), AppError> {
 
     if version < 30 {
         create_tables_v30(conn)?;
+    }
+
+    if version < 31 {
+        create_tables_v31(conn)?;
     }
 
     // Stamp FORWARD only. Three binaries share this DB and they don't upgrade
@@ -1625,6 +1629,19 @@ fn create_tables_v29(conn: &Connection) -> Result<()> {
 /// The backfill has to reach the same answer on every replica, because each runs
 /// this alone and none of them writes `updated_at`: the oldest host with a live
 /// workspace, which is the machine that was already doing this work.
+/// v31: `tasks.archive_at`, the retire date `db::tasks::auto_archive_due`
+/// acts on. Nullable with no default, so a pre-v31 binary neither writes nor
+/// needs it, and no backfill is required.
+fn create_tables_v31(conn: &Connection) -> Result<()> {
+    if let Err(e) = conn.execute("ALTER TABLE tasks ADD COLUMN archive_at TEXT", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 fn create_tables_v30(conn: &Connection) -> Result<()> {
     for sql in [
         "ALTER TABLE tasks ADD COLUMN run_on TEXT",

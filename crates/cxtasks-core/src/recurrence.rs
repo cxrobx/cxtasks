@@ -383,6 +383,10 @@ pub fn complete_with_recurrence_as(
             // leave every future instance able to read nothing — which fails
             // as a confident report about an empty directory.
             run_on: completed.run_on.clone(),
+            // The retire date belongs to the SERIES: a recurring watch with an end
+            // date stops recurring once it passes, because the next instance is
+            // archived by the same sweep.
+            archive_at: completed.archive_at.clone(),
             bg_mcp_servers: completed.bg_mcp_servers.clone(),
             model: completed.model.clone(),
             section_id: completed.section_id.clone(),

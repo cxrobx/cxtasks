@@ -1520,6 +1520,12 @@ pub fn tick(in_flight: &Arc<AtomicUsize>) -> Result<usize, AppError> {
         // still held.
         log::warn!("runner: abandoned-run sweep failed: {e}");
     }
+    // Housekeeping on the same footing as the sweep above: before the gate, so
+    // a paused queue or a spent budget still retires what is due, and never
+    // fatal to the tick.
+    if let Err(e) = db::tasks::auto_archive_due(&conn, &cap) {
+        log::warn!("runner: auto-archive sweep failed: {e}");
+    }
     let running = db::runs::count_running_background(&conn)?;
     let runs_today = db::runs::count_background_runs_today(&conn)?;
 

@@ -2,6 +2,7 @@ import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import * as Popover from "@radix-ui/react-popover";
 import { forwardRef, useEffect, useRef, useState } from "react";
 import {
+  Archive,
   Ban,
   CalendarCheck,
   CalendarClock,
@@ -48,7 +49,7 @@ import {
 
 /** The properties that can be absent — the ones the `+` menu adds. Status and
  *  priority always have a value, so they always have a chip. */
-type Prop = "project" | "section" | "due" | "defer" | "repeat" | "tripwire" | "waiting";
+type Prop = "project" | "section" | "due" | "defer" | "retire" | "repeat" | "tripwire" | "waiting";
 
 const FIELD =
   "w-full rounded-md border border-border bg-input px-2 py-1 text-content placeholder:text-content-faint";
@@ -73,6 +74,7 @@ const ADD_LABELS: Record<Prop, string> = {
   section: "Section",
   due: "Due date",
   defer: "Start date",
+  retire: "Archive date",
   repeat: "Repeat",
   tripwire: "Tripwire",
   waiting: "Waiting reason",
@@ -83,6 +85,7 @@ const ICONS: Record<Prop, typeof Zap> = {
   section: Rows3,
   due: CalendarCheck,
   defer: CalendarClock,
+  retire: Archive,
   repeat: Repeat,
   tripwire: Zap,
   waiting: Ban,
@@ -160,6 +163,7 @@ export function PropertyStrip({ task }: { task: Task }) {
     section: Boolean(section),
     due: Boolean(task.due_at),
     defer: Boolean(task.defer_until),
+    retire: Boolean(task.archive_at),
     repeat: Boolean(task.recurrence),
     tripwire: task.tripwire !== null,
     waiting: Boolean(task.blocked_reason) || openBlockers.length > 0,
@@ -192,6 +196,7 @@ export function PropertyStrip({ task }: { task: Task }) {
     // empty in WKWebView, where the blank renders as a plausible fake date.
     if (p === "due") void patch(task.id, { due_at: defaultDate() });
     if (p === "defer") void patch(task.id, { defer_until: defaultDate() });
+    if (p === "retire") void patch(task.id, { archive_at: defaultDate() });
     window.clearTimeout(clearTimer.current);
     setAdding(p);
     setOpen(p);
@@ -446,6 +451,28 @@ export function PropertyStrip({ task }: { task: Task }) {
             value={task.defer_until}
             onChange={(iso) => void patch(task.id, { defer_until: iso })}
             addLabel="Not deferred"
+          />
+        </ChipPopover>
+      )}
+
+      {shows("retire") && (
+        <ChipPopover
+          open={open === "retire"}
+          onOpenChange={onOpenChange("retire")}
+          title="Archives"
+          hint="Archived automatically after this date. If it needs you then (tripwire fired, in review), it stays until that clears."
+          chip={
+            <Chip
+              label="Archives"
+              icon={Archive}
+              value={task.archive_at ? `Archives ${shortDate(task.archive_at)}` : "Archives…"}
+            />
+          }
+        >
+          <DateField
+            value={task.archive_at}
+            onChange={(iso) => void patch(task.id, { archive_at: iso })}
+            addLabel="No archive date"
           />
         </ChipPopover>
       )}

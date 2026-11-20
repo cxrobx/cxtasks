@@ -147,6 +147,18 @@ describe("a held task still reads as held", () => {
     expect(chip(/^Starts:/).className).toContain("text-warning");
   });
 
+  it("a retire date gets an Archives chip", () => {
+    mount(task({ archive_at: inDays(2) }));
+    expect(chip(/^Archives: Archives /)).toBeInTheDocument();
+  });
+
+  it("adding an archive date writes one at once", async () => {
+    mount(task());
+    openMenu(screen.getByRole("button", { name: "Add a property" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Archive date" }));
+    expect(patch).toHaveBeenCalledWith("t1", { archive_at: expect.any(String) });
+  });
+
   it("an armed tripwire says what the runner last said", () => {
     mount(
       task({ tripwire: "script:crawled teacherhero.org", tripwire_state: "armed", tripwire_every_minutes: 1440 }),
@@ -188,7 +200,7 @@ describe("the + menu", () => {
     openMenu(screen.getByRole("button", { name: "Add a property" }));
     const items = (await screen.findAllByRole("menuitem")).map((i) => i.textContent);
     // Tag is always on offer — a task takes any number of them.
-    expect(items).toEqual(["Due date", "Start date", "Tripwire", "Waiting reason", "Tag"]);
+    expect(items).toEqual(["Due date", "Start date", "Archive date", "Tripwire", "Waiting reason", "Tag"]);
   });
 
   it("adding a date writes one at once — a date input is never mounted empty", async () => {

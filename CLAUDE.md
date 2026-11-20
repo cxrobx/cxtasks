@@ -216,7 +216,7 @@ the Tauri side.
 Full schema (table-by-table, tags/deps/comments, migration discipline):
 `.claude/rules/database.md`. Always-relevant:
 
-- `schema.rs` is at `CURRENT_VERSION = 30`; the stamp only moves **forward**
+- `schema.rs` is at `CURRENT_VERSION = 31`; the stamp only moves **forward**
   (three binaries share one DB and don't upgrade in lockstep). Don't hardcode the
   number in a test — compare against `schema::CURRENT_VERSION`.
 - **A version number is spent the moment any binary stamps it on a real DB —

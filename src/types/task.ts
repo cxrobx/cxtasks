@@ -51,6 +51,9 @@ export interface Task {
   /** The machine this task and its tripwire run on, as a host id. Null is
    *  whichever host takes unassigned work. */
   run_on: string | null;
+  /** The retire date: once it passes, the runner archives the task unless it
+   *  needs attention then (`db::tasks::auto_archive_due`). */
+  archive_at: string | null;
   /** Comma-separated MCP server NAMES a repo-less run may reach. Empty grants
    *  nothing beyond the write-back router, which is the design: an ungranted
    *  detached run can read nothing. */
@@ -795,6 +798,7 @@ export interface NewTask {
   project?: string | null;
   due_at?: string | null;
   defer_until?: string | null;
+  archive_at?: string | null;
   recurrence?: string | null;
   parent_id?: string | null;
   repo_path?: string | null;
@@ -841,6 +845,7 @@ export interface TaskPatch {
   bg_shell_allowed?: boolean;
   bg_remote_allowed?: boolean;
   run_on?: string | null;
+  archive_at?: string | null;
   bg_mcp_servers?: string | null;
   model?: string | null;
   section_id?: string | null;

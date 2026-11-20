@@ -25,6 +25,7 @@ import type { Task, TaskRun } from "@/types/task";
 const baseTask: Task = {
   id: "t",
   run_on: null,
+  archive_at: null,
   title: "t",
   body: null,
   status: "todo",

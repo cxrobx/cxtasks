@@ -2069,6 +2069,7 @@ const UNDOABLE_FIELDS = [
   "bg_shell_allowed",
   "bg_remote_allowed",
   "run_on",
+  "archive_at",
   "bg_mcp_servers",
   "model",
   "section_id",
@@ -2172,6 +2173,8 @@ function describePatch(patch: TaskPatch): string {
       return patch.due_at ? "rescheduled" : "un-scheduled";
     case "defer_until":
       return patch.defer_until ? "deferred" : "un-deferred";
+    case "archive_at":
+      return patch.archive_at ? "set to archive" : "no longer set to archive";
     case "recurrence":
       return patch.recurrence ? "set to repeat" : "stopped repeating";
     case "title":

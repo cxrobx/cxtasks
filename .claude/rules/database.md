@@ -14,13 +14,23 @@ number to its file. Numbers here are therefore non-sequential; that's deliberate
 
 ## Data Model
 
-`schema.rs` is at `CURRENT_VERSION = 30`. Every migration is `IF NOT EXISTS` or
+`schema.rs` is at `CURRENT_VERSION = 31`. Every migration is `IF NOT EXISTS` or
 version-gated, and the stamp only ever moves **forward** — three binaries share
 one DB and don't upgrade in lockstep, so a leftover older `cxtasks-runner` must
 not re-stamp a v4 file back to v3 and send the next new-binary launch through
 migrations against columns that already exist. Don't hardcode the number in a
 test; compare against `schema::CURRENT_VERSION` (a literal there broke a test on
 every migration for no signal).
+
+**v31 added `tasks.archive_at`**, the retire date. The runner's tick calls
+`db::tasks::auto_archive_due`, which archives a task once the date passes,
+unless it needs Chris right then: its tripwire has fired, it is `in_review`,
+it is an open decision, or a run is in flight. A held task stays where it is,
+gets one `runner` comment per retire date, and is archived on a later tick once
+the reason clears. Only the host the task belongs to (`is_mine` on `run_on`)
+acts, so two replicas never both write the archive. Nullable with no default and
+no backfill, so a pre-v31 binary ignores it. Recurrence carries it forward,
+which means a recurring task with a passed date stops recurring.
 
 **v30 added `tasks.run_on` and `hosts.takes_unassigned`** (invariant 30, in
 `execution.md`). Its backfill picks the oldest host with a live workspace, keyed
