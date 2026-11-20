@@ -1101,12 +1101,12 @@ pub const TRIPWIRE_ARMED: &str = "COALESCE(tripwire_state, '') = 'armed'";
 pub const MONITOR_SQL: &str =
     "(tripwire IS NOT NULL AND COALESCE(tripwire_on_trip, '') = 'monitor')";
 
-/// **A fired monitor**: one whose check tripped or broke, waiting on Chris to
-/// read it. Today lists these; the Monitors badge counts them. `error` counts
-/// for the same reason it surfaces a task at all (invariant 26): a check that
-/// cannot run must not stay out of sight.
-pub const FIRED_MONITOR_SQL: &str = "(tripwire IS NOT NULL \
-     AND COALESCE(tripwire_on_trip, '') = 'monitor' \
+/// **A surfaced tripwire**: ANY tripwire — monitor or one-shot — whose check
+/// tripped or broke. Today lists these and the Inbox leaves them out. A trip
+/// is the moment the task asked to come back, so it belongs where Chris looks
+/// for what needs him now, not in the pile still waiting to be filed; an
+/// undated one-shot (T682, a P1 security patch) otherwise landed in the Inbox.
+pub const SURFACED_TRIPWIRE_SQL: &str = "(tripwire IS NOT NULL \
      AND COALESCE(tripwire_state, '') IN ('tripped', 'error'))";
 
 /// The BLOCKER half: held by a written reason or by an open dependency. Both,
@@ -1239,6 +1239,8 @@ pub(crate) fn view_where(view: View) -> Vec<String> {
             // …and a MONITOR is never left to file: it is standing
             // infrastructure with its own view. A fired one goes to Today.
             parts.push(format!("NOT {MONITOR_SQL}"));
+            // …and a tripwire that tripped is on Today (below), so not here too.
+            parts.push(format!("NOT {SURFACED_TRIPWIRE_SQL}"));
         }
         View::Today => {
             // Not held — deferred, armed, or blocked…
@@ -1247,12 +1249,13 @@ pub(crate) fn view_where(view: View) -> Vec<String> {
             // already actively in flight.
             // …or a decision awaiting Chris (`DECISION_TAG`): undated, but
             // "today" in the sense that matters — nothing else can move it.
-            // …or a monitor that fired: its report is waiting on him now.
+            // …or any tripwire that tripped or broke (a fired monitor, or a
+            // one-shot whose condition came true): it is waiting on him now.
             parts.push(format!(
                 "((due_at IS NOT NULL AND datetime(due_at,'localtime') < {TOMORROW_LOCAL})
                   OR status IN ('in_progress','queued','in_review')
                   OR {}
-                  OR {FIRED_MONITOR_SQL}
+                  OR {SURFACED_TRIPWIRE_SQL}
                   OR {HEALTH_WARNING_SQL})",
                 is_decision_sql()
             ));
@@ -5445,7 +5448,8 @@ mod monitor_view_tests {
         // A section must not lift a quiet monitor above the fired ones.
         let personal = crate::db::projects::create_section(&conn, None, "Personal").unwrap();
         crate::db::projects::move_task_to_section(&conn, &quiet.id, Some(&personal.id)).unwrap();
-        // A one-time tripwire that tripped is ordinary surfaced work, not a monitor.
+        // A one-time tripwire that tripped is surfaced work, not a monitor: it
+        // goes to Today with the fired monitors, and leaves the Inbox.
         let one_shot = create(&conn, &NewTask { title: "one-shot".into(), ..Default::default() }).unwrap();
         conn.execute(
             "UPDATE tasks SET tripwire = 'script:x', tripwire_state = 'tripped' WHERE id = ?1",
@@ -5453,8 +5457,8 @@ mod monitor_view_tests {
         )
         .unwrap();
 
-        assert_eq!(titles(&conn, View::Inbox), vec!["loose todo", "one-shot"]);
-        assert_eq!(titles(&conn, View::Today), vec!["broken", "fired"]);
+        assert_eq!(titles(&conn, View::Inbox), vec!["loose todo"]);
+        assert_eq!(titles(&conn, View::Today), vec!["broken", "fired", "one-shot"]);
         assert_eq!(titles(&conn, View::Monitors), vec!["broken", "fired", "handled", "quiet"]);
 
         // Fired first: the armed-sinks rule orders the view without a special case.
@@ -5467,7 +5471,8 @@ mod monitor_view_tests {
 
         let counts = view_counts(&conn).unwrap();
         assert_eq!(counts.monitors, 2, "badge = fired monitors, not the view's length");
-        assert_eq!(counts.inbox, 2);
+        assert_eq!(counts.inbox, 1);
+        assert_eq!(counts.today, 3);
     }
 }
 
