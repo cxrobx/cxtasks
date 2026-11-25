@@ -4,9 +4,9 @@ An agentic task manager for macOS built with Rust, Tauri 2, React 19, and SQLite
 
 Every task works as a normal to-do item (due dates, recurrence, priorities, reminders, projects), and any task can also carry an execution context — repo path, brief, tripwire, and permission envelope — so it can be filed by an agent mid-session over MCP and later dispatched to **Claude Code** or **Codex**, interactively in Ghostty or unattended in the background.
 
-![CXTasks filing a task via MCP, evaluating a repo tripwire, and delegating a background agent run — app replica, seeded demo data](docs/media/cxtasks-demo.gif)
+![CXTasks Today view with condition tripwires (SEO traffic, CVE advisory, paying-user milestones) escalating an urgent CVE patch and delegating a bounded Claude Code run with snapshot rollback](docs/media/cxtasks-demo.gif)
 
-<sub>App replica with seeded demo data. [Watch the full 40-second overview with sound](https://cxventures.io/products/cxtasks).</sub>
+<sub>Interactive UI demo with illustrative task data. [Watch the full 40-second overview with sound](https://cxventures.io/products/cxtasks).</sub>
 
 ## Why
 
